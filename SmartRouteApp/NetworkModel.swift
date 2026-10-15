@@ -863,24 +863,16 @@ final class NetworkModel: ObservableObject {
             // 但 SSID 本身可以叫 "1. CZ-305"，按 "数字. " 剥前缀会剥错。
             let saved = WifiParsing.savedNetworks(
                 Shell.run("'\(script)' wifi list --raw", timeout: 8).out)
-            var signal = "", channel = "", bars = 0
-            if let cur = WifiParsing.currentSignal(
-                Shell.run("'\(script)' wifi current", timeout: 8).out) {
+            // 一次调用拿全信号/信道/速率/噪声。这里曾经为了速率和噪声去跑两次
+            // `smartroute status`（各约 1.8 秒），Wi-Fi 页刷新要 5 秒——
+            // system_profiler 一次就要 1.7 秒，重复调它就是慢的根源。
+            var signal = "", channel = "", bars = 0, rate = "", noise = ""
+            let curOut = Shell.run("'\(script)' wifi current --raw", timeout: 8).out
+            if let cur = WifiParsing.currentSignal(curOut) {
                 signal = cur.rssi; channel = cur.channel; bars = cur.bars
             }
-            // 真实协商速率与噪声底。networksetup -getMedia 对 Wi-Fi 只回
-            // autoselect，但 system_profiler 里有 Transmit Rate——别再以为读不到。
-            var rate = "", noise = ""
-            if let r = WifiParsing.capture(
-                Shell.run("'\(script)' status", timeout: 12).out,
-                pattern: "协商速率[[:space:]]+([0-9]+)[[:space:]]+Mbps") {
-                rate = r
-            }
-            if let n = WifiParsing.capture(
-                Shell.run("'\(script)' status", timeout: 12).out,
-                pattern: "噪声[[:space:]]+(-?[0-9]+)[[:space:]]+dBm") {
-                noise = n
-            }
+            if let r = WifiParsing.capture(curOut, pattern: "rate=([0-9]+)") { rate = r }
+            if let n = WifiParsing.capture(curOut, pattern: "noise=(-?[0-9]+)") { noise = n }
             DispatchQueue.main.async {
                 self.wifiSaved = saved
                 self.wifiSignal = signal

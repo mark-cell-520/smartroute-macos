@@ -1,48 +1,60 @@
-// wifiscan.swift —— 免权限判断"哪些已保存网络在附近 + 信号多强"
+// wifiscan.swift —— 免权限读 Wi-Fi：附近网络扫描 + 当前连接状态
 //
 // 为什么需要它：
-//   macOS 上通用 Wi-Fi 扫描（scanForNetworks(withSSID: nil)）拿不到 SSID
-//   （要「定位服务」权限），按指定 SSID 扫描（withSSID: Data）却不需要权限。
-//   我们只关心"已保存的网络在不在范围"，正好可以用后者。
+//   1) 附近网络：macOS 的通用 Wi-Fi 扫描（scanForNetworks(withSSID: nil)）
+//      拿不到 SSID（要「定位服务」权限），但**按指定 SSID 扫描**
+//      （withSSID: Data）不需要权限。我们只关心"已保存的网络在不在范围"，
+//      正好用后者。附带好处：不打断当前连接。
+//   2) 当前状态：system_profiler SPAirPortDataType 一次要约 1.6 秒，
+//      而 App 每 5 秒轮询一次、status 也要用。CoreWLAN 同样这几个量
+//      （信号/信道/速率/噪声）只要几十毫秒。
 //
-//   有了它就能：把候选网络按信号排序、跳过多年来不在范围的网络、
-//   在界面上把够不着的网络置灰——都不需要打断当前连接，
-//   也不需要向用户要定位权限。
+// 用法：
+//   wifiscan SSID1 SSID2 ...    扫描指定 SSID
+//   wifiscan --quick SSID...    只扫一轮，不重试（给不能等的场合）
+//   wifiscan --current          读当前连接的网络
 //
-// 用法：wifiscan SSID1 SSID2 ...
-// 输出（TSV，每行一个）：SSID \t rssi \t channel \t fresh
-//   rssi    最强 BSSID 的信号；不在范围输出 -
-//   channel 最强 BSSID 的信道；不在范围输出 -
-//   fresh   1=这次真的发了探测；0=系统直接返回了缓存
+// 输出（都是 TSV）：
+//   扫描：  SSID \t rssi \t channel \t fresh
+//            rssi=- 表示没找到；fresh=1 表示这次真发了探测
+//   当前：  rssi \t channel \t rate \t noise
 //
 // 【关键陷阱】fresh=0 且 rssi=- 时不能信。
-//   系统对扫描请求有冷却：刚扫过 A，紧接着问 B，可能直接用上次的缓存回答，
-//   而那份缓存里只有 A 的结果——于是 B 被误判成"不在范围"。
-//   实测：先扫 CZ-305(1.27s)，紧接着问 CZ-BH-407 只用 0.01s 且报空，
-//   但单独扫 CZ-BH-407 明明能拿到 -60。所以"找不到"必须配 fresh=1 才算数。
-//   （反过来，rssi 有值时永远可信，不管 fresh。）
+//   系统对扫描请求有冷却：刚真扫过一个 SSID，紧接着问下一个，
+//   可能直接用上次的缓存回答，而缓存里只有上一个的结果——于是这个被
+//   误判成"不在范围"。实测：先问 A（真扫 1.3s），紧接着问 B 只用 0.02s
+//   且报空，但单独问 B 能拿到 -60。系统约每 5 秒才肯真扫一次。
+//   所以"没找到"必须配 fresh=1 才算数；而"找到了"（rssi 有值）永远可信。
 //
 // 编译：swiftc -O wifiscan.swift -o wifiscan
 import CoreWLAN
 import Foundation
+
+// 一次扫描的结果：rssi（-999 表示没找到）、信道、这次是否真发了探测
+struct Hit { let name: String; let rssi: Int; let ch: Int; let fresh: Bool }
 
 guard let iface = CWWiFiClient.shared().interface() else {
     FileHandle.standardError.write("no Wi-Fi interface\n".data(using: .utf8)!)
     exit(1)
 }
 
-// 每个 SSID 的结果：rssi（- 表示没找到）、信道、这次是否真发了探测
-struct Hit { let name: String; let rssi: Int; let ch: Int; let fresh: Bool }
+// ---------- 当前连接 ----------
 
-var anyFresh = false
+/// 读当前连接的网络：rssi / 信道 / 协商速率 / 噪声底。
+/// 拿不到就退出码 1，由调用方回退到 system_profiler。
+func currentInfo() {
+    // 注意：CWInterface.wlanChannel 是**方法**（要加括号），
+    // 而 CWNetwork.wlanChannel 是属性。两者不一致，踩过一次。
+    let ch = iface.wlanChannel()?.channelNumber ?? -1
+    let noise = iface.noiseMeasurement()
+    let rate = Int(iface.transmitRate())
+    // 没连上时 rssi 会是 0 之类，交给调用方判断
+    print("\(iface.rssiValue())\t\(ch)\t\(rate)\t\(noise)")
+    fflush(stdout)
+    exit(0)
+}
 
-// --quick：只扫一轮，不重试。给"自动切换"这类不能等的场合用。
-// 默认（交互式）：对"没找到且没真扫"的再问几轮，每轮间隔约 5 秒——
-// 实测系统约每 5 秒才肯真扫一次，等 1~3 秒都不够。
-var quick = false
-let argv = CommandLine.arguments
-if argv.contains("--quick") { quick = true }
-let names = argv.dropFirst().filter { $0 != "--quick" && !$0.isEmpty }
+// ---------- 附近网络扫描 ----------
 
 func scanOne(_ name: String) -> Hit {
     let t0 = Date()
@@ -57,6 +69,19 @@ func scanOne(_ name: String) -> Hit {
     }
     return Hit(name: name, rssi: -999, ch: -1, fresh: fresh)
 }
+
+var anyFresh = false
+
+// --quick：只扫一轮，不重试。给"自动切换"这类不能等的场合用。
+// 默认（交互式）：对"没找到且没真扫"的再问几轮，每轮间隔约 5 秒——
+// 实测系统约每 5 秒才肯真扫一次，等 1~3 秒都不够。
+var quick = false
+let argv = CommandLine.arguments
+if argv.contains("--quick") { quick = true }
+
+if argv.contains("--current") { currentInfo() }
+
+let names = argv.dropFirst().filter { $0 != "--quick" && $0 != "--current" && !$0.isEmpty }
 
 let RETRY_GAP = 5.0
 let MAX_PASS = 3

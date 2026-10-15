@@ -19,9 +19,17 @@ enum WifiParsing {
             .filter { !$0.isEmpty }
     }
 
-    /// 解析 `smartroute wifi current` 的一行输出：
-    /// "Wi-Fi en1  信号 -70 dBm（2/4 格）  信道 44"
+    /// 解析 `smartroute wifi current` 的输出。两种格式都认：
+    ///   人看的："Wi-Fi en1  信号 -70 dBm（2/4 格）  信道 44"
+    ///   机器的："rssi=-70 channel=44 rate=432 noise=-97"（--raw，一次调用拿全）
+    /// App 用 --raw：system_profiler 一次要约 1.7 秒，能少调一次就少调一次。
     static func currentSignal(_ text: String) -> (rssi: String, channel: String, bars: Int)? {
+        // 先试 key=value 格式（更规整，也不会和中文文案耦合）
+        if let rssi = capture(text, pattern: "rssi=(-?[0-9]+)") {
+            let channel = capture(text, pattern: "channel=([0-9]+)") ?? "?"
+            return (rssi: rssi, channel: channel, bars: bars(for: rssi))
+        }
+        // 再试人类格式
         let rssi = capture(text, pattern: "信号\\s+(-?[0-9]+)\\s+dBm")
         let channel = capture(text, pattern: "信道\\s+([0-9]+)")
         let bars = capture(text, pattern: "（([0-9]+)/4\\s*格）")
@@ -29,6 +37,21 @@ enum WifiParsing {
         return (rssi: r,
                 channel: channel ?? "?",
                 bars: bars.flatMap(Int.init) ?? 0)
+    }
+
+    /// dBm -> 格数（0~4）。**必须和脚本里的 wifi_bars 逐档对齐**，
+    /// 否则同一个信号在命令行显示 4 格、App 里显示 3 格。
+    /// 有测试专门比对两边（mock_wifi_parse.sh 的"格数与脚本一致"）。
+    static func bars(for rssi: String) -> Int {
+        guard let v = Int(rssi) else { return 0 }
+        // 注意区间方向：必须小的在左（-59...-40）。写成 -40...(-59) 是从大到小，
+        // 编译能过但一运行就 trap（SIGTRAP）——App 走 --raw 格式就会崩。
+        switch v {
+        case -59...(-40): return 4   // 脚本 -5*|-4*
+        case -69...(-60): return 3   // 脚本 -6*
+        case -79...(-70): return 2   // 脚本 -7*
+        default: return 1            // 其余（含 -80 以外）
+        }
     }
 
     /// 附近网络的一条记录

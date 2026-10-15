@@ -735,18 +735,12 @@ cmd_status() {
         echo "以太网链路   : $(link_media "$ACTIVE_ETH_DEV" 2>/dev/null || echo 未知)"
     fi
     if [ -n "$ACTIVE_WIFI_DEV" ]; then
-        # 用局部变量，别用 set -- （会把位置参数冲掉，后面就取不到信号/信道了）
+        # 一次 system_profiler 拿全四项（它一次要约 1.7 秒，分两次调白等一倍）
         local _wrssi="" _wch="" _wrate="" _wnoise=""
-        _wcur="$(wifi_current_signal 2>/dev/null)"
+        _wcur="$(wifi_current_all 2>/dev/null)"
         if [ -n "$_wcur" ]; then
-            _wrssi="${_wcur%% *}"
-            _wch="${_wcur##* }"
-        fi
-        _wrate="$(wifi_current_rate 2>/dev/null)"
-        if [ -n "$_wrate" ]; then
-            # 顺序要紧：先把噪声取出来，再截速率。反了就会拿速率当噪声。
-            _wnoise="${_wrate##* }"
-            _wrate="${_wrate%% *}"
+            set -- $_wcur
+            _wrssi="$1"; _wch="$2"; _wrate="$3"; _wnoise="$4"
         fi
         if [ -n "$_wrssi" ]; then
             # 信噪比 = 信号 - 噪声。差值小于 20dB 说明信号被噪声淹了，
@@ -1935,15 +1929,47 @@ wifi_scan() {
 # 附近有信号的已保存网络（按信号排序）。-> stdout: "SSID rssi channel"
 wifi_nearby() { wifi_scan "$(wifi_saved_list | tr '\n' ' ')" "${1:-0}"; }
 
+# 一次 system_profiler 拿全：信号、信道、协商速率、噪声底。
+# -> stdout: "<rssi> <channel> <rate> <noise>"，读不到输出空
+#
+# 为什么要合并成一次：system_profiler SPAirPortDataType 一次要约 1.7 秒，
+# 而"信号"和"速率"原本是两个函数各调一次，status 里白等一倍（2.2s）。
+# 也不能用"进程内变量缓存"偷懒——调用方都是 $(...) 子 shell，
+# 子 shell 里的赋值传不回父 shell，缓存永远命中不了。
+wifi_current_all() {
+    local out rssi ch rate noise bin
+    # 快路径：CoreWLAN helper。system_profiler 一次要约 1.6 秒，而 App 每 5 秒
+    # 轮询一次、status 也要用；helper 首次约 0.3 秒、之后命中缓存只要 0.01 秒。
+    # helper 不在（没装/没构建）就回退 system_profiler——功能不变，只是慢。
+    bin="$(wifi_scan_bin)"
+    if [ -n "$bin" ]; then
+        out="$("$bin" --current 2>/dev/null)"
+        if [ -n "$out" ]; then
+            # helper 输出 TSV：rssi \t channel \t rate \t noise
+            IFS="$(printf '\t')" read -r rssi ch rate noise <<EOF2
+$out
+EOF2
+            [ -n "$rssi" ] && [ "$rssi" != "0" ] || return 1
+            printf '%s %s %s %s\n' "$rssi" "${ch:-0}" "${rate:-0}" "${noise:-0}"
+            return 0
+        fi
+    fi
+    out="$(system_profiler SPAirPortDataType 2>/dev/null)"
+    [ -n "$out" ] || return 1
+    rssi="$(printf '%s\n' "$out" | sed -n 's/.*Signal \/ Noise:[[:space:]]*\(-*[0-9][0-9]*\) dBm.*/\1/p' | head -1)"
+    [ -n "$rssi" ] || return 1
+    ch="$(printf '%s\n' "$out" | sed -n 's/.*Channel:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)"
+    rate="$(printf '%s\n' "$out" | sed -n 's/.*Transmit Rate:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)"
+    noise="$(printf '%s\n' "$out" | sed -n 's/.*Signal \/ Noise:[[:space:]]*-*[0-9]* dBm \/ *\(-*[0-9][0-9]*\) dBm.*/\1/p' | head -1)"
+    printf '%s %s %s %s\n' "$rssi" "${ch:-0}" "${rate:-0}" "${noise:-0}"
+}
+
 # 当前连接的信号强度（dBm）与信道。这两个免权限，system_profiler 就能读到。
 wifi_current_signal() {   # ->  stdout: "<rssi> <channel>"，读不到输出空
-    local out
-    out="$(system_profiler SPAirPortDataType 2>/dev/null)"
-    local rssi ch
-    rssi="$(printf '%s\n' "$out" | sed -n 's/.*Signal \/ Noise:[[:space:]]*\(-*[0-9][0-9]*\) dBm.*/\1/p' | head -1)"
-    ch="$(printf '%s\n' "$out" | sed -n 's/.*Channel:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)"
-    [ -n "$rssi" ] || return 1
-    printf '%s %s\n' "$rssi" "${ch:-0}"
+    local a
+    a="$(wifi_current_all)" || return 1
+    set -- $a
+    printf '%s %s\n' "$1" "$2"
 }
 
 # 当前 Wi-Fi 的真实协商速率（Mbps）与噪声底（dBm）。
@@ -1952,12 +1978,10 @@ wifi_current_signal() {   # ->  stdout: "<rssi> <channel>"，读不到输出空
 # 用户最初的疑问"网线 100M、Wi-Fi 标称 1000M，为什么不走 Wi-Fi"，
 # 这里给出的是真实答案（本机实测 864 Mbps，但信号只有 2 格）。
 wifi_current_rate() {   # -> stdout: "<速率Mbps> <噪声dBm>"，读不到输出空
-    local out rate noise
-    out="$(system_profiler SPAirPortDataType 2>/dev/null)"
-    rate="$(printf '%s\n' "$out" | sed -n 's/.*Transmit Rate:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)"
-    noise="$(printf '%s\n' "$out" | sed -n 's/.*Signal \/ Noise:[[:space:]]*-*[0-9]* dBm \/ *\(-*[0-9][0-9]*\) dBm.*/\1/p' | head -1)"
-    [ -n "$rate" ] || return 1
-    printf '%s %s\n' "$rate" "${noise:-0}"
+    local a
+    a="$(wifi_current_all)" || return 1
+    set -- $a
+    printf '%s %s\n' "$3" "$4"
 }
 
 # dBm -> 人类可读的格数（0~4）。-50 以内满格，-80 以外一格
@@ -2257,11 +2281,30 @@ cmd_wifi() {
             ;;
         current|cur|status|st)
             find_active
-            local sig
-            if sig="$(wifi_current_signal)"; then
-                set -- $sig
-                printf 'Wi-Fi %s  信号 %s dBm（%s/4 格）  信道 %s\n' \
+            # cmd_wifi 没有全局 shift，这里 $1 还是 "current"
+            shift
+            # 先把标志取下来。必须在 set -- 之前——set -- 会把位置参数
+            # 换成 wifi_current_all 的输出，标志就被冲掉了。
+            local _raw=0
+            if [ "${1:-}" = "--raw" ] || [ "${1:-}" = "-r" ]; then _raw=1; fi
+            local all
+            if all="$(wifi_current_all)"; then
+                set -- $all
+                # --raw 给 App 用：一次调用拿全（信号/信道/速率/噪声）。
+                # system_profiler 一次要约 1.7 秒，App 原来为了拿速率和噪声
+                # 去跑两次 status（各 1.8 秒），Wi-Fi 页刷新要 5 秒——就是这里慢的。
+                if [ "$_raw" = "1" ]; then
+                    printf 'rssi=%s channel=%s rate=%s noise=%s\n' "$1" "$2" "$3" "$4"
+                    return 0
+                fi
+                # 信噪比：差值小于 20dB 说明信号被噪声淹了，速率再高也白搭
+                local _snr=""
+                if [ "$4" != "0" ]; then _snr="  信噪比 $(( $1 - $4 )) dB"; fi
+                printf 'Wi-Fi %s  信号 %s dBm（%s/4 格）  信道 %s' \
                     "${ACTIVE_WIFI_DEV:-?}" "$1" "$(wifi_bars "$1")" "${2:-?}"
+                [ "$3" != "0" ] && printf '  协商速率 %s Mbps' "$3"
+                [ "$4" != "0" ] && printf '  噪声 %s dBm' "$4"
+                printf '%s\n' "$_snr"
             else
                 echo "读不到当前 Wi-Fi 信号（可能未连接）"
             fi

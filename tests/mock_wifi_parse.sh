@@ -12,6 +12,7 @@
 #
 # 运行: bash tests/mock_wifi_parse.sh
 cd "$(dirname "$0")/.."
+SRC="$PWD/smartroute.sh"
 PASS=0; FAIL=0
 ok()  { printf '  ✓ %s\n' "$1"; PASS=$((PASS+1)); }
 bad() { printf '  ✗ %s\n' "$1"; FAIL=$((FAIL+1)); }
@@ -32,11 +33,19 @@ case "list":
     let text = (try? String(contentsOfFile: args[2], encoding: .utf8)) ?? ""
     print(WifiParsing.savedNetworks(text).joined(separator: "\n"))
 case "current":
-    if let r = WifiParsing.currentSignal(args[2]) {
+    // 文件里可能是人类格式，也可能是一行 key=value（--raw）
+    let text = (try? String(contentsOfFile: args[2], encoding: .utf8)) ?? args[2]
+    if let r = WifiParsing.currentSignal(text) {
         print("\(r.rssi)|\(r.channel)|\(r.bars)")
     } else {
         print("nil")
     }
+case "rate":
+    let text = (try? String(contentsOfFile: args[2], encoding: .utf8)) ?? args[2]
+    print(WifiParsing.capture(text, pattern: "rate=([0-9]+)") ?? "nil")
+case "noise":
+    let text = (try? String(contentsOfFile: args[2], encoding: .utf8)) ?? args[2]
+    print(WifiParsing.capture(text, pattern: "noise=(-?[0-9]+)") ?? "nil")
 case "nearby":
     let text = (try? String(contentsOfFile: args[2], encoding: .utf8)) ?? ""
     for n in WifiParsing.nearbyNetworks(text) {
@@ -123,6 +132,44 @@ if printf '%s' "$out" | grep -q "信号"; then
 else
     ok "解析结果不含\"信号\"/\"dBm\"等字样（确认取的是捕获组）"
 fi
+
+echo "=== 6b. wifi current --raw：一次调用拿全（App 走这条） ==="
+# 这条格式存在的理由：system_profiler 一次要约 1.7 秒，App 原来为了速率和噪声
+# 去跑两次 status（各 1.8 秒），Wi-Fi 页刷新要 5 秒。
+if [ -s /tmp/cur_raw.txt ]; then
+    echo "  真实输出: $(cat /tmp/cur_raw.txt)"
+    out="$("$T/parse" current /tmp/cur_raw.txt)"
+    echo "  解析: $out"
+    case "$out" in
+        -[0-9]*|[0-9]*) ok "raw 格式能解析出信号" ;;
+        *) bad "raw 格式解析失败: $out" ;;
+    esac
+    # bars 必须和脚本的 wifi_bars 一致（同一个 dBm 必须得到同一个格数）。
+    # 这条断言抓到一起真实的档位错位：脚本按 -5*/-4*→4、-6*→3、-7*→2 分档，
+    # 而 Swift 那边原来是 -50~-59→3，导致 -52 dBm 在命令行显示 4 格、App 显示 3 格。
+    awk '/^# ---------------- 入口 ----------------/{exit} {print}' "$SRC" > "$T/pre.sh"
+    rssi="${out%%|*}"
+    want="$(bash -c ". '$T/pre.sh'; wifi_bars '$rssi'")"
+    got="$(printf '%s' "$out" | cut -d'|' -f3)"
+    [ "$want" = "$got" ] && ok "格数与脚本一致（$rssi dBm -> $got 格）" || bad "脚本算 $want 格，Swift 算 $got 格"
+    out="$("$T/parse" rate /tmp/cur_raw.txt)"
+    case "$out" in ''|nil) echo "  （本机无速率，跳过）" ;; *) ok "速率可解析: $out Mbps" ;; esac
+    out="$("$T/parse" noise /tmp/cur_raw.txt)"
+    case "$out" in ''|nil) echo "  （本机无噪声，跳过）" ;; *) ok "噪声可解析: $out dBm" ;; esac
+fi
+# 人类格式仍然要认（命令行输出没变）
+out="$("$T/parse" current "Wi-Fi en1  信号 -70 dBm（2/4 格）  信道 44")"
+[ "$out" = "-70|44|2" ] && ok "人类格式仍能解析" || bad "得到: $out"
+# 只有 raw 格式时，中文字段缺失也不能崩
+out="$("$T/parse" current "rssi=-52 channel=6 rate=432 noise=-96")"
+[ "$out" = "-52|6|4" ] && ok "纯 key=value 也能解析（-52 是 4 格）" || bad "得到: $out"
+# 逐个档位和脚本比对，防止再次错位
+for dbm in -45 -52 -60 -65 -70 -75 -85; do
+    want="$(bash -c ". '$T/pre.sh'; wifi_bars '$dbm'")"
+    got="$("$T/parse" current "rssi=$dbm channel=6" | cut -d'|' -f3)"
+    [ "$want" = "$got" ] || bad "档位不一致：$dbm dBm 脚本=$want Swift=$got"
+done
+ok "7 个档位全部与脚本一致"
 
 echo "=== 7. 附近网络：喂真实 scan 输出 ==="
 if [ -s /tmp/real_scan.txt ]; then

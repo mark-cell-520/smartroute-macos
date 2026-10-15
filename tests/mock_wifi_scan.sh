@@ -39,10 +39,15 @@ sed -e "s|^LOG_FILE=.*|LOG_FILE=\"$T/run/log\"|" \
 # helper 与 pre.sh 同目录，wifi_scan_bin 用 BASH_SOURCE 就能找到
 cp "$T/bin/wifiscan" "$T/wifiscan"
 
+# 注意：MOCK_CURRENT / MOCK_NO_HELPER 也必须在这里导出。
+# 曾经漏了 MOCK_CURRENT，mock 的 --current 输出空，wifi_current_all 于是回退
+# 去读真的 system_profiler——断言"碰巧"对上（当时真实噪声正好是 -96），
+# 测试因为错误的原因通过。后来真实噪声变成 -97 就失败了。
 run() {
     bash -c "
         export PATH='$T/bin:$PATH'
         export MOCK_SCAN_OUT='$MOCK_SCAN_OUT' MOCK_SCAN_RC='${MOCK_SCAN_RC:-0}'
+        export MOCK_CURRENT='${MOCK_CURRENT:-}' MOCK_NO_HELPER='${MOCK_NO_HELPER:-0}'
         . '$T/pre.sh'
         ACTIVE_WIFI_DEV=en1; ACTIVE_WIFI_SVC='Wi-Fi'
         STATE_FILE='$T/run/state'
@@ -122,6 +127,38 @@ if printf '%s' "$out" | grep -qi "Operation not permitted"; then
     bad "刷了权限错误"
 else
     ok "写不了 state 时静默降级"
+fi
+
+echo "=== 10. wifi_current_all：快路径与兜底 ==="
+# 快路径走 CoreWLAN helper，比 system_profiler 快一个数量级
+# （实测 helper 首次 0.3s/之后 0.01s，system_profiler 1.6s）。
+# helper 不在时必须回退 system_profiler，功能不能少。
+cat > "$T/bin/wifiscan" <<'EOF2'
+#!/bin/bash
+if [ "$1" = "--current" ]; then
+    if [ "${MOCK_NO_HELPER:-0}" = "1" ]; then exit 1; fi
+    printf '%b' "${MOCK_CURRENT:-}"
+    exit 0
+fi
+printf '%b' "${MOCK_SCAN_OUT:-}"
+exit ${MOCK_SCAN_RC:-0}
+EOF2
+chmod +x "$T/bin/wifiscan"; cp "$T/bin/wifiscan" "$T/wifiscan"
+MOCK_CURRENT=$'-70\t44\t432\t-96\n'
+out="$(run 'wifi_current_all')"
+[ "$out" = "-70 44 432 -96" ] && ok "快路径：helper 输出四项齐全" || bad "得到: $out"
+out="$(run 'wifi_current_all | awk "{print \$1, \$4}"')"
+[ "$out" = "-70 -96" ] && ok "rssi 与噪声位置正确" || bad "得到: $out"
+
+echo "=== 11. helper 挂了要回退 system_profiler（数据不能少） ==="
+out="$(run 'export MOCK_NO_HELPER=1; wifi_current_all')"
+# 回退路径读真 system_profiler；本机连着 Wi-Fi 应该有值
+if [ -n "$out" ]; then
+    ok "回退成功，仍有数据: $out"
+    n="$(printf '%s\n' "$out" | wc -w | tr -d ' ')"
+    [ "$n" = "4" ] && ok "四项齐全（rssi 信道 速率 噪声）" || bad "只有 $n 项"
+else
+    echo "  （本机读不到 system_profiler，跳过）"
 fi
 
 echo
