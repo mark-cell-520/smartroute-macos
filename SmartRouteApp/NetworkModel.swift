@@ -4,13 +4,14 @@ import SwiftUI
 // MARK: - 页面枚举
 
 enum AppPage: String, CaseIterable, Identifiable {
-    case status, speed, balance, rules, routing, doctor, log, daemon, about
+    case status, speed, balance, wifi, rules, routing, doctor, log, daemon, about
     var id: String { rawValue }
     var title: String {
         switch self {
         case .status:  return "状态"
         case .speed:   return "网速与延迟"
         case .balance: return "双网并发"
+        case .wifi:    return "Wi-Fi 网络"
         case .rules:   return "分流规则"
         case .routing: return "选路设置"
         case .doctor:  return "体检"
@@ -25,6 +26,7 @@ enum AppPage: String, CaseIterable, Identifiable {
         case .status:  return "谁在上网、网关通不通、服务顺序一览"
         case .speed:   return "实时速率与延迟；失焦时自动停采"
         case .balance: return "按连接把流量分摊到两条线路（实验特性）"
+        case .wifi:    return "选网络、看信号；上不了网时自动换能上网的"
         case .rules:   return "指定网段固定走某条线路"
         case .routing: return "选路模式与探测参数"
         case .doctor:  return "一键排查守护进程、路由与 pf"
@@ -38,6 +40,7 @@ enum AppPage: String, CaseIterable, Identifiable {
         case .status:  return "dot.radiowaves.left.and.right"
         case .speed:   return "speedometer"
         case .balance: return "arrow.triangle.branch"
+        case .wifi:    return "wifi"
         case .rules:   return "list.bullet.rectangle"
         case .routing: return "slider.horizontal.3"
         case .doctor:  return "stethoscope"
@@ -201,6 +204,17 @@ final class NetworkModel: ObservableObject {
     @Published var balanceLatency: [String: String] = [:]   // 设备名 -> "14.3 ms"
     @Published var balanceLoading = false
     @Published var balanceMessage = ""
+
+    // MARK: Wi-Fi
+    @Published var wifiSaved: [String] = []          // 已保存的网络（靠前优先）
+    @Published var wifiSignal = ""                   // "-70 dBm"
+    @Published var wifiChannel = ""                  // "44"
+    @Published var wifiBars = 0                      // 0~4
+    @Published var wifiLoading = false
+    @Published var wifiMessage = ""
+    @Published var wifiJoining = ""                  // 正在连接的 SSID（用于转圈）
+    @Published var wifiFailoverOn = false
+    @Published var wifiPreferred = ""                // 逗号分隔的优先列表
 
     // MARK: 分流规则
     @Published var rules: [RouteRule] = []
@@ -816,6 +830,158 @@ final class NetworkModel: ObservableObject {
                     }
                     self.balanceMessage = "操作失败: \(msg)"
                 }
+            }
+        }
+    }
+
+    // MARK: - Wi-Fi 网络选择
+
+    /// 读已保存网络 + 当前信号。免权限，普通 Shell 就够。
+    func loadWifi() {
+        let script = ScriptLocator.scriptPath
+        DispatchQueue.global().async {
+            var saved: [String] = []
+            var signal = "", channel = "", bars = "0"
+            let listOut = Shell.run("'\(script)' wifi list", timeout: 8).out
+            if !listOut.isEmpty {
+                saved = listOut.components(separatedBy: "\n")
+                    .compactMap { line -> String? in
+                        let t = line.trimmingCharacters(in: .whitespaces)
+                        // 形如 "  1. CZ-305"，去掉序号前缀
+                        guard let r = t.range(of: "^\\s*[0-9]+\\.\\s*(.+)$", options: .regularExpression) else { return nil }
+                        return String(t[r]).trimmingCharacters(in: .whitespaces)
+                    }
+            }
+            let curOut = Shell.run("'\(script)' wifi current", timeout: 8).out
+            if !curOut.isEmpty {
+                // 形如 "Wi-Fi en1  信号 -70 dBm（2/4 格）  信道 44"
+                if let r = curOut.range(of: "信号\\s+(-?[0-9]+)\\s+dBm", options: .regularExpression) {
+                    signal = String(curOut[r])
+                }
+                if let r = curOut.range(of: "信道\\s+([0-9]+)", options: .regularExpression) {
+                    channel = String(curOut[r])
+                }
+                if let r = curOut.range(of: "（([0-9]+)/4 格）", options: .regularExpression) {
+                    bars = String(curOut[r])
+                }
+            }
+            DispatchQueue.main.async {
+                self.wifiSaved = saved
+                self.wifiSignal = signal
+                self.wifiChannel = channel
+                self.wifiBars = Int(bars) ?? 0
+            }
+        }
+    }
+
+    /// 连接到一个 Wi-Fi。已保存的网络不用输密码。
+    func wifiJoin(_ ssid: String) {
+        guard wifiJoining.isEmpty else { return }   // 正在连另一个，别并发
+        wifiJoining = ssid
+        wifiMessage = ""
+        let script = ScriptLocator.scriptPath
+        DispatchQueue.global().async {
+            do {
+                let out = try Privileged.run("'\(script)' wifi join \(Shell.quote(ssid))")
+                DispatchQueue.main.async {
+                    self.wifiJoining = ""
+                    self.loadWifi()
+                    self.wifiMessage = out.isEmpty ? "已连接到 \(ssid)" : out
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.wifiJoining = ""
+                    var msg = error.localizedDescription
+                    if msg.contains("连接") && msg.contains("失败") {
+                        msg += "\n\n提示：只有「已保存过」的网络才能一键连接（密码在系统钥匙串里）。"
+                        msg += "\n新网络请先在系统菜单栏的 Wi-Fi 里连一次，之后这里就能一键切了。"
+                    }
+                    self.wifiMessage = "切换失败: \(msg)"
+                }
+            }
+        }
+    }
+
+    /// 逐个试连已保存网络，自动连上第一个能上网的
+    func wifiTryAll() {
+        wifiLoading = true
+        wifiMessage = ""
+        let script = ScriptLocator.scriptPath
+        DispatchQueue.global().async {
+            do {
+                let out = try Privileged.run("'\(script)' wifi tryall")
+                DispatchQueue.main.async {
+                    self.wifiLoading = false
+                    self.loadWifi()
+                    self.wifiMessage = out
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.wifiLoading = false
+                    self.wifiMessage = "失败: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    /// 开关自动故障转移
+    func setWifiFailover(on: Bool) {
+        wifiLoading = true
+        wifiMessage = ""
+        let script = ScriptLocator.scriptPath
+        DispatchQueue.global().async {
+            do {
+                _ = try Privileged.run("'\(script)' wifi auto \(on ? "on" : "off")")
+                DispatchQueue.main.async {
+                    self.wifiLoading = false
+                    self.loadWifiFailover()
+                    self.wifiMessage = on ? "已开启自动切换" : "已关闭自动切换"
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.wifiLoading = false
+                    self.wifiMessage = "设置失败: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    /// 保存优先尝试列表（逗号分隔）
+    func saveWifiPreferred() {
+        // 用户多半会习惯打中文逗号或带空格，先规整成半角逗号+去空格，
+        // 否则脚本那边 tr ',' ' ' 拆不开，列表看着设了其实没生效
+        let normalized = wifiPreferred
+            .replacingOccurrences(of: "，", with: ",")
+            .replacingOccurrences(of: " ", with: "")
+        wifiPreferred = normalized
+        wifiMessage = ""
+        setConfigBatch([("WIFI_PREFERRED", Shell.quote(normalized))]) { ok, msg in
+            DispatchQueue.main.async {
+                self.wifiMessage = ok ? (normalized.isEmpty ? "已恢复默认顺序" : "优先列表已保存") : "保存失败: \(msg)"
+                self.loadWifiFailover()
+            }
+        }
+    }
+
+    /// 读自动故障转移开关与优先列表
+    func loadWifiFailover() {
+        let script = ScriptLocator.scriptPath
+        DispatchQueue.global().async {
+            var on = false, preferred = ""
+            let stOut = Shell.run("'\(script)' wifi auto status", timeout: 8).out
+            if !stOut.isEmpty {
+                for line in stOut.components(separatedBy: "\n") {
+                    if line.hasPrefix("WIFI_FAILOVER=") {
+                        on = line.replacingOccurrences(of: "WIFI_FAILOVER=", with: "") == "1"
+                    } else if line.hasPrefix("优先列表:") {
+                        let v = line.replacingOccurrences(of: "优先列表:", with: "").trimmingCharacters(in: .whitespaces)
+                        preferred = (v == "(空，按系统保存顺序)") ? "" : v
+                    }
+                }
+            }
+            DispatchQueue.main.async {
+                self.wifiFailoverOn = on
+                self.wifiPreferred = preferred
             }
         }
     }

@@ -7,6 +7,12 @@ import Foundation
 /// （objc_exception_throw → SIGABRT）。历史上这里只 terminate 后睡 300ms，
 /// 遇到慢命令（如 balance status 里的延迟测量）就会崩。
 enum Shell {
+    /// 把任意字符串包成可安全放进 shell 命令的单引号字面量。
+    /// Wi-Fi 名里出现空格、单引号、$ 都很常见，不转义会直接被 shell 拆开或求值。
+    static func quote(_ s: String) -> String {
+        "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
     /// - Returns: (输出(stdout+stderr), 退出码)
     static func run(_ command: String, timeout: TimeInterval = 20) -> (out: String, code: Int32) {
         let task = Process()

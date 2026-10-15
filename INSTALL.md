@@ -85,6 +85,7 @@ App 打开后，顶部会出现蓝色横幅：**「守护进程需要更新 / �
 | 状态 | 谁在上网、网关通不通、服务顺序、切换历史 |
 | 网速与延迟 | 实时速率曲线（每接口一条）+ 延迟丢包 |
 | 双网并发 | 开启/关闭按连接分流；轮询或"最快线路"模式 |
+| Wi-Fi 网络 | 一键切换已保存的 Wi-Fi；上不了网时自动换能上网的 |
 | 分流规则 | 指定网段固定走某条线路（如公司内网走有线） |
 | 选路设置 | 选路模式、探测开关（TLS/通知/自动开 Wi-Fi）、判定阈值 |
 | 体检 | 一键排查 + **导出诊断报告** |
@@ -113,6 +114,13 @@ smartroute set wifi               # 强制走 Wi-Fi（auto / ethernet / wifi）
 smartroute log 100                # 看最近 100 行日志
 smartroute fixconf                # App 提示"保存失败"时修配置属主（需 sudo）
 sudo smartroute report > r.txt    # 一键诊断报告（贴给别人排查用）
+
+# —— Wi-Fi 选择与自动切换 ——
+smartroute wifi list             # 已保存的 Wi-Fi（免权限）
+smartroute wifi current          # 当前信号强度与信道（免权限）
+smartroute wifi join CZ-305      # 一键切换到已保存的网络
+smartroute wifi tryall           # 逐个试连，自动连上第一个能上网的
+sudo smartroute wifi auto on     # Wi-Fi 上不了网时自动换网络
 ```
 
 报告是纯文本，包含硬件接口、接口地址、IPv4 路由表、pf 状态与锚点规则、

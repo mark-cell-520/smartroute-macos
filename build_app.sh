@@ -46,6 +46,7 @@ swiftc -O -swift-version 5 \
     SmartRouteApp/Privileged.swift \
     SmartRouteApp/ScriptLocator.swift \
     SmartRouteApp/NetworkModel.swift \
+    SmartRouteApp/WifiView.swift \
     SmartRouteApp/Views.swift \
     SmartRouteApp/SmartRouteApp.swift \
     -framework SwiftUI -framework AppKit -framework Combine

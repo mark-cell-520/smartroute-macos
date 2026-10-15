@@ -13,7 +13,7 @@ struct MainView: View {
         NavigationSplitView {
             List(selection: $model.page) {
                 Section("监控") {
-                    ForEach([AppPage.status, .speed, .balance, .rules]) { p in
+                    ForEach([AppPage.status, .speed, .balance, .wifi, .rules]) { p in
                         Label(p.title, systemImage: p.icon).tag(p)
                     }
                 }
@@ -32,6 +32,7 @@ struct MainView: View {
                 case .status:  StatusView(model: model)
                 case .speed:   SpeedView(model: model)
                 case .balance: BalanceView(model: model)
+                case .wifi:    WifiView(model: model)
                 case .rules:   RulesView(model: model)
                 case .routing: RoutingView(model: model)
                 case .doctor:  DoctorView(model: model)
@@ -60,6 +61,8 @@ struct MainView: View {
             model.loadBalance()
             model.loadRules()
             model.loadQuality()
+            model.loadWifi()
+            model.loadWifiFailover()
             model.startSpeedMonitor()
         }
         .onReceive(timer) { _ in
@@ -70,6 +73,7 @@ struct MainView: View {
             guard model.shouldPoll() else { return }
             model.refresh()
             if model.page == .balance { model.loadBalance() }
+            if model.page == .wifi { model.loadWifi() }
             if model.page == .rules { model.loadRules() }
         }
         .onReceive(qualityTimer) { _ in

@@ -45,9 +45,12 @@ BALANCE_MODE="round-robin"  # 并发分流策略: round-robin=两个接口轮询
 FASTEST_SWITCH_RATIO=20     # 判定"明显更快"的延迟差阈值（百分比）。低于这个差距就继续轮询，
                             # 避免在两条差不多的线路间来回切
 FASTEST_RECHECK=12          # fastest 模式下守护进程重新测延迟的轮询次数（每轮约 20 秒）
+WIFI_FAILOVER=0             # Wi-Fi 上不了网时，自动试连其它已保存的 Wi-Fi（1 开启）
+WIFI_PREFERRED=""           # 优先试连的 Wi-Fi 名（逗号分隔，靠前优先）。留空=按系统保存顺序
+WIFI_FAILOVER_COOLDOWN=120  # Wi-Fi 故障转移的最小间隔（秒），防止在网络间来回跳
 
 # 可用 set 命令修改的配置项
-VALID_KEYS="MODE OK_N FAIL_N COOLDOWN PROBE_TARGETS PING_TIMEOUT NC_TIMEOUT TLS_PROBE NOTIFY AUTO_WIFI_POWER BALANCE BALANCE_MODE FASTEST_SWITCH_RATIO"
+VALID_KEYS="MODE OK_N FAIL_N COOLDOWN PROBE_TARGETS PING_TIMEOUT NC_TIMEOUT TLS_PROBE NOTIFY AUTO_WIFI_POWER BALANCE BALANCE_MODE FASTEST_SWITCH_RATIO WIFI_FAILOVER WIFI_PREFERRED WIFI_FAILOVER_COOLDOWN"
 
 CONF="/etc/smartroute.conf"                     # 系统级配置（root 维护，install.sh 生成）
 USER_CONF="/Users/Shared/smartroute.conf"       # 用户级配置（App/普通用户可写，优先级更高）
@@ -69,7 +72,9 @@ ts()  { date '+%Y-%m-%d %H:%M:%S'; }
 
 log() {
     local msg="$*"
-    printf '%s %s\n' "$(ts)" "$msg" >> "$LOG_FILE" 2>/dev/null
+    # 用 { } 2>/dev/null 包住：普通用户写不了 root 的日志文件时，
+    # bash 会把"重定向失败"打到自己的 stderr，那样会在终端里刷一行噪音
+    { printf '%s %s\n' "$(ts)" "$msg" >> "$LOG_FILE"; } 2>/dev/null
     if [ -f "$LOG_FILE" ]; then
         local sz
         sz=$(stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)
@@ -103,6 +108,13 @@ usage() {
   rule add <CIDR> <接口>   添加静态分流规则，如 rule add 10.0.0.0/8 en0（普通用户可写，守护进程应用）
   rule del <CIDR>          删除规则
   rule list                查看规则及生效情况
+
+Wi-Fi 选择与自动故障转移:
+  wifi list               列出已保存的 Wi-Fi（靠前优先，免权限）
+  wifi current            当前 Wi-Fi 的信号强度与信道（免权限）
+  wifi join <网络名>       连接到指定 Wi-Fi（已保存的不用输密码）
+  wifi tryall             逐个试连已保存的 Wi-Fi，自动连上第一个能上网的
+  wifi auto on|off|status  Wi-Fi 上不了网时自动切换到其它可用网络
 
 监控:
   stats        各活跃接口的累计收发字节（供 App 计算实时速率）
@@ -599,6 +611,9 @@ cmd_watch() {
         notify "smartroute" "已自动打开 Wi-Fi"
     fi
 
+    # 【Wi-Fi 自动故障转移】Wi-Fi 上不了网、以太网也没外网时，自动换个能上网的 Wi-Fi
+    wifi_failover_if_needed "$wifi_ok" "$eth_ok" "$wifi_res"
+
     # 期望的首选设备
     want=""
     case "$MODE" in
@@ -715,7 +730,7 @@ cmd_set() {
             case "$val" in auto|ethernet|wifi) ;; *) echo "MODE 只能是 auto|ethernet|wifi"; exit 1 ;; esac ;;
         OK_N|FAIL_N|COOLDOWN|PING_TIMEOUT|NC_TIMEOUT)
             [[ "$val" =~ ^[0-9]+$ ]] || { echo "$key 必须是正整数"; exit 1; } ;;
-        TLS_PROBE|NOTIFY|AUTO_WIFI_POWER|BALANCE)
+        TLS_PROBE|NOTIFY|AUTO_WIFI_POWER|BALANCE|WIFI_FAILOVER|WIFI_PREFERRED|WIFI_FAILOVER_COOLDOWN)
             case "$val" in 0|1) ;; *) echo "$key 只能是 0 或 1"; exit 1 ;; esac ;;
     esac
 
@@ -1667,9 +1682,236 @@ cmd_report() {
     balance_status 2>/dev/null | sed 's/^/    /' || echo "    (读取失败，可能需要 root)"
 
     echo
+    echo "----- [10] Wi-Fi 网络与故障转移 -----"
+    _wsig="$(wifi_current_signal 2>/dev/null)"
+    if [ -n "$_wsig" ]; then
+        set -- $_wsig
+        echo "当前信号: $1 dBm（$(wifi_bars "$1")/4 格）  信道 ${2:-?}"
+    else
+        echo "当前信号: 读不到（Wi-Fi 可能未连接）"
+    fi
+    echo "已保存的网络（靠前优先）:"
+    wifi_saved_list 2>/dev/null | sed 's/^/    /' || echo "    (读取失败)"
+    echo "自动故障转移: WIFI_FAILOVER=$WIFI_FAILOVER  优先列表=${WIFI_PREFERRED:-(空)}  冷却=${WIFI_FAILOVER_COOLDOWN}秒"
+    _wfl="$(state_get wifi_failover_last 2>/dev/null)"
+    case "$_wfl" in
+        ''|*[!0-9]*) _wfl="从未" ;;
+        *) _wfl="$(date -r "$_wfl" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$_wfl")" ;;
+    esac
+    echo "上次故障转移尝试: $_wfl"
+
+    echo
     echo "===== 报告结束 ====="
     echo "提示：把这份报告贴给别人时，里面的 IP 都是内网地址（192.168.x.x 之类），"
     echo "     不包含密码或令牌，可以放心分享。"
+}
+
+# ---------------- Wi-Fi 网络选择与自动故障转移 ----------------
+# 说明（重要）：
+#   · macOS 不给人看"附近有哪些 Wi-Fi"的免权限接口。CoreWLAN 扫描能拿到信号强度，
+#     但 SSID 要位置权限；networksetup 的 -getairportnetwork 在部分系统上也读不到。
+#   · 但"已保存的网络"是免权限的（networksetup -listpreferredwirelessnetworks），
+#     所以自动故障转移走这条路线：Wi-Fi 上不了网时，按优先级逐个试连已保存的网络，
+#     连上后立刻探测外网，通了就留下、不通就下一个。不需要位置权限，也不需要用户输密码
+#     （已保存的网络密码在钥匙串里）。
+#   · networksetup -setairportnetwork 失败时**也返回退出码 0**，所以成败必须解析输出文本。
+
+# 已保存的 Wi-Fi 列表（按系统偏好顺序，最优先在前）
+wifi_saved_list() {
+    networksetup -listpreferredwirelessnetworks "$ACTIVE_WIFI_DEV" 2>/dev/null \
+        | sed -n '2,$p' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$'
+}
+
+# 候选列表 = WIFI_PREFERRED 里指定的（靠前优先）+ 其余已保存的（去重）
+wifi_preferred_candidates() {
+    local pref saved out="" ssid
+    pref="$(printf '%s' "$WIFI_PREFERRED" | tr ',' ' ')"
+    saved="$(wifi_saved_list | tr '\n' ' ')"
+    for ssid in $pref $saved; do
+        [ -n "$ssid" ] || continue
+        case " $out " in *" $ssid "*) continue ;; esac
+        out="$out $ssid"
+    done
+    printf '%s\n' "${out# }"
+}
+
+# 当前连接的信号强度（dBm）与信道。这两个免权限，system_profiler 就能读到。
+wifi_current_signal() {   # ->  stdout: "<rssi> <channel>"，读不到输出空
+    local out
+    out="$(system_profiler SPAirPortDataType 2>/dev/null)"
+    local rssi ch
+    rssi="$(printf '%s\n' "$out" | sed -n 's/.*Signal \/ Noise:[[:space:]]*\(-*[0-9][0-9]*\) dBm.*/\1/p' | head -1)"
+    ch="$(printf '%s\n' "$out" | sed -n 's/.*Channel:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)"
+    [ -n "$rssi" ] || return 1
+    printf '%s %s\n' "$rssi" "${ch:-0}"
+}
+
+# dBm -> 人类可读的格数（0~4）。-50 以内满格，-80 以外一格
+wifi_bars() {   # $1=dBm
+    local r="$1"
+    case "$r" in
+        ''|*[!0-9-]*) echo "?" ;;
+        -5*|-4*) echo "4" ;;
+        -6*) echo "3" ;;
+        -7*) echo "2" ;;
+        *) echo "1" ;;
+    esac
+}
+
+# 连接到一个 Wi-Fi。$1=SSID。成功返回 0。
+# 注意：networksetup 失败也返回 0，所以必须看输出里有没有错误字样。
+wifi_join() {   # $1=SSID -> 0 成功 / 1 失败
+    local ssid="$1" out
+    [ -n "$ssid" ] || return 1
+    out="$(networksetup -setairportnetwork "$ACTIVE_WIFI_DEV" "$ssid" 2>&1)"
+    case "$out" in
+        *"Could not find network"*|*"Failed"*|*"Error"*|*"error"*|*"not associated"*|*"Invalid"*)
+            log "wifi join '$ssid' 失败: $out"
+            return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# 连上之后等接口真正拿到地址（DHCP 可能要一两秒）
+wifi_wait_associated() {   # $1=最多等几秒
+    local i max=$(( ${1:-6} * 2 ))
+    i=0
+    while [ "$i" -lt "$max" ]; do
+        dev_active "$ACTIVE_WIFI_DEV" && return 0
+        sleep 0.5
+        i=$((i+1))
+    done
+    dev_active "$ACTIVE_WIFI_DEV"
+}
+
+# 试连列表里的 Wi-Fi，返回第一个"能上网"的 SSID（stdout）。
+# $1=候选列表（空格分隔，可为空=用已保存列表）；$2=每个最多等几秒
+# 副作用：会真的切换网络。调用方负责确认"现在确实上不了网"。
+wifi_try_candidates() {   # ->  stdout: 成功的 SSID（全失败输出空）
+    local cands="$1" wait_s="${2:-6}" ssid gw
+    [ -n "$cands" ] || cands="$(wifi_saved_list | tr '\n' ' ')"
+    [ -n "$cands" ] || return 1
+
+    for ssid in $cands; do
+        [ -n "$ssid" ] || continue
+        log "wifi 故障转移：试连 '$ssid'"
+        wifi_join "$ssid" || continue
+        wifi_wait_associated "$wait_s" || { log "'$ssid' 连上了但没拿到 IP，跳过"; continue; }
+        # 连上≠能上网：门户认证/假连接很常见，必须真探一次
+        gw="$(svc_router "$ACTIVE_WIFI_SVC")"
+        if probe_dev "$ACTIVE_WIFI_DEV" "$gw" | sed -n 1p | grep -q '^ok$'; then
+            log "wifi 故障转移：'$ssid' 可以上网"
+            printf '%s\n' "$ssid"
+            return 0
+        fi
+        log "'$ssid' 能连上但没有外网，试下一个"
+    done
+    return 1
+}
+
+# Wi-Fi 自动故障转移。
+# 触发条件（全部满足才动，宁可不动也不能把用户正在用的网络弄坏）：
+#   · WIFI_FAILOVER=1 且以 root 运行（即守护进程）
+#   · 用户没有强制 MODE=ethernet
+#   · Wi-Fi 确认上不了网（滞回后 wifi_ok != 1），且不是"接口都没激活"
+#   · 以太网也没有外网（否则默认路由走以太网，切 Wi-Fi 没有意义）
+#   · 距上次尝试已过 WIFI_FAILOVER_COOLDOWN 秒
+wifi_failover_if_needed() {   # $1=wifi_ok $2=eth_ok $3=wifi_res
+    local wifi_ok="$1" eth_ok="$2" wifi_res="$3"
+    [ "$WIFI_FAILOVER" = "1" ] || return 0
+    [ "$(id -u)" -eq 0 ] || return 0
+    [ -n "$ACTIVE_WIFI_DEV" ] || return 0
+    [ "$MODE" = "ethernet" ] && return 0
+    [ "$wifi_ok" != "1" ] || return 0
+    [ "$eth_ok" != "1" ] || return 0
+    # 接口压根没激活（Wi-Fi 被关/没网卡）时不要瞎试
+    [ "$wifi_res" != "na" ] || return 0
+
+    local now last
+    now="$(date +%s)"
+    last="$(state_get wifi_failover_last)"
+    case "$last" in ''|*[!0-9]*) last=0 ;; esac
+    [ $((now - last)) -ge "$WIFI_FAILOVER_COOLDOWN" ] || return 0
+    state_set wifi_failover_last "$now"
+
+    log "Wi-Fi 故障转移：当前 Wi-Fi 上不了网，开始按优先级试连其它已保存网络"
+    local got
+    got="$(wifi_try_candidates "$(wifi_preferred_candidates)" 6)"
+    if [ -n "$got" ]; then
+        log "Wi-Fi 故障转移成功：已切到 $got"
+        notify "smartroute" "已自动切换到可用 Wi-Fi：$got"
+    else
+        log "Wi-Fi 故障转移：已保存的 Wi-Fi 都没有外网，放弃本轮"
+    fi
+    return 0
+}
+
+cmd_wifi() {
+    local arg="${1:-status}"
+    case "$arg" in
+        list|ls)
+            find_active
+            echo "已保存的 Wi-Fi（靠前优先）："
+            local n=0 ssid
+            while IFS= read -r ssid; do
+                [ -n "$ssid" ] || continue
+                n=$((n+1)); printf '  %d. %s\n' "$n" "$ssid"
+            done < <(wifi_saved_list)
+            [ "$n" -gt 0 ] || echo "  （没有已保存的 Wi-Fi）"
+            ;;
+        current|cur|status|st)
+            find_active
+            local sig
+            if sig="$(wifi_current_signal)"; then
+                set -- $sig
+                printf 'Wi-Fi %s  信号 %s dBm（%s/4 格）  信道 %s\n' \
+                    "${ACTIVE_WIFI_DEV:-?}" "$1" "$(wifi_bars "$1")" "${2:-?}"
+            else
+                echo "读不到当前 Wi-Fi 信号（可能未连接）"
+            fi
+            ;;
+        join|connect)
+            shift
+            local target="${1:-}"
+            [ -n "$target" ] || die "用法: smartroute wifi join <网络名>"
+            find_active
+            [ -n "$ACTIVE_WIFI_DEV" ] || die "没有检测到 Wi-Fi 接口"
+            # Wi-Fi 被关了就帮你打开
+            [ "$(wifi_power "$ACTIVE_WIFI_DEV")" = "off" ] && set_wifi_power "$ACTIVE_WIFI_DEV" on
+            if wifi_join "$target" && wifi_wait_associated 8; then
+                echo "✅ 已连接到 $target"
+                [ "$NOTIFY" = "1" ] && notify "SmartRoute" "已连接到 Wi-Fi：$target"
+            else
+                die "连接 $target 失败（不在范围 / 密码已改 / 未保存过这个网络）"
+            fi
+            ;;
+        tryall|scan-join)
+            find_active
+            [ -n "$ACTIVE_WIFI_DEV" ] || die "没有检测到 Wi-Fi 接口"
+            echo "正在逐个试连已保存的 Wi-Fi，找第一个能上网的…"
+            local got
+            got="$(wifi_try_candidates "" 6)"
+            if [ -n "$got" ]; then
+                echo "✅ 找到可用的网络：$got"
+                [ "$NOTIFY" = "1" ] && notify "SmartRoute" "已切换到可用 Wi-Fi：$got"
+            else
+                echo "❌ 已保存的 Wi-Fi 都没有外网"
+            fi
+            ;;
+        auto)
+            shift
+            case "${1:-status}" in
+                on|1)  conf_set_auto WIFI_FAILOVER 1; echo "已开启 Wi-Fi 自动故障转移" ;;
+                off|0) conf_set_auto WIFI_FAILOVER 0; echo "已关闭 Wi-Fi 自动故障转移" ;;
+                status|st)
+                    echo "WIFI_FAILOVER=$WIFI_FAILOVER"
+                    echo "优先列表: ${WIFI_PREFERRED:-(空，按系统保存顺序)}"
+                    echo "切换冷却: ${WIFI_FAILOVER_COOLDOWN} 秒" ;;
+                *) die "用法: smartroute wifi auto on|off|status" ;;
+            esac
+            ;;
+        *) die "用法: smartroute wifi list|current|join <网络名>|tryall|auto on|off|status" ;;
+    esac
 }
 
 # ---------------- 入口 ----------------
@@ -1686,6 +1928,7 @@ main() {
         set)            cmd_set "$@" ;;
         log)            cmd_log "$@" ;;
         balance|bal)    cmd_balance "$@" ;;
+        wifi|w)         cmd_wifi "$@" ;;
         fixconf)        cmd_fixconf ;;
         rule)           cmd_rule "$@" ;;
         stats)          cmd_stats ;;

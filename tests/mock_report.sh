@@ -15,7 +15,7 @@ OUT="$(bash smartroute.sh report 2>&1)"
 
 echo "=== 1. 九个区段齐全 ==="
 for sec in "smartroute 诊断报告" "硬件接口" "接口地址" "路由表" "pf 状态" \
-           "配置" "守护进程状态" "状态文件" "最近日志" "双网并发状态" "报告结束"; do
+           "配置" "守护进程状态" "状态文件" "最近日志" "双网并发状态" "Wi-Fi 网络与故障转移" "报告结束"; do
     if printf '%s' "$OUT" | grep -q "$sec"; then ok "含区段：$sec"; else bad "缺区段：$sec"; fi
 done
 
@@ -58,7 +58,12 @@ else
 fi
 rm -f "$T"
 
-echo "=== 8. usage 里登记了这个命令 ==="
+echo "=== 8. Wi-Fi 区段内容 ==="
+printf '%s' "$OUT" | grep -q "已保存的网络" && ok "列出了已保存网络" || bad "缺已保存网络"
+printf '%s' "$OUT" | grep -q "自动故障转移: WIFI_FAILOVER=" && ok "显示故障转移开关状态" || bad "缺故障转移状态"
+printf '%s' "$OUT" | grep -q "优先列表=" && ok "显示优先列表" || bad "缺优先列表"
+
+echo "=== 9. usage 里登记了这个命令 ==="
 bash smartroute.sh --help 2>&1 | grep -q "report" && ok "--help 里有 report" || bad "--help 缺 report"
 
 echo
