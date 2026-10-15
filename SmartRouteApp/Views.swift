@@ -148,7 +148,7 @@ struct StatusView: View {
                     // 断网/恢复时颜色平滑过渡，不刺眼
                     .animation(.easeInOut(duration: 0.35), value: model.snapshot.defaultReachable)
                 }
-                VStack(alignment: .leading, spacing: 3) {
+                VStack(alignment: .leading, spacing: Theme.gapXS) {
                     Text("当前默认路由").font(.headline)
                     Text("\(deviceDisplayName(model.snapshot.defaultDevice))   via   \(model.snapshot.defaultGateway.isEmpty ? "?" : model.snapshot.defaultGateway)")
                         .font(.title3.monospaced())
@@ -292,7 +292,7 @@ struct SpeedView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: Theme.gapM) {
                 if model.monitoredDevices.isEmpty {
                     Card {
                         Text("没有检测到活跃接口")
@@ -314,7 +314,7 @@ struct SpeedView: View {
 
     private var qualityCard: some View {
         Card(title: "延迟与丢包", subtitle: "每 30 秒更新；root 下按接口分别探测") {
-            VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: Theme.gapS) {
                 if model.quality.isEmpty {
                     Text("测量中…").foregroundStyle(.secondary)
                 }
@@ -334,12 +334,11 @@ struct SpeedView: View {
                     }
                 }
             }
-            .padding(6)
         }
     }
 
     private func qualityValue(label: String, value: String, color: Color = .primary) -> some View {
-        VStack(spacing: 2) {
+        VStack(spacing: Theme.gapXS) {
             Text(label).font(.caption2).foregroundStyle(.secondary)
             Text(value).font(.system(.callout, design: .monospaced)).foregroundStyle(color)
         }
@@ -348,14 +347,13 @@ struct SpeedView: View {
 
     private var hintCard: some View {
         Card {
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: Theme.gapS) {
                 Label("想两个接口同时跑流量？去「双网并发」页开启 pf 分流。", systemImage: "arrow.triangle.branch")
                     .font(.callout)
                 Text("开启后这里能直接看到两个接口的实时曲线同时起伏，即证明流量被分摊。")
                     .font(.caption).foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(4)
         }
     }
 }
@@ -371,12 +369,12 @@ struct SpeedCard: View {
 
     var body: some View {
         Card {
-            VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: Theme.gapS) {
                 HStack {
                     Image(systemName: icon).font(.title3)
                     Text("\(role)（\(dev)）").font(.headline)
                     Spacer()
-                    HStack(spacing: 14) {
+                    HStack(spacing: Theme.gapM) {
                         Label(formatSpeed(model.speedIn[dev] ?? 0), systemImage: "arrow.down")
                             .foregroundStyle(.green)
                             .font(.system(.callout, design: .monospaced))
@@ -385,7 +383,7 @@ struct SpeedCard: View {
                             .font(.system(.callout, design: .monospaced))
                     }
                 }
-                HStack(spacing: 8) {
+                HStack(spacing: Theme.gapS) {
                     Sparkline(values: model.historyIn[dev] ?? [], color: .green)
                         .frame(height: 40)
                     Sparkline(values: model.historyOut[dev] ?? [], color: .blue)
@@ -397,7 +395,6 @@ struct SpeedCard: View {
                     Text("上传曲线").font(.caption2).foregroundStyle(.blue)
                 }
             }
-            .padding(6)
         }
     }
 
@@ -484,7 +481,7 @@ struct BalanceView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: Theme.gapM) {
                 statusCard
                 controlCard
                 liveCard
@@ -505,7 +502,7 @@ struct BalanceView: View {
 
     private var statusCard: some View {
         Card(title: "并发分流状态") {
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: Theme.gapS) {
                 HStack {
                     statusDot(on: model.balanceOn, text: model.balanceOn ? "已开启" : "未开启")
                     Spacer()
@@ -516,7 +513,6 @@ struct BalanceView: View {
                 LabeledContent("系统 pf", value: pfLine)
                 LabeledContent("分流规则", value: ruleLine)
             }
-            .padding(6)
         }
     }
 
@@ -541,7 +537,7 @@ struct BalanceView: View {
     }
 
     private func statusDot(on: Bool, text: String) -> some View {
-        HStack(spacing: 6) {
+        HStack(spacing: Theme.gapXS) {
             Circle().fill(on ? Theme.ok : Theme.idle).frame(width: 10, height: 10)
             Text(text).font(.headline)
         }
@@ -549,7 +545,7 @@ struct BalanceView: View {
 
     private var controlCard: some View {
         Card {
-            VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: Theme.gapS) {
                 Text(model.balanceOn
                      ? (model.balanceMode == "fastest" ? "正在把新连接全部送到延迟更低的那条线路。" : "正在把新连接轮询分发到两个接口。")
                      : "开启后，不同的网络连接会分别走以太网和 Wi-Fi。")
@@ -567,7 +563,7 @@ struct BalanceView: View {
 
                 // 各接口实时延迟（选"最快"时就是靠它决定走哪条）
                 if !model.balanceLatency.isEmpty {
-                    HStack(spacing: 16) {
+                    HStack(spacing: Theme.gapM) {
                         ForEach(model.monitoredDevices, id: \.self) { dev in
                             Label("\(roleName(dev)) \(model.balanceLatency[dev] ?? "—")",
                                   systemImage: "timer")
@@ -601,7 +597,6 @@ struct BalanceView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
-            .padding(6)
         }
     }
 
@@ -609,7 +604,7 @@ struct BalanceView: View {
         Card(title: model.balanceMode == "fastest"
              ? "实时流量（只有一条在动 = 正在走最快线路）"
                  : "实时流量（两个接口一起动 = 分流生效）") {
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: Theme.gapS) {
                 ForEach(model.monitoredDevices, id: \.self) { dev in
                     HStack {
                         Text(roleName(dev)).frame(width: 80, alignment: .leading)
@@ -624,7 +619,6 @@ struct BalanceView: View {
                     Text("暂无活跃接口").foregroundStyle(.secondary)
                 }
             }
-            .padding(6)
         }
     }
 
@@ -639,7 +633,7 @@ struct BalanceView: View {
 
     private var explainCard: some View {
         Card(title: "原理与限制", subtitle: "务必阅读") {
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: Theme.gapS) {
                 point("✅", "不同连接走不同接口：浏览、多线程下载、云同步、视频会议等会自然分摊到两个接口")
                 point("✅", "开启前会自动做 10 个连接验证；流量没分布到两个接口就自动还原，不会留下半截配置")
                 point("✅", "任一口失去外网，守护进程会自动关闭并发并还原（安全阀，20 秒内）")
@@ -650,12 +644,11 @@ struct BalanceView: View {
                 point("💡", "两个接口在同一网段时效果最好（源地址天然合法）；不同网段会额外做 NAT")
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(4)
         }
     }
 
     private func point(_ icon: String, _ text: String) -> some View {
-        HStack(alignment: .top, spacing: 8) {
+        HStack(alignment: .top, spacing: Theme.gapS) {
             Text(icon)
             Text(text).font(.callout)
         }
@@ -705,7 +698,7 @@ struct RulesView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {
-                VStack(alignment: .leading, spacing: 6) {
+                VStack(alignment: .leading, spacing: Theme.gapS) {
                     Text("静态分流规则：把指定网段的流量固定从某个接口出去，优先级高于默认选路。")
                         .font(.callout)
                     Text("写入 \(ScriptLocator.userRules)，普通用户可写；守护进程（root）在 ≤20 秒内添加/删除对应路由。")
@@ -984,13 +977,13 @@ struct DaemonView: View {
                         Image(systemName: "trash.circle.fill")
                             .foregroundStyle(Theme.bad)
                             .font(.title3)
-                        VStack(alignment: .leading, spacing: 2) {
+                        VStack(alignment: .leading, spacing: Theme.gapXS) {
                             Text("彻底卸载（零残留）").font(.headline)
                             Text("会一次清掉下面全部内容，卸载完不留任何痕迹")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                     }
-                    VStack(alignment: .leading, spacing: 3) {
+                    VStack(alignment: .leading, spacing: Theme.gapXS) {
                         uninstallItem("守护进程（停止 + 删 plist）")
                         uninstallItem("命令行工具 /usr/local/bin/smartroute")
                         uninstallItem("双网并发的 pf 分流规则与锚点文件")
@@ -1061,11 +1054,11 @@ struct AboutView: View {
     var body: some View {
         Form {
             Section {
-                HStack(spacing: 14) {
+                HStack(spacing: Theme.gapM) {
                     Image(nsImage: NSApp.applicationIconImage)
                         .resizable()
                         .frame(width: 64, height: 64)
-                    VStack(alignment: .leading, spacing: 4) {
+                    VStack(alignment: .leading, spacing: Theme.gapXS) {
                         Text("SmartRoute").font(.title2.bold())
                         Text("macOS 智能选路 · 双网并发 · 分流规则").foregroundStyle(.secondary)
                         Text("版本 2.2").font(.caption).foregroundStyle(.secondary)
