@@ -99,6 +99,8 @@ struct NetworkSnapshot {
     var daemonRunning: Bool = false
     var daemonScriptOutdated: Bool = false
     var lastUpdated: String = ""
+    /// 上次成功采集的时间（用于算"x 秒前"，比字符串更准）
+    var lastUpdatedAt: Date = Date.distantPast
 }
 
 final class NetworkModel: ObservableObject {
@@ -122,6 +124,43 @@ final class NetworkModel: ObservableObject {
     @Published var daemonMessage = ""
     /// 彻底卸载的二次确认弹窗（此环境 @State 宏不可用，只能放 Model 里）
     @Published var confirmFullUninstall = false
+
+    // MARK: - 自适应轮询
+    /// 连续多少次快照"关键字段"完全没变（用于降频省电）
+    private var stableStreak = 0
+    private var lastPollAt = Date.distantPast
+    /// 当前生效的轮询间隔：默认 5 秒；连续 36 秒（约 6 次）没变化就拉到 10 秒
+    private(set) var pollInterval: TimeInterval = 5
+    private var lastSignature = ""
+
+    /// 到了该采集的时候吗？（配合 5 秒的 Timer 实现自适应间隔）
+    func shouldPoll() -> Bool {
+        Date().timeIntervalSince(lastPollAt) >= pollInterval
+    }
+
+    /// 记录本次轮询时间，并按快照变化情况调整下一次间隔
+    private func notePoll(signature: String) {
+        lastPollAt = Date()
+        if signature == lastSignature {
+            stableStreak += 1
+        } else {
+            stableStreak = 0
+            lastSignature = signature
+        }
+        // 稳定 6 次（约 30~60 秒）后降频到 10 秒；一有变化立刻回到 5 秒
+        pollInterval = stableStreak >= 6 ? 10 : 5
+    }
+
+    /// 快照里"值得为它多跑一次命令"的字段签名
+    private func signature(of snap: NetworkSnapshot) -> String {
+        var ips = ""
+        for i in snap.interfaces.sorted(by: { $0.device < $1.device }) {
+            ips += "\(i.device):\(i.ip):\(i.active ? 1 : 0);"
+        }
+        return [snap.defaultDevice, snap.defaultGateway,
+                snap.defaultReachable ? "1" : "0",
+                snap.ethOK, snap.wifiOK, snap.mode, ips].joined(separator: "|")
+    }
     @Published var daemonInstalling = false
 
     // MARK: 选路表单
@@ -197,6 +236,7 @@ final class NetworkModel: ObservableObject {
             let snap = self.collectSnapshot()
             DispatchQueue.main.async {
                 self.snapshot = snap
+                self.notePoll(signature: self.signature(of: snap))
                 self.endOp("refresh")
             }
         }
@@ -269,6 +309,7 @@ final class NetworkModel: ObservableObject {
         snapshot.daemonRunning = daemonIsRunning()
         snapshot.daemonScriptOutdated = ScriptLocator.daemonScriptOutdated
         snapshot.lastUpdated = Self.timeString()
+        snapshot.lastUpdatedAt = Date()
         return snapshot
     }
 

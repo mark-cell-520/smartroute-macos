@@ -357,3 +357,31 @@ struct WelcomeView: View {
         }
     }
 }
+
+// MARK: - 数据新鲜度徽标
+
+/// 显示"x 秒前更新"，让用户知道 App 是活的、数据不旧。
+/// 超过 30 秒变橙色提醒（说明采集可能卡了）。
+/// 无内部定时器：跟随父视图的 5 秒刷新一起更新（少一个定时器就少一分卡顿）
+struct FreshnessBadge: View {
+    let since: Date
+    var now: Date = Date()
+
+    var body: some View {
+        Text(label)
+            .font(.caption)
+            .foregroundStyle(seconds > 30 ? Theme.warn : Color.secondary)
+            .help("上次成功采集数据的时间")
+    }
+
+    private var seconds: Int {
+        Int(now.timeIntervalSince(since))
+    }
+
+    private var label: String {
+        guard since > Date.distantPast else { return "尚未采集" }
+        let s = max(0, seconds)
+        if s < 60 { return "\(s) 秒前更新" }
+        return "\(s / 60) 分 \(s % 60) 秒前更新"
+    }
+}

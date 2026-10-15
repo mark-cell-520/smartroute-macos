@@ -66,6 +66,8 @@ struct MainView: View {
             // 失焦时完全不采集：5 秒一次、每次五六个进程，后台白烧电。
             // 切回前台时 applicationDidBecomeActive 会立刻补一次刷新，数据不会旧。
             guard NSApp.isActive else { return }
+            // 自适应间隔：网络状况稳定时降频到 10 秒，一有变化立刻回到 5 秒
+            guard model.shouldPoll() else { return }
             model.refresh()
             if model.page == .balance { model.loadBalance() }
             if model.page == .rules { model.loadRules() }
@@ -143,6 +145,8 @@ struct StatusView: View {
                     Image(systemName: model.snapshot.defaultReachable ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
                         .font(.system(size: 26))
                         .foregroundStyle(model.snapshot.defaultReachable ? Theme.ok : Theme.warn)
+                    // 断网/恢复时颜色平滑过渡，不刺眼
+                    .animation(.easeInOut(duration: 0.35), value: model.snapshot.defaultReachable)
                 }
                 VStack(alignment: .leading, spacing: 3) {
                     Text("当前默认路由").font(.headline)
@@ -151,8 +155,7 @@ struct StatusView: View {
                     HStack(spacing: Theme.gapXS) {
                         Pill(text: model.snapshot.defaultReachable ? "网关可达" : "网关不可达",
                              color: model.snapshot.defaultReachable ? Theme.ok : Theme.warn)
-                        Text("更新于 \(model.snapshot.lastUpdated)")
-                            .font(.caption).foregroundStyle(.secondary)
+                        FreshnessBadge(since: model.snapshot.lastUpdatedAt)
                         Text("最近切换 \(model.snapshot.lastSwitch)（共 \(model.snapshot.switchCount) 次）")
                             .font(.caption).foregroundStyle(.secondary)
                     }
@@ -181,11 +184,13 @@ struct StatusView: View {
                             Spacer()
                             if svc.device == model.snapshot.defaultDevice {
                                 Pill(text: "当前默认", color: Theme.brand, icon: "star.fill", filled: true)
+                                    .transition(.scale.combined(with: .opacity))
                             }
                             Text(svc.device).font(.caption).foregroundStyle(.secondary)
                         }
                     }
                 }
+                .animation(.easeInOut(duration: 0.3), value: model.snapshot.defaultDevice)
             }
         }
     }
@@ -228,6 +233,8 @@ struct InterfaceCard: View {
                     Text(role).font(.headline)
                     Spacer()
                     ProbePill(value: probe, streak: streak)
+                        // 探测判定从"检测中"变成"有/无外网"时淡入，不要硬跳
+                        .animation(.easeOut(duration: 0.28), value: probe)
                 }
                 if let iface, iface.active {
                     KeyValueRow(key: "设备", value: iface.device, monospaced: true)
@@ -410,18 +417,62 @@ struct Sparkline: View {
             ZStack {
                 RoundedRectangle(cornerRadius: 4)
                     .fill(color.opacity(0.06))
-                Path { p in
-                    guard values.count > 1 else { return }
-                    let maxV = max(values.max() ?? 1, 1.0)
-                    let w = geo.size.width, h = geo.size.height
-                    for (i, v) in values.enumerated() {
-                        let x = w * CGFloat(i) / CGFloat(values.count - 1)
-                        let y = h - max(1, h * CGFloat(v / maxV))
-                        if i == 0 { p.move(to: CGPoint(x: x, y: y)) } else { p.addLine(to: CGPoint(x: x, y: y)) }
+
+                if values.count > 1 {
+                    // 面积填充：让曲线有体积感，读起来更直观
+                    Path { p in
+                        let maxV = max(values.max() ?? 1, 1.0)
+                        let w = geo.size.width, h = geo.size.height
+                        p.move(to: CGPoint(x: 0, y: h))
+                        for (i, v) in values.enumerated() {
+                            let x = w * CGFloat(i) / CGFloat(values.count - 1)
+                            let y = h - max(1, h * CGFloat(v / maxV))
+                            p.addLine(to: CGPoint(x: x, y: y))
+                        }
+                        p.addLine(to: CGPoint(x: w, y: h))
+                        p.closeSubpath()
                     }
+                    .fill(
+                        LinearGradient(
+                            colors: [color.opacity(0.22), color.opacity(0.0)],
+                            startPoint: .top, endPoint: .bottom
+                        )
+                    )
+
+                    // 折线用 Catmull-Rom 平滑，去掉锯齿感
+                    Path { p in
+                        let maxV = max(values.max() ?? 1, 1.0)
+                        let w = geo.size.width, h = geo.size.height
+                        let pts = values.enumerated().map { i, v -> CGPoint in
+                            CGPoint(x: w * CGFloat(i) / CGFloat(values.count - 1),
+                                    y: h - max(1, h * CGFloat(v / maxV)))
+                        }
+                        p.move(to: pts[0])
+                        for i in 1..<pts.count {
+                            let p0 = pts[max(0, i - 2)]
+                            let p1 = pts[i - 1]
+                            let p2 = pts[i]
+                            let p3 = pts[min(pts.count - 1, i + 1)]
+                            let c1 = CGPoint(x: p1.x + (p2.x - p0.x) / 6, y: p1.y + (p2.y - p0.y) / 6)
+                            let c2 = CGPoint(x: p2.x - (p3.x - p1.x) / 6, y: p2.y - (p3.y - p1.y) / 6)
+                            p.addCurve(to: p2, control1: c1, control2: c2)
+                        }
+                    }
+                    .stroke(color, style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
                 }
-                .stroke(color, style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
+
+                // 最新值点
+                if let last = values.last, let maxV = values.max(), maxV > 0 {
+                    let x = geo.size.width
+                    let y = geo.size.height - max(1, geo.size.height * CGFloat(last / maxV))
+                    Circle()
+                        .fill(color)
+                        .frame(width: 5, height: 5)
+                        .position(x: x - 3, y: y)
+                        .shadow(color: color.opacity(0.5), radius: 3)
+                }
             }
+            .animation(.easeOut(duration: 0.35), value: values.count)
         }
     }
 }
