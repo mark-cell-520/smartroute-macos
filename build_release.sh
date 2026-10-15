@@ -58,6 +58,11 @@ lipo -create "$PWD/.build/arm64" "$PWD/.build/x86_64" -output "$APP/Contents/Mac
 lipo -info "$APP/Contents/MacOS/SmartRoute"
 
 # ---------- 3. 资源 ----------
+echo "==> 编译 Wi-Fi 扫描组件（免权限，按指定 SSID 扫）"
+swiftc -O -module-cache-path "$MC" tools/wifiscan.swift \
+    -o "$APP/Contents/MacOS/wifiscan" || {
+    echo "!! wifiscan 编译失败，附近网络扫描将不可用"; exit 1; }
+
 echo "==> 拷贝资源"
 cp smartroute.sh install.sh uninstall.sh com.user.smartroute.plist "$APP/Contents/Resources/"
 chmod +x "$APP/Contents/Resources/smartroute.sh" \

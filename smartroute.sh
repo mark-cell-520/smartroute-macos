@@ -454,7 +454,24 @@ state_get() {
     awk -F= -v k="$1" '$1==k{print $2; exit}' "$STATE_FILE" 2>/dev/null
 }
 
+# state 文件能不能写。普通用户跑 smartroute（不是 root）时 state 在
+# /var/db/smartroute/ 下属 root，写不进去。这本身不是错误——缓存只是优化，
+# 写不进就每次真测/真扫。但必须**提前判断并记住**，否则每写一次就刷一条
+# "Operation not permitted"，用户看到满屏红字还以为出事了。
+STATE_WRITABLE=""
+state_writable() {
+    if [ -z "$STATE_WRITABLE" ]; then
+        if mkdir -p "$(dirname "$STATE_FILE")" 2>/dev/null &&            { [ -f "$STATE_FILE" ] && [ -w "$STATE_FILE" ] || [ -w "$(dirname "$STATE_FILE")" ]; }; then
+            STATE_WRITABLE=1
+        else
+            STATE_WRITABLE=0
+        fi
+    fi
+    [ "$STATE_WRITABLE" = "1" ]
+}
+
 state_set() {
+    state_writable || return 0
     mkdir -p "$(dirname "$STATE_FILE")" 2>/dev/null
     local tmp="$STATE_FILE.$$"
     if [ -f "$STATE_FILE" ]; then
@@ -709,16 +726,38 @@ cmd_status() {
     echo "选路模式     : $MODE"
     echo "判定结果     : eth_ok=$(state_get eth_ok) wifi_ok=$(state_get wifi_ok) streak_eth=$(state_get streak_eth) streak_wifi=$(state_get streak_wifi)"
     echo "最近切换     : $(human_ts "$(state_get last_switch)")（累计 $(state_get switch_count) 次）"
-    # 链路与实测：解释"为什么走了这条"。网线协商速率只有以太网读得到，
-    # Wi-Fi 在 macOS 上读不到（networksetup -getMedia 只回 autoselect），所以只显示实测。
+    # 链路与实测：解释"为什么走了这条"。
+    # 注意：以前这里写"Wi-Fi 读不到链路速率"，其实不对——读不到的是
+    # networksetup -getMedia（只回 autoselect），system_profiler 里有真实的
+    # Transmit Rate 和噪声底。用户最初的疑问"网线 100M、Wi-Fi 标称 1000M，
+    # 为什么不走 Wi-Fi"，答案就在这里。
     if [ -n "$ACTIVE_ETH_DEV" ]; then
         echo "以太网链路   : $(link_media "$ACTIVE_ETH_DEV" 2>/dev/null || echo 未知)"
     fi
     if [ -n "$ACTIVE_WIFI_DEV" ]; then
+        # 用局部变量，别用 set -- （会把位置参数冲掉，后面就取不到信号/信道了）
+        local _wrssi="" _wch="" _wrate="" _wnoise=""
         _wcur="$(wifi_current_signal 2>/dev/null)"
         if [ -n "$_wcur" ]; then
-            set -- $_wcur
-            echo "Wi-Fi 信号    : $1 dBm（$(wifi_bars "$1")/4 格）  信道 ${2:-?}"
+            _wrssi="${_wcur%% *}"
+            _wch="${_wcur##* }"
+        fi
+        _wrate="$(wifi_current_rate 2>/dev/null)"
+        if [ -n "$_wrate" ]; then
+            # 顺序要紧：先把噪声取出来，再截速率。反了就会拿速率当噪声。
+            _wnoise="${_wrate##* }"
+            _wrate="${_wrate%% *}"
+        fi
+        if [ -n "$_wrssi" ]; then
+            # 信噪比 = 信号 - 噪声。差值小于 20dB 说明信号被噪声淹了，
+            # 这时协商速率再高也白搭——这才是"有信号却慢"的真正原因。
+            local _snr_txt=""
+            if [ -n "$_wnoise" ] && [ "$_wnoise" != "0" ]; then
+                _snr_txt="  信噪比 $(( _wrssi - _wnoise )) dB"
+            fi
+            echo "Wi-Fi 信号    : ${_wrssi} dBm（$(wifi_bars "$_wrssi")/4 格）  信道 ${_wch:-?}  协商速率 ${_wrate:-?} Mbps  噪声 ${_wnoise:-?} dBm${_snr_txt}"
+        else
+            echo "Wi-Fi 信号    : 读不到（可能未连接 Wi-Fi）"
         fi
     fi
     _es="$(_metric_val "speed_$ACTIVE_ETH_DEV")"
@@ -1808,6 +1847,94 @@ wifi_preferred_candidates() {
     printf '%s\n' "${out# }"
 }
 
+# ---------- 附近网络扫描（免权限） ----------
+# macOS 的通用 Wi-Fi 扫描拿不到 SSID（要「定位服务」权限），但按指定 SSID
+# 扫描（CoreWLAN scanForNetworks(withSSID:)）不需要权限。我们只关心
+# "已保存的网络在不在范围"，正好用后者，由 tools/wifiscan.swift 实现。
+#
+# 输出协议（TSV）：SSID \t rssi \t channel \t fresh
+#   fresh=1 表示这次真的发了探测；fresh=0 表示系统直接返回了缓存。
+#   【必须区分】系统对扫描有冷却，刚扫过 A 紧接着问 B 可能拿 A 的缓存回答，
+#   而缓存里只有 A——B 就被误判成"不在范围"。所以"找不到"只有配 fresh=1 才算数；
+#   而"找到了"（rssi 有值）永远可信。
+WIFI_SCAN_TTL="${WIFI_SCAN_TTL:-25}"     # 扫描结果缓存多久（秒）
+wifi_scan_bin() {   # -> stdout: helper 路径；找不到输出空
+    local d c
+    # 脚本自身所在目录。不能只信 $0——被 source 进来时 $0 是调用方的路径，
+    # 测试里就是因此找不到 helper 的。BASH_SOURCE[0] 才是当前文件。
+    d="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+    for c in "$d/wifiscan" "$d/../MacOS/wifiscan" "$d/../Resources/wifiscan" \
+             "/usr/local/bin/smartroute-wifiscan" \
+             "/Applications/SmartRoute.app/Contents/MacOS/wifiscan" \
+             "/Applications/SmartRoute.app/Contents/Resources/wifiscan"; do
+        [ -x "$c" ] && { printf '%s\n' "$c"; return 0; }
+    done
+    return 1
+}
+
+# 扫一批 SSID。$1=空格分隔的 SSID 列表；$2=thorough（1=多轮重试，默认 0）。
+#   thorough=1 约 10 秒，能把"未探测"压到最少；给交互式命令用。
+#   thorough=0 约 1 秒；给自动切换这类不能等的场合用。
+# -> stdout: "SSID rssi channel"（只含有信号的，按信号降序）
+# -> 另设 WIFI_SCAN_UNKNOWN=几个没能确认在不在范围
+wifi_scan() {
+    local list="$1" thorough="${2:-0}" bin line ssid rssi ch fresh need="" out="" s
+    local NL=$'\n' 
+    bin="$(wifi_scan_bin)" || { WIFI_SCAN_AVAILABLE=0; WIFI_SCAN_UNKNOWN=0; return 1; }
+    WIFI_SCAN_AVAILABLE=1
+    WIFI_SCAN_UNKNOWN=0
+    [ -n "$list" ] || return 1
+
+    # 缓存还新鲜的直接拿来用
+    for s in $list; do
+        [ -n "$s" ] || continue
+        if _metric_fresh "wifiscan_$s" "$WIFI_SCAN_TTL"; then
+            line="$(_metric_get "wifiscan_$s")"
+            rssi="${line%% *}"
+            [ "$rssi" != "-" ] && out="$out$s $line$NL"
+        else
+            need="$need $s"
+        fi
+    done
+
+    # 剩下的真扫。helper 输出 TSV：SSID \t rssi \t channel \t fresh
+    if [ -n "${need# }" ]; then
+        local extra=""
+        [ "$thorough" = "1" ] || extra="--quick"
+        while IFS="$(printf '\t')" read -r ssid rssi ch fresh; do
+            [ -n "$ssid" ] || continue
+            if [ "$rssi" != "-" ]; then
+                # 找到了永远可信，直接缓存
+                _metric_set "wifiscan_$ssid" "$rssi $ch $fresh"
+                out="$out$ssid $rssi $ch$NL"
+            elif [ "$fresh" = "1" ]; then
+                # 真扫过且确实没有——权威的"不在范围"，可以缓存
+                _metric_set "wifiscan_$ssid" "- $ch $fresh"
+            else
+                # 没找到、又没真扫：这是系统缓存的假阴性，**不能缓存也不能信**。
+                # 实测：先问 A（真扫 1.3s），紧接着问 B 只用 0.02s 且报空，
+                # 但单独问 B 能拿到 -60。系统约每 5 秒才肯真扫一次。
+                WIFI_SCAN_UNKNOWN=$((WIFI_SCAN_UNKNOWN+1))
+            fi
+        done < <("$bin" $extra $need 2>/dev/null)
+    fi
+
+    [ -n "$out" ] || return 1
+    # 按信号降序。两个要点：
+    #  · -s 稳定排序：相等的键必须保持输入顺序，否则"其余按原顺序垫后"作废
+    #  · 先按 SSID 去重取最强：helper 已经这么做了，这里防一手重复行
+    #  · out 是"一行一条"，别用 printf '%s\n' $out（会把所有条拼成一行）
+    printf '%s' "$out" | awk 'NF>=3 {
+            r=($2=="-"?-999:$2+0)
+            if (!($1 in best) || r+0 > best[$1]) { best[$1]=r+0; ch[$1]=$3 }
+        }
+        END { for (k in best) printf "%d\t%s\t%s\n", best[k], k, ch[k] }' \
+        | sort -s -t"$(printf '\t')" -k1,1nr | awk -F"$(printf '\t')" '{print $2" "$1" "$3}'
+}
+
+# 附近有信号的已保存网络（按信号排序）。-> stdout: "SSID rssi channel"
+wifi_nearby() { wifi_scan "$(wifi_saved_list | tr '\n' ' ')" "${1:-0}"; }
+
 # 当前连接的信号强度（dBm）与信道。这两个免权限，system_profiler 就能读到。
 wifi_current_signal() {   # ->  stdout: "<rssi> <channel>"，读不到输出空
     local out
@@ -1817,6 +1944,20 @@ wifi_current_signal() {   # ->  stdout: "<rssi> <channel>"，读不到输出空
     ch="$(printf '%s\n' "$out" | sed -n 's/.*Channel:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)"
     [ -n "$rssi" ] || return 1
     printf '%s %s\n' "$rssi" "${ch:-0}"
+}
+
+# 当前 Wi-Fi 的真实协商速率（Mbps）与噪声底（dBm）。
+# 这两个免权限，system_profiler 就能读到——所以别再说什么"macOS 读不到
+# Wi-Fi 链路速率"了，读不到的是 networksetup -getMedia（只回 autoselect）。
+# 用户最初的疑问"网线 100M、Wi-Fi 标称 1000M，为什么不走 Wi-Fi"，
+# 这里给出的是真实答案（本机实测 864 Mbps，但信号只有 2 格）。
+wifi_current_rate() {   # -> stdout: "<速率Mbps> <噪声dBm>"，读不到输出空
+    local out rate noise
+    out="$(system_profiler SPAirPortDataType 2>/dev/null)"
+    rate="$(printf '%s\n' "$out" | sed -n 's/.*Transmit Rate:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)"
+    noise="$(printf '%s\n' "$out" | sed -n 's/.*Signal \/ Noise:[[:space:]]*-*[0-9]* dBm \/ *\(-*[0-9][0-9]*\) dBm.*/\1/p' | head -1)"
+    [ -n "$rate" ] || return 1
+    printf '%s %s\n' "$rate" "${noise:-0}"
 }
 
 # dBm -> 人类可读的格数（0~4）。-50 以内满格，-80 以外一格
@@ -1887,6 +2028,27 @@ wifi_power_cycle() {   # $1=设备
     sleep 2
     set_wifi_power "$d" on
     wifi_wait_associated 10
+}
+
+# 把候选列表按"附近信号强弱"重排：确认有信号的在前（强的更前），
+# 其余保持原顺序垫后。注意"没能确认"和"确认不在范围"都不提前——
+# 前者可能是假阴性，排在前面只是多花几秒，漏掉能用的网络才是真错。
+wifi_rank_candidates() {   # $1=空格分隔候选 -> stdout: 重排后的候选
+    local cands="$1" near="" s out=""
+    local NL=$'\n' 
+    near="$(wifi_scan "$cands" 0)"
+    [ -n "$near" ] || { printf '%s\n' "$cands"; return 0; }
+
+    # near 是 "SSID rssi ch" 一行一条；没有信号的候选原样保留在后面
+    local have=""
+    have="$(printf '%s\n' "$near" | awk '{print $1}' | tr '\n' ' ')"
+    for s in $cands; do
+        case " $have " in *" $s "*) ;; *) near="$near$NL$s - 0" ;; esac
+    done
+
+    printf '%s\n' "$near" | awk 'NF>=3 {r=($2=="-"?-999:$2+0); print r"\t"$1}' \
+        | sort -s -t"$(printf '\t')" -k1,1nr | awk -F"$(printf '\t')" '{printf "%s ", $2}'
+    echo
 }
 
 wifi_try_candidates() {   # $1=候选列表 $2=每个等几秒 -> stdout: 成功的 SSID；另设 WIFI_TRY_* 汇总
@@ -2044,6 +2206,55 @@ cmd_wifi() {
             done < <(wifi_saved_list)
             [ "$n" -gt 0 ] || echo "  （没有已保存的 Wi-Fi）"
             ;;
+        scan|sc|nearby)
+            find_active
+            [ -n "$ACTIVE_WIFI_DEV" ] || die "没有检测到 Wi-Fi 接口"
+            if ! wifi_scan_bin >/dev/null; then
+                echo "（找不到扫描组件 wifiscan，跳过附近网络检测）"
+                return 0
+            fi
+            # 默认 thorough（约 10 秒），把"没能确认"的压到最少；
+            # --quick 约 1 秒，给 App 轮询这种不能等的场合用。
+            # 注意 cmd_wifi 没有全局 shift，这里 $1 还是 "scan"，要先 shift 一次。
+            shift
+            local _thorough=1
+            case "${1:-}" in
+                --quick|-q) _thorough=0; echo "快速扫描（约 1 秒，部分结果可能未确认）…" ;;
+                *) echo "正在扫描附近的 Wi-Fi（约需 10 秒）…" ;;
+            esac
+            local near all far="" s rssi ch
+            near="$(wifi_nearby "$_thorough")"
+            all="$(wifi_saved_list | tr '\n' ' ')"
+
+            if [ -n "$near" ]; then
+                echo
+                echo "在范围的已保存网络（按信号排序，越靠前越好）："
+                while read -r s rssi ch; do
+                    [ -n "$s" ] || continue
+                    printf '  %-16s %5s dBm（%s/4 格）  信道 %s\n' \
+                        "$s" "$rssi" "$(wifi_bars "$rssi")" "${ch:-?}"
+                done < <(printf '%s\n' "$near")
+            else
+                echo
+                echo "附近没有已保存的网络在范围。"
+            fi
+
+            # 区分"确认不在范围"和"没能确认"——后者别让人以为查过了
+            local have=""
+            have="$(printf '%s\n' "$near" | awk '{print $1}' | tr '\n' ' ')"
+            for s in $all; do
+                case " $have " in *" $s "*) ;; *) far="$far $s" ;; esac
+            done
+            if [ -n "${far# }" ]; then
+                echo
+                echo "确认不在范围的（旁边没有这些路由器，属正常）："
+                for s in $far; do printf '  %s\n' "$s"; done
+            fi
+            if [ "${WIFI_SCAN_UNKNOWN:-0}" -gt 0 ]; then
+                echo
+                echo "有 $WIFI_SCAN_UNKNOWN 个没能确认（系统扫描有冷却，不是故障），重试即可。"
+            fi
+            ;;
         current|cur|status|st)
             find_active
             local sig
@@ -2091,8 +2302,16 @@ cmd_wifi() {
             fi
 
             echo "当前 Wi-Fi 上不了网，正在逐个试连已保存的网络…"
-            local got
-            got="$(wifi_try_candidates "" 6)"
+            # 用扫描结果把候选排个序：附近有信号的按信号强弱优先，
+            # 够不着的排最后。排序错了只是多花几秒，不会漏掉能用的网络——
+            # 所以够不着的一样会试，只是最后试。
+            local got ordered
+            ordered="$(wifi_rank_candidates "$(wifi_saved_list | tr '\n' ' ')")"
+            got="$(wifi_try_candidates "$ordered" 6)"
+            # 有几个网络没能确认在不在范围——如实告诉用户，别让他以为全查过了
+            if [ "${WIFI_SCAN_UNKNOWN:-0}" -gt 0 ]; then
+                echo "（有 $WIFI_SCAN_UNKNOWN 个网络没能确认在不在范围，已一并试过）"
+            fi
             if [ -n "$got" ]; then
                 echo "✅ 找到可用的网络：$got"
                 [ "$NOTIFY" = "1" ] && notify "SmartRoute" "已切换到可用 Wi-Fi：$got"

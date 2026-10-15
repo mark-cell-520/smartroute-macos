@@ -218,6 +218,15 @@ final class NetworkModel: ObservableObject {
     @Published var wifiSignal = ""                   // "-70 dBm"
     @Published var wifiChannel = ""                  // "44"
     @Published var wifiBars = 0                      // 0~4
+    @Published var wifiRate = ""                     // 协商速率 Mbps（真实值，非标称）
+    @Published var wifiNoise = ""                    // 噪声底 dBm
+    // 附近扫描：哪些已保存网络够得着、信号多强。
+    // 有了它才能把候选按信号排序、把够不着的置灰——都不需要定位权限，
+    // 也不用打断当前连接（按指定 SSID 扫描即可）。
+    @Published var wifiNearby: [WifiParsing.Nearby] = []
+    @Published var wifiScanning = false
+    @Published var wifiScanNote = ""                  // "有 N 个未能确认" 之类
+    @Published var wifiScanAt: Date? = nil            // 上次扫描时间
     @Published var wifiLoading = false
     @Published var wifiMessage = ""
     @Published var wifiJoining = ""                  // 正在连接的 SSID（用于转圈）
@@ -859,11 +868,57 @@ final class NetworkModel: ObservableObject {
                 Shell.run("'\(script)' wifi current", timeout: 8).out) {
                 signal = cur.rssi; channel = cur.channel; bars = cur.bars
             }
+            // 真实协商速率与噪声底。networksetup -getMedia 对 Wi-Fi 只回
+            // autoselect，但 system_profiler 里有 Transmit Rate——别再以为读不到。
+            var rate = "", noise = ""
+            if let r = WifiParsing.capture(
+                Shell.run("'\(script)' status", timeout: 12).out,
+                pattern: "协商速率[[:space:]]+([0-9]+)[[:space:]]+Mbps") {
+                rate = r
+            }
+            if let n = WifiParsing.capture(
+                Shell.run("'\(script)' status", timeout: 12).out,
+                pattern: "噪声[[:space:]]+(-?[0-9]+)[[:space:]]+dBm") {
+                noise = n
+            }
             DispatchQueue.main.async {
                 self.wifiSaved = saved
                 self.wifiSignal = signal
                 self.wifiChannel = channel
                 self.wifiBars = bars
+                self.wifiRate = rate
+                self.wifiNoise = noise
+            }
+        }
+    }
+
+    /// 扫描附近网络。thorough=false 约 1 秒（给轮询用），true 约 10 秒（给按钮用）。
+    ///
+    /// App 自己缓存结果而不是每次轮询都扫：扫描要 1 秒以上，而轮询是几秒一次，
+    /// 每次都扫既慢又费电。用户点「重新扫描」才强制刷。
+    func loadWifiScan(force: Bool = false, thorough: Bool = false) {
+        if wifiScanning { return }
+        // 30 秒内的缓存直接复用
+        if !force, let at = wifiScanAt, Date().timeIntervalSince(at) < 30 { return }
+
+        let script = ScriptLocator.scriptPath
+        wifiScanning = true
+        DispatchQueue.global().async {
+            let cmd = thorough
+                ? "'\(script)' wifi scan"
+                : "'\(script)' wifi scan --quick"
+            let out = Shell.run(cmd, timeout: thorough ? 40 : 15).out
+
+            let list = WifiParsing.nearbyNetworks(out)
+            var note = ""
+            if let n = WifiParsing.scanUnknownCount(out) {
+                note = "有 \(n) 个网络未能确认（系统扫描有冷却）"
+            }
+            DispatchQueue.main.async {
+                self.wifiNearby = list
+                self.wifiScanNote = note
+                self.wifiScanning = false
+                self.wifiScanAt = Date()
             }
         }
     }

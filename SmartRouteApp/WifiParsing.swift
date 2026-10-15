@@ -31,6 +31,48 @@ enum WifiParsing {
                 bars: bars.flatMap(Int.init) ?? 0)
     }
 
+    /// 附近网络的一条记录
+    struct Nearby: Identifiable, Equatable {
+        let id = UUID()
+        var name: String
+        var rssi: Int
+        var bars: Int
+        var channel: String
+    }
+
+    /// 解析 `smartroute wifi scan` 输出里「在范围的」那一段。
+    ///
+    /// 只取到空行或下一个标题为止——后面的「确认不在范围」「未能确认」
+    /// 是另一类信息，混进来会把不在范围的网络也显示成能连。
+    ///
+    /// 每行形如："  CZ-305    -52 dBm（4/4 格）  信道 6"
+    /// SSID 可能带空格（如 "A9 5G"），所以名字取到第一个空白为止，
+    /// 而不是按空白切分整行。
+    static func nearbyNetworks(_ text: String) -> [Nearby] {
+        var out: [Nearby] = []
+        var inRange = false
+        for line in text.components(separatedBy: "\n") {
+            let t = line.trimmingCharacters(in: .whitespaces)
+            if t.hasPrefix("在范围的") { inRange = true; continue }
+            // 段落结束：空行，或下一个标题
+            if inRange && (t.isEmpty || t.hasPrefix("确认不在") || t.hasPrefix("有 ")) { break }
+            guard inRange, !t.isEmpty else { continue }
+            guard let name = capture(t, pattern: "^([^[:space:]]+)"),
+                  let rssi = capture(t, pattern: "(-?[0-9]+)[[:space:]]+dBm"),
+                  let bars = capture(t, pattern: "（([0-9]+)/4") else { continue }
+            out.append(Nearby(name: name,
+                              rssi: Int(rssi) ?? 0,
+                              bars: Int(bars) ?? 0,
+                              channel: capture(t, pattern: "信道[[:space:]]+([0-9]+)") ?? "?"))
+        }
+        return out
+    }
+
+    /// 从 scan 输出里取「有 N 个未能确认」的 N（没有则 nil）
+    static func scanUnknownCount(_ text: String) -> Int? {
+        capture(text, pattern: "有[[:space:]]+([0-9]+)[[:space:]]+个没能确认").flatMap(Int.init)
+    }
+
     /// 取第一个捕获组。注意：`String.range(of:options:.regularExpression)`
     /// 返回的是**整个匹配**的范围，不是捕获组的——直接 String(x[r]) 会把
     /// "信号 -70 dBm" 整段当成值。必须用 NSRegularExpression 的 range(at: 1)。

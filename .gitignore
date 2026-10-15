@@ -22,3 +22,5 @@ SmartRoute.app
 tools/make_dmg_bg
 .dmgstage/
 .dmgbg.png
+# 编译产物：tools/wifiscan.swift 构建出来的二进制（源码要提交，二进制不要）
+/wifiscan

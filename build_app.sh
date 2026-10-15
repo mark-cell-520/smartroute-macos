@@ -48,6 +48,13 @@ swiftc -O -swift-version 5 \
     $SRCS \
     -framework SwiftUI -framework AppKit -framework Combine
 
+echo "==> 编译 Wi-Fi 扫描组件"
+# 免权限扫描附近 Wi-Fi 用（按指定 SSID 扫，不要定位权限）。少了它
+# smartroute wifi scan 就退化成"查不到"，界面上的附近网络也是空的。
+swiftc -O -module-cache-path "$PWD/.build/module-cache" \
+    tools/wifiscan.swift -o "$APP/Contents/MacOS/wifiscan" || {
+    echo "!! wifiscan 编译失败，附近网络扫描将不可用"; exit 1; }
+
 echo "==> 拷贝资源（脚本 + 安装卸载器 + plist）"
 cp smartroute.sh install.sh uninstall.sh com.user.smartroute.plist "$APP/Contents/Resources/"
 chmod +x "$APP/Contents/Resources/smartroute.sh" \

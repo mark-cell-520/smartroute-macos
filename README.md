@@ -100,9 +100,11 @@ smartroute quality              # 逐接口测延迟/丢包（root 下按接口�
 | `ethernet` | 只要以太网有外网就走以太网 | 有线优先 |
 | `wifi` | 只要 Wi-Fi 有外网就走 Wi-Fi | 网线口是局域网/坏口 |
 
-**为什么"网速优先"要实测，不看链路标称值？** 因为 macOS 上 Wi-Fi 根本读不到协商速率——
-`networksetup -getMedia en1` 只回 `autoselect`，而有线能读到（如 `100baseTX`）。
-所以只能两边各下载一点数据实测。实测有两个代价，都做了处理：
+**为什么"网速优先"要实测，不看链路标称值？** 因为链路的标称值说明不了问题——
+`networksetup -getMedia` 对 Wi-Fi 只回 `autoselect`（读不到），
+而有线能读到（如 `100baseTX`）。虽然 `system_profiler` 里有 Wi-Fi 的真实
+`Transmit Rate`，但它只是链路瞬时速率：弱信号下标称 1000M 的路由器
+可能只跑到几十兆。所以只能两边各下载一点数据实测。实测有两个代价，都做了处理：
 
 - **费流量**：结果缓存，默认 5 分钟才重测（`SPEED_RECHECK`）
 - **耗时数秒**：两个接口**串行**测。并行会互相抢带宽，两个数都偏小
@@ -116,13 +118,42 @@ smartroute measurements       # 看上次实测结果
 sudo smartroute measure now   # 立即重新测量
 ```
 
+### 附近网络扫描：免权限，也不打断连接
+
+`smartroute wifi scan` 会告诉你**现在够得着哪些已保存网络、信号多强**：
+
+```
+在范围的已保存网络（按信号排序，越靠前越好）：
+  CZ-305             -52 dBm（4/4 格）  信道 6
+  CZ-BH-407          -60 dBm（3/4 格）  信道 1
+
+确认不在范围的（旁边没有这些路由器，属正常）：
+  m
+  405-2
+```
+
+两个关键点：
+
+- **不需要「定位服务」权限**。macOS 的通用 Wi-Fi 扫描拿不到 SSID（要权限），
+  但**按指定 SSID 扫描**不需要——而我们只关心"已保存的网络在不在范围"。
+- **不打断当前连接**。不像 `networksetup -setairportnetwork` 那样一切就断。
+
+有了它，`tryall` 才能**按信号从强到弱**试，而不是按系统保存的任意顺序。
+
+> 注意「确认不在范围」和「未能确认」是两回事。系统对扫描有约 5 秒冷却，
+> 冷却期内问别的 SSID 会拿上次的缓存回答，可能被误判成不在范围。
+> 所以工具只把"真扫过且确实没有"算不在范围；拿不准的老实说"未能确认"，
+> 并且**照样会去试**——排序错了只是多花几秒，漏掉能用的网络才是真错。
+
 ### Wi-Fi 选择与自动切换（v2.2 新增）
 
 ```bash
 smartroute wifi list             # 已保存的 Wi-Fi（靠前优先，免权限）
 smartroute wifi current          # 当前信号强度与信道（免权限）
 smartroute wifi join CZ-305      # 一键切换到已保存的网络（不用输密码）
-smartroute wifi tryall           # 逐个试连，自动连上第一个能上网的
+smartroute wifi scan             # 看附近哪些已保存网络够得着、信号多强（约 10 秒）
+smartroute wifi scan --quick     # 快速版（约 1 秒，部分结果可能未确认）
+smartroute wifi tryall           # 逐个试连，按信号从强到弱，自动连上第一个能上网的
                                  # （当前已能上网时直接不动，不会把自己踢下线）
 sudo smartroute wifi auto on     # Wi-Fi 上不了网时，自动换到其它可用网络
 smartroute wifi auto status      # 看开关、优先列表、冷却时间

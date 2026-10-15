@@ -22,8 +22,10 @@ trap 'rm -rf "$T"' EXIT
 # ---------- 编译被测的解析代码 ----------
 cat > "$T/main.swift" <<'EOF'
 import Foundation
-// 命令：list <文件>   → 一行一个 SSID
-//       current <文本> → rssi|channel|bars
+// 命令：list <文件>      → 一行一个 SSID
+//       current <文本>   → rssi|channel|bars
+//       nearby <文件>    → 每条 "name|rssi|bars|channel"
+//       unknown <文件>   → 未能确认的个数
 let args = CommandLine.arguments
 switch args[1] {
 case "list":
@@ -35,6 +37,15 @@ case "current":
     } else {
         print("nil")
     }
+case "nearby":
+    let text = (try? String(contentsOfFile: args[2], encoding: .utf8)) ?? ""
+    for n in WifiParsing.nearbyNetworks(text) {
+        print("\(n.name)|\(n.rssi)|\(n.bars)|\(n.channel)")
+    }
+    print("count=\(WifiParsing.nearbyNetworks(text).count)")
+case "unknown":
+    let text = (try? String(contentsOfFile: args[2], encoding: .utf8)) ?? ""
+    print(WifiParsing.scanUnknownCount(text).map(String.init) ?? "nil")
 default:
     print("unknown")
 }
@@ -112,6 +123,49 @@ if printf '%s' "$out" | grep -q "信号"; then
 else
     ok "解析结果不含\"信号\"/\"dBm\"等字样（确认取的是捕获组）"
 fi
+
+echo "=== 7. 附近网络：喂真实 scan 输出 ==="
+if [ -s /tmp/real_scan.txt ]; then
+    out="$("$T/parse" nearby /tmp/real_scan.txt)"
+    echo "  真实输出解析结果:"; printf '%s\n' "$out" | sed 's/^/    /'
+    cnt="$(printf '%s\n' "$out" | sed -n 's/^count=//p')"
+    [ -n "$cnt" ] && [ "$cnt" -ge 1 ] && ok "解析出 $cnt 个附近网络" || bad "一个都没解析出来"
+    # 关键：不能把"确认不在范围"里的网络也当成能连的
+    if printf '%s' "$out" | grep -qE "^(m|405-2|A1234)\|"; then
+        bad "把不在范围的网络也解析成附近了"
+    else
+        ok "没有混入"确认不在范围"那一段"
+    fi
+    # 每条的 rssi 必须是整数
+    if printf '%s\n' "$out" | grep -v '^count=' | grep -qE '^[^|]+\|[^0-9-]'; then
+        bad "rssi 不是数字"
+    else
+        ok "rssi 都是数字"
+    fi
+else
+    echo "  （没有真实输出，跳过）"
+fi
+
+echo "=== 8. 附近网络：边界 ==="
+# 只有标题没有条目
+printf '在范围的已保存网络（按信号排序，越靠前越好）：\n\n确认不在范围的：\n' > "$T/n1.txt"
+out="$("$T/parse" nearby "$T/n1.txt")"
+[ "$out" = "count=0" ] && ok "空段落返回 0 条" || bad "得到: $out"
+# 没有"在范围的"标题时不该乱抓
+printf '确认不在范围的（旁边没有这些路由器，属正常）：\n  CZ-305\n' > "$T/n2.txt"
+out="$("$T/parse" nearby "$T/n2.txt")"
+[ "$out" = "count=0" ] && ok "没有标题时返回 0 条（不会误抓）" || bad "得到: $out"
+# SSID 带空格：名字取到第一个空白为止，但 rssi/bars 仍要抓对
+printf '在范围的：\n  A9 5G    -52 dBm（4/4 格）  信道 6\n' > "$T/n3.txt"
+out="$("$T/parse" nearby "$T/n3.txt")"
+printf '%s' "$out" | grep -q "A9|-52|4|6" && ok "带空格的 SSID 也能解析（名字到第一个空白）" || bad "得到: $out"
+# 未能确认的个数
+printf '有 3 个没能确认（系统扫描有冷却，不是故障），重试即可。\n' > "$T/n4.txt"
+out="$("$T/parse" unknown "$T/n4.txt")"
+[ "$out" = "3" ] && ok "未能确认个数可解析" || bad "得到: $out"
+printf '没有这句\n' > "$T/n5.txt"
+out="$("$T/parse" unknown "$T/n5.txt")"
+[ "$out" = "nil" ] && ok "没有该句时返回 nil" || bad "得到: $out"
 
 echo
 echo "结果: $PASS 通过, $FAIL 失败"

@@ -6,6 +6,16 @@ cd "$(dirname "$0")"
 echo "==> 安装 smartroute 到 /usr/local/bin"
 sudo install -m 0755 smartroute.sh /usr/local/bin/smartroute
 
+# Wi-Fi 扫描组件（免权限，按指定 SSID 扫）。装到 /usr/local/bin 下，
+# 这样 /usr/local/bin/smartroute 同目录就能找到它——守护进程和命令行都用得到。
+# 少了它只是退化：wifi scan 查不到附近网络，候选排序退回按保存顺序。
+if [ -f wifiscan ]; then
+    sudo install -m 0755 wifiscan /usr/local/bin/smartroute-wifiscan
+    echo "==> 已安装 Wi-Fi 扫描组件"
+else
+    echo "!! 没找到 wifiscan（附近网络扫描不可用，重新构建即可）"
+fi
+
 echo "==> 写入默认配置 /etc/smartroute.conf"
 if [ ! -f /etc/smartroute.conf ]; then
     echo "# smartroute 配置文件" | sudo tee /etc/smartroute.conf >/dev/null

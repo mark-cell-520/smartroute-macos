@@ -16,6 +16,7 @@ struct WifiView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.gapM) {
                 currentCard
+                nearbyCard
                 savedCard
                 autoCard
                 explainCard
@@ -25,8 +26,86 @@ struct WifiView: View {
         .onAppear {
             model.loadWifi()
             model.loadWifiFailover()
+            model.loadWifiScan()
         }
     }
+
+    /// 信噪比 = 信号 - 噪声。差值小于 20dB 说明信号被噪声淹了，
+    /// 这时协商速率再高也白搭——这才是"有信号却慢"的真正原因。
+    private var snrText: String {
+        guard let s = Int(model.wifiSignal), let n = Int(model.wifiNoise) else { return "?" }
+        return "\(s - n)"
+    }
+
+    // MARK: 附近网络
+
+    /// 附近有哪些已保存的网络够得着、信号多强。
+    /// 这是免权限做到的（按指定 SSID 扫描），也是唯一能把候选按信号排序的依据。
+    private var nearbyCard: some View {
+        Card(title: "附近的网络",
+             subtitle: model.wifiScanning ? "正在扫描…" : "够得着的才连得上，按信号排序") {
+            VStack(alignment: .leading, spacing: Theme.gapS) {
+                if model.wifiScanning && model.wifiNearby.isEmpty {
+                    HStack(spacing: Theme.gapS) {
+                        ProgressView().scaleEffect(0.7)
+                        Text("正在扫描附近的 Wi-Fi…").font(.caption).foregroundStyle(.secondary)
+                    }
+                } else if model.wifiNearby.isEmpty {
+                    EmptyState(icon: "wifi.slash",
+                               title: "附近没有已保存的网络",
+                               message: "只列出已保存过的网络（密码在系统钥匙串里）。新网络请先在系统菜单栏的 Wi-Fi 里连一次。")
+                } else {
+                    ForEach(model.wifiNearby) { n in
+                        HStack(spacing: Theme.gapS) {
+                            // 4 格信号条，填充格数 = 强度
+                            HStack(spacing: 2) {
+                                ForEach(1...4, id: \.self) { i in
+                                    RoundedRectangle(cornerRadius: 1)
+                                        .fill(i <= n.bars ? Theme.ok : Theme.idle.opacity(0.3))
+                                        .frame(width: 3, height: CGFloat(4 + i * 2))
+                                }
+                            }
+                            Text(n.name)
+                                .font(.body.weight(.medium))
+                                .lineLimit(1)
+                            Spacer()
+                            Text("\(n.rssi) dBm")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                            Text("信道 \(n.channel)")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    if !model.wifiScanNote.isEmpty {
+                        Text(model.wifiScanNote)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                HStack(spacing: Theme.gapS) {
+                    LoadingButton(title: model.wifiScanning ? "扫描中…" : "重新扫描",
+                                  icon: "arrow.clockwise",
+                                  loading: model.wifiScanning) {
+                        model.loadWifiScan(force: true, thorough: true)
+                    }
+                    if let at = model.wifiScanAt {
+                        Text("上次扫描 \(Self.ageFormatter.string(from: at))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                }
+            }
+        }
+    }
+
+    private static let ageFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        return f
+    }()
 
     // MARK: 当前连接
 
@@ -42,6 +121,16 @@ struct WifiView: View {
                             Text("信道 \(model.wifiChannel)")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
+                            // 真实协商速率。networksetup -getMedia 对 Wi-Fi 只回
+                            // autoselect，但 system_profiler 里有 Transmit Rate。
+                            // 用户问过"网线 100M、Wi-Fi 标称 1000M 为什么不走 Wi-Fi"，
+                            // 这里给的就是真实答案——标称值在弱信号下根本不兑现。
+                            if !model.wifiRate.isEmpty {
+                                Text("协商速率 \(model.wifiRate) Mbps" +
+                                     (model.wifiNoise.isEmpty ? "" : "  信噪比 \(snrText) dB"))
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                         Spacer()
                         signalHint
