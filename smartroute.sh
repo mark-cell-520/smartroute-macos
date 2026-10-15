@@ -522,7 +522,7 @@ do_switch() {   # $1=目标设备 $2=原默认设备 $3=eth探测 $4=wifi探测 
 # ---------------- 命令实现 ----------------
 cmd_watch() {
     find_active
-    local eth_res="na" wifi_res="na"
+    local eth_res="na" wifi_res="na" _p
     # probe_dev 输出两行：第 1 行判定，第 2 行明细。这里只取判定行。
     if [ -n "$ACTIVE_ETH_DEV" ]; then
         eth_res="$(probe_dev "$ACTIVE_ETH_DEV" "$(svc_router "$ACTIVE_ETH_SVC")" | sed -n 1p)"
@@ -672,7 +672,7 @@ cmd_test() {
         echo "提示：非 root 运行，只能按“当前默认路由”探测，建议使用 sudo smartroute test"
     fi
     find_active
-    local eth_res="na" wifi_res="na" eth_detail="" wifi_detail=""
+    local eth_res="na" wifi_res="na" eth_detail="" wifi_detail="" _p
     if [ -n "$ACTIVE_ETH_DEV" ]; then
         _p="$(probe_dev "$ACTIVE_ETH_DEV" "$(svc_router "$ACTIVE_ETH_SVC")")"
         eth_res="$(printf '%s\n' "$_p" | sed -n 1p)"
@@ -1341,7 +1341,7 @@ balance_on() {
     find_active
     [ -n "$ACTIVE_ETH_DEV" ]  || die "没有检测到活跃的以太网接口"
     [ -n "$ACTIVE_WIFI_DEV" ] || die "没有检测到活跃的 Wi-Fi 接口"
-    local eth_gw wifi_gw eth_res wifi_res eth_detail wifi_detail
+    local eth_gw wifi_gw eth_res wifi_res eth_detail wifi_detail _p
     eth_gw="$(svc_router "$ACTIVE_ETH_SVC")"; wifi_gw="$(svc_router "$ACTIVE_WIFI_SVC")"
     [ -n "$eth_gw" ]  || die "取不到以太网网关（服务: ${ACTIVE_ETH_SVC:-?}）"
     [ -n "$wifi_gw" ] || die "取不到 Wi-Fi 网关（服务: ${ACTIVE_WIFI_SVC:-?}）"

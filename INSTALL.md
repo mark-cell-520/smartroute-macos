@@ -112,7 +112,14 @@ sudo smartroute balance off       # 关闭并恢复原状
 smartroute set wifi               # 强制走 Wi-Fi（auto / ethernet / wifi）
 smartroute log 100                # 看最近 100 行日志
 smartroute fixconf                # App 提示"保存失败"时修配置属主（需 sudo）
+sudo smartroute report > r.txt    # 一键诊断报告（贴给别人排查用）
 ```
+
+报告是纯文本，包含硬件接口、接口地址、IPv4 路由表、pf 状态与锚点规则、
+两份配置、守护进程状态、状态文件、最近日志、双网并发状态。
+里面的 IP 都是内网地址，不含密码或令牌，可以放心分享。
+
+也可以在 App 里点「体检」页的**导出诊断报告**，会直接存到桌面。
 
 ---
 
