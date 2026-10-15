@@ -60,7 +60,10 @@ if [ "${1:-}" = "release" ]; then
     if git diff --cached --quiet; then echo "  代码无变动"; else
         git commit -q -m "Release v${VERSION}" && echo "  已提交"
     fi
-    git push -u origin main 2>&1 | tail -2 || die "推送失败"
+    # 用当前分支名，别写死 main（老仓库默认分支可能还是 master）
+    BR="$(git branch --show-current 2>/dev/null)"
+    [ -n "$BR" ] || BR="main"
+    git push -u origin "$BR" 2>&1 | tail -2 || die "推送失败"
 
     # 3) 建 Release 并上传产物
     say "创建 GitHub Release v${VERSION}"
@@ -78,7 +81,11 @@ if [ "${1:-}" = "release" ]; then
         echo "  export PATH=\"\$HOME/Pictures/smartroute/.tools/gh_*/bin:\$PATH\""
         echo "  gh auth login"
         echo "然后手动上传产物："
-        echo "  gh release create v${VERSION} $ZIP $DMG --title \"SmartRoute v${VERSION}\" --notes-file INSTALL.md"
+        if [ -f "$DMG" ]; then
+            echo "  gh release create v${VERSION} $ZIP $DMG --title \"SmartRoute v${VERSION}\" --notes-file INSTALL.md"
+        else
+            echo "  gh release create v${VERSION} $ZIP --title \"SmartRoute v${VERSION}\" --notes-file INSTALL.md"
+        fi
     fi
     exit 0
 fi

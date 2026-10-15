@@ -249,24 +249,6 @@ struct KeyValueRow: View {
     }
 }
 
-// MARK: - 页面标题
-
-struct PageHeader: View {
-    let title: String
-    let subtitle: String?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(title).font(.largeTitle.weight(.semibold))
-            if let subtitle {
-                Text(subtitle).font(.callout).foregroundStyle(.secondary)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.bottom, Theme.gapXS)
-    }
-}
-
 // MARK: - 首次启动引导
 
 /// 第一次打开 App 时显示的欢迎页：说清楚这个 App 干什么、要不要装守护进程。
