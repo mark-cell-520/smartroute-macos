@@ -1,0 +1,16 @@
+# 构建产物
+.build/
+dist/
+*.dmg
+*.zip
+
+# 系统垃圾
+.DS_Store
+Icon?
+
+# 用户本地配置（不应进仓库）
+smartroute.conf
+smartroute.rules
+
+# 构建出的 App（通过 GitHub Release 分发）
+SmartRoute.app

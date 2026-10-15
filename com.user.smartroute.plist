@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.smartroute</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/smartroute</string>
+        <string>watch</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>20</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>Nice</key>
+    <integer>10</integer>
+    <key>StandardOutPath</key>
+    <string>/var/log/smartroute.out</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/smartroute.err</string>
+</dict>
+</plist>
