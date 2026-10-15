@@ -65,7 +65,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var balanceItem: NSMenuItem?
 
     @objc private func toggleBalance() {
-        guard let model = NetworkModel.shared else {
+        guard NetworkModel.shared != nil else {
             notify(title: "SmartRoute", body: "请先打开 SmartRoute 面板")
             return
         }
@@ -73,7 +73,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let (out, _) = Shell.run("'\(ScriptLocator.scriptPath)' balance status", timeout: 8)
             let on = out.contains("BALANCE=1")
             DispatchQueue.main.async {
-                model.setBalance(on: !on)
+                // 不在 @Sendable 闭包里捕获 model（非 Sendable 会告警）；
+                // 回到主线程后再从 shared 取，等价且干净
+                NetworkModel.shared?.setBalance(on: !on)
             }
         }
     }

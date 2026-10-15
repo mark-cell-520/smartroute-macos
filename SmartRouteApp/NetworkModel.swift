@@ -440,21 +440,32 @@ final class NetworkModel: ObservableObject {
     // MARK: - 配置导出 / 导入
 
     /// 导出当前生效的配置（用户配置 + 静态规则）成一个 .conf 文本文件
+    // 导出文件里的区段标记。用显式标记而不是靠路径里有没有 "rules" 字样判断——
+    // 后者在路径一改就静默失效，规则会被并进配置里。
+    private static let confHeader = "# >>> smartroute 配置（KEY=VALUE）>>>"
+    private static let rulesHeader = "# >>> smartroute 静态分流规则 >>>"
+
     func exportConfig() {
         configIOError = ""
         DispatchQueue.global(qos: .userInitiated).async {
             var text = "# smartroute 配置导出  生成于 \(Date())\n"
             text += "# 导入方式：App → 选路设置 → 导入配置\n\n"
-            for f in [ScriptLocator.userConf, ScriptLocator.userRules] {
-                if let s = try? String(contentsOfFile: f, encoding: .utf8), !s.isEmpty {
-                    text += "# ===== \(f) =====\n" + s + "\n"
-                }
+            text += Self.confHeader + "\n"
+            if let c = try? String(contentsOfFile: ScriptLocator.userConf, encoding: .utf8),
+               !c.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                text += c + (c.hasSuffix("\n") ? "" : "\n")
             }
+            text += "\n" + Self.rulesHeader + "\n"
+            if let r = try? String(contentsOfFile: ScriptLocator.userRules, encoding: .utf8),
+               !r.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                text += r + (r.hasSuffix("\n") ? "" : "\n")
+            }
+
             let panel = NSSavePanel()
             panel.nameFieldStringValue = "smartroute-config.conf"
             panel.allowedContentTypes = [.plainText]
             DispatchQueue.main.async {
-                panel.beginSheetModal(for: NSApp.keyWindow ?? NSApp.windows.first ?? NSWindow()) { resp in
+                presentPanel(panel) { resp in
                     if resp == .OK, let url = panel.url {
                         do {
                             try text.write(to: url, atomically: true, encoding: .utf8)
@@ -468,29 +479,38 @@ final class NetworkModel: ObservableObject {
         }
     }
 
-    /// 从文件导入配置：只认 KEY=VALUE 行与规则行，其余忽略
+    /// 从文件导入配置：只认区段标记内的 KEY=VALUE 与规则行，其余忽略
     func importConfig() {
         configIOError = ""
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.plainText]
         panel.allowsMultipleSelection = false
         DispatchQueue.main.async {
-            panel.beginSheetModal(for: NSApp.keyWindow ?? NSApp.windows.first ?? NSWindow()) { resp in
+            presentPanel(panel) { resp in
                 guard resp == .OK, let url = panel.url else { return }
                 do {
                     let raw = try String(contentsOf: url, encoding: .utf8)
                     var conf = "", rules = ""
-                    var inRules = false
+                    var section = 0   // 0=说明区 1=配置 2=规则
                     for line in raw.components(separatedBy: "\n") {
-                        let t = line.trimmingCharacters(in: .whitespaces)
-                        if t.hasPrefix("# ===== ") && t.contains("rules") { inRules = true; continue }
-                        if t.hasPrefix("#") || t.isEmpty { continue }
-                        if inRules { rules += t + "\n" }
-                        else if t.contains("=") { conf += t + "\n" }
+                        let t = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if t == Self.confHeader  { section = 1; continue }
+                        if t == Self.rulesHeader { section = 2; continue }
+                        if t.isEmpty || t.hasPrefix("#") { continue }
+                        switch section {
+                        case 1 where t.contains("="): conf += t + "\n"
+                        case 2: rules += t + "\n"
+                        default: break
+                        }
                     }
                     guard !conf.isEmpty else {
-                        self.configIOError = "文件里没找到 KEY=VALUE 配置行"
+                        self.configIOError = "文件里没找到配置区段（\(Self.confHeader)）"
                         return
+                    }
+                    // 先备份再覆盖：导入是破坏性操作，留个后悔药
+                    let backup = ScriptLocator.userConf + ".bak"
+                    if FileManager.default.fileExists(atPath: ScriptLocator.userConf) {
+                        try? FileManager.default.copyItem(atPath: ScriptLocator.userConf, toPath: backup)
                     }
                     try conf.write(toFile: ScriptLocator.userConf, atomically: true, encoding: .utf8)
                     if !rules.isEmpty {
@@ -499,7 +519,7 @@ final class NetworkModel: ObservableObject {
                     self.loadRoutingConfig()
                     self.loadRules()
                     self.refresh()
-                    self.configIOError = "✅ 已导入并生效（≤20 秒守护进程会跟上）"
+                    self.configIOError = "✅ 已导入并生效（原配置备份为 \(URL(fileURLWithPath: backup).lastPathComponent)）"
                 } catch {
                     self.configIOError = "导入失败：\(error.localizedDescription)"
                 }

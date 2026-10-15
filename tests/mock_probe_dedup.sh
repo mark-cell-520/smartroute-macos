@@ -1,3 +1,7 @@
+PASS=0; FAIL=0
+ok()  { printf '  ✓ %s\n' "$1"; PASS=$((PASS+1)); }
+bad() { printf '  ✗ %s\n' "$1"; FAIL=$((FAIL+1)); }
+
 #!/bin/bash
 # 验证：探测目标去重 + route 输出被完全屏蔽
 set -u
@@ -39,7 +43,11 @@ echo "探测输出: [$out]"
 # 新契约：第 1 行判定、第 2 行明细，共 2 行；route 的噪音一行都不能多
 first="$(printf '%s' "$out" | cut -d'|' -f1)"
 nlines="$(printf '%s' "$out" | tr -cd '|' | wc -c | tr -d ' ')"
-[ "$first" = "ok" ] && [ "$nlines" = "2" ] && echo "✅ 输出干净（判定行 ok，共 2 行）" || echo "❌ 输出被污染"
+if [ "$first" = "ok" ] && [ "$nlines" = "2" ]; then
+    ok "输出干净（判定行 ok，共 2 行）"
+else
+    bad "输出被污染: [$out]"
+fi
 
 # 数一下 route add 被调用几次（应为 5 次：去重后）
 cat > "$T/bin/route" <<'EOF'
@@ -56,7 +64,11 @@ chmod +x "$T/bin/route"
 probe_dev en1 192.168.1.1 >/dev/null 2>&1
 n=$(grep -c "^route add" "$T/calls.log")
 echo "route add 调用次数: $n"
-[ "$n" = "5" ] && echo "✅ 目标已去重（5 个唯一目标）" || echo "❌ 期望 5 次，实际 $n 次"
+if [ "$n" = "5" ]; then ok "目标已去重（5 个唯一目标）"; else bad "期望 5 次 route add，实际 $n 次"; fi
 d=$(grep -c "^route delete" "$T/calls.log")
 echo "route delete 调用次数: $d"
-[ "$d" -ge 5 ] && echo "✅ 探测后清理了路由" || echo "❌ 清理不完整"
+if [ "$d" -ge 5 ]; then ok "探测后清理了路由（$d 次 delete）"; else bad "清理不完整：只有 $d 次 delete"; fi
+
+echo
+echo "结果: $PASS 通过, $FAIL 失败"
+[ "$FAIL" -eq 0 ]

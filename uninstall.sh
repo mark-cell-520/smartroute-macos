@@ -104,6 +104,7 @@ run "守护进程 plist"                             rm -f /Library/LaunchDaemon
 run "系统配置 /etc/smartroute.conf"              rm -f /etc/smartroute.conf
 run "用户配置 /Users/Shared/smartroute.conf"     rm -f /Users/Shared/smartroute.conf
 run "用户配置临时残留 .conf.tmp*"                bash -c 'rm -f /Users/Shared/smartroute.conf.tmp*'
+run "导入前的配置备份 .conf.bak"                 rm -f /Users/Shared/smartroute.conf.bak
 run "分流规则 /Users/Shared/smartroute.rules"    rm -f /Users/Shared/smartroute.rules
 run "状态目录 /var/db/smartroute"                rm -rf /var/db/smartroute
 run "锁目录 /var/run/smartroute.lock"            rm -rf /var/run/smartroute.lock
@@ -145,7 +146,8 @@ if [ "$DRY" = "0" ]; then
     say "校验残留"
     left=0
     for f in /usr/local/bin/smartroute /Library/LaunchDaemons/com.user.smartroute.plist \
-             /etc/smartroute.conf /Users/Shared/smartroute.conf /Users/Shared/smartroute.rules \
+             /etc/smartroute.conf /Users/Shared/smartroute.conf /Users/Shared/smartroute.conf.bak \
+             /Users/Shared/smartroute.rules \
              /etc/pf.anchors/com.user.smartroute /var/db/smartroute /var/run/smartroute.lock \
              "$HOME/Library/LaunchAgents/com.user.smartroute.app.plist" \
              "$APP"; do

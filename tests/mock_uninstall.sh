@@ -76,8 +76,37 @@ else
     ok "dry-run 未执行任何真实动作"
 fi
 
+echo "=== 4b. --keep-app：App 内调用时不删自己 ==="
+# App 里的"彻底卸载"按钮会带 --keep-app，否则会把正在运行的 App 删掉
+TMPK=$(mktemp /tmp/uninstall_keepapp.XXXX.sh)
+sed 's/^if \[ "\$(id -u)" -ne 0 \]; then/if false; then/' "$UNI" > "$TMPK"
+OUTK=$(bash "$TMPK" --dry-run --keep-app 2>&1)
+rm -f "$TMPK"
+if printf '%s' "$OUTK" | grep -q "保留App=1"; then ok "识别 --keep-app"; else bad "--keep-app 没被识别"; fi
+if printf '%s' "$OUTK" | grep -q "将删除 /Applications/SmartRoute.app"; then
+    bad "--keep-app 模式下仍要删 App（会自杀）"
+else
+    ok "--keep-app 模式下不删 App"
+fi
+# 同样要短路 root 检查，否则脚本在第一行就退出了
+TMPN=$(mktemp /tmp/uninstall_noapp.XXXX.sh)
+sed 's/^if \[ "\$(id -u)" -ne 0 \]; then/if false; then/' "$UNI" > "$TMPN"
+OUTK2=$(bash "$TMPN" --dry-run 2>&1)
+rm -f "$TMPN"
+if printf '%s' "$OUTK2" | grep -q "保留App=0"; then ok "不带旗标时保留App=0"; else bad "保留App 标志异常"; fi
+if printf '%s' "$OUTK2" | grep -q "将删除 /Applications/SmartRoute.app"; then
+    ok "不带旗标时会删 App"
+else
+    bad "不带旗标时反而不删 App（用户会抱怨卸不干净）"
+fi
+
+echo "=== 4c. 新残留来源必须覆盖 ==="
+for pat in 'smartroute.conf.bak' 'smartroute.conf.tmp' 'smartroute.rules' 'com.user.smartroute.app.plist'; do
+    if grep -qF "$pat" "$UNI"; then ok "清理 $pat"; else bad "漏删 $pat"; fi
+done
+
 echo "=== 5. 参数解析 ==="
-for a in --yes --dry-run --keep-logs --help; do
+for a in --yes --dry-run --keep-logs --keep-app --help; do
     if grep -q -- "$a" "$UNI"; then ok "支持参数 $a"; else bad "不支持参数 $a"; fi
 done
 # 未知参数必须报错退出，不能静默忽略

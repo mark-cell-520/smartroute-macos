@@ -34,7 +34,7 @@ die() { printf '\033[1;31m错误: %s\033[0m\n' "$*" >&2; exit 1; }
 # ---------- release 模式：推送代码 + 建 Release 上传产物 ----------
 if [ "${1:-}" = "release" ]; then
     shift
-    VERSION="${1:-2.1}"
+    VERSION="${1:-2.2}"
     say "发布模式 v$VERSION"
     command -v git >/dev/null 2>&1 || die "没有安装 git"
     [ -d .git ] || die "还没有 git 仓库，请先运行: bash sync-github.sh"

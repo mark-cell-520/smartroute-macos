@@ -2,6 +2,7 @@
 # 把 SmartRouteApp/ 编译打包成 SmartRoute.app（需要 Xcode 或 Command Line Tools）
 set -e
 cd "$(dirname "$0")"
+VERSION="2.2"
 APP="SmartRoute.app"
 
 echo "==> 清理旧构建"
@@ -56,7 +57,8 @@ chmod +x "$APP/Contents/Resources/smartroute.sh" \
          "$APP/Contents/Resources/uninstall.sh"
 
 echo "==> 写入 Info.plist"
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+# 注意：heredoc 不能加引号，否则 ${VERSION} 不会被展开（会字面量写进 plist）
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -76,7 +78,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>2.1</string>
+    <string>${VERSION}</string>
     <key>CFBundleVersion</key>
     <string>3</string>
     <key>CFBundleIconFile</key>

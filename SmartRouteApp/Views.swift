@@ -910,7 +910,7 @@ struct LogView: View {
         panel.nameFieldStringValue = "smartroute-log-\(fmt.string(from: Date())).txt"
         panel.allowedContentTypes = [.plainText]
         DispatchQueue.main.async {
-            panel.beginSheetModal(for: NSApp.keyWindow ?? NSApp.windows.first ?? NSWindow()) { resp in
+            presentPanel(panel) { resp in
                 if resp == .OK, let url = panel.url {
                     do {
                         try model.logText.write(to: url, atomically: true, encoding: .utf8)

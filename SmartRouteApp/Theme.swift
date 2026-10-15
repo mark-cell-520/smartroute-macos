@@ -385,3 +385,18 @@ struct FreshnessBadge: View {
         return "\(s / 60) 分 \(s % 60) 秒前更新"
     }
 }
+
+// MARK: - 文件面板呈现
+
+/// 统一的 NSSavePanel/NSOpenPanel 呈现方式。
+/// 之前直接写 `NSApp.keyWindow ?? NSApp.windows.first ?? NSWindow()` 有个坑：
+/// new 出来的 NSWindow 没被显示过，拿它当 sheet 宿主面板会**不出现**，
+/// 用户点了按钮没反应。这里：有可见窗口就用 sheet，没有就退化成普通模态窗口。
+func presentPanel(_ panel: NSSavePanel, _ completion: @escaping (NSApplication.ModalResponse) -> Void) {
+    if let win = NSApp.keyWindow ?? NSApp.windows.first(where: { $0.isVisible }) {
+        panel.beginSheetModal(for: win, completionHandler: completion)
+        return
+    }
+    // 没有可见窗口（例如只开了菜单栏图标、面板被关掉）：退化成模态
+    DispatchQueue.main.async { completion(panel.runModal()) }
+}
