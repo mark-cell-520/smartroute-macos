@@ -63,7 +63,7 @@ sudo smartroute test -v         # 手动探测两个接口（-v 显示 ping/TCP/
 sudo smartroute doctor          # 一键体检：定位"为什么上不了网"
 sudo smartroute config          # 查看当前生效配置
 sudo smartroute watch           # 手动执行一次检测/切换
-sudo smartroute set wifi        # 强制走 Wi-Fi（auto / ethernet / wifi）
+sudo smartroute set wifi        # 强制走 Wi-Fi（auto / ethernet / wifi / speed / latency）
 smartroute log 100              # 查看最近 100 行日志
 sudo smartroute report > r.txt  # 一键诊断报告（贴给别人排查用）
 tail -f /var/log/smartroute.log # 实时看日志
@@ -86,6 +86,34 @@ smartroute rule del 10.0.0.0/8       # 删除
 # —— 监控 ——
 smartroute stats                # 各接口累计收发字节（App 每秒采样算实时速率）
 smartroute quality              # 逐接口测延迟/丢包（root 下按接口分别测）
+```
+
+### 选路模式：不只是"能上网"，还能按网速/延迟挑
+
+`MODE` 控制选路策略，`smartroute set <模式>` 或 App 的「选路设置」页切换：
+
+| 模式 | 行为 | 适合 |
+|------|------|------|
+| `auto` | 两个接口谁有外网就走谁，以太网恢复外网后自动切回 | 默认，只求不断网 |
+| `speed` | 两边都能上网时，**实测下载吞吐**大的赢 | 网线只协商到 100M、Wi-Fi 更快 |
+| `latency` | 两边都能上网时，**实测延迟**低的赢 | 游戏、视频会议 |
+| `ethernet` | 只要以太网有外网就走以太网 | 有线优先 |
+| `wifi` | 只要 Wi-Fi 有外网就走 Wi-Fi | 网线口是局域网/坏口 |
+
+**为什么"网速优先"要实测，不看链路标称值？** 因为 macOS 上 Wi-Fi 根本读不到协商速率——
+`networksetup -getMedia en1` 只回 `autoselect`，而有线能读到（如 `100baseTX`）。
+所以只能两边各下载一点数据实测。实测有两个代价，都做了处理：
+
+- **费流量**：结果缓存，默认 5 分钟才重测（`SPEED_RECHECK`）
+- **耗时数秒**：两个接口**串行**测。并行会互相抢带宽，两个数都偏小
+
+**不会来回横跳**：吞吐差距不到 30%（`SPEED_SWITCH_RATIO`）判平手，继续用当前线路。
+实测这台机器：以太网 15.9 Mbps、Wi-Fi 10.7 Mbps，差 49%，所以走有线是对的——
+尽管网线只协商到 100M，Wi-Fi 信号只有 2 格反而更慢。
+
+```bash
+smartroute measurements       # 看上次实测结果
+sudo smartroute measure now   # 立即重新测量
 ```
 
 ### Wi-Fi 选择与自动切换（v2.2 新增）

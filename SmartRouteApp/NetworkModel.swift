@@ -180,6 +180,14 @@ final class NetworkModel: ObservableObject {
     @Published var routeOkN = 2
     @Published var routeFailN = 3
     @Published var routeCooldown = 45
+    // 网速/延时优先模式下展示的实测结果
+    @Published var ethSpeed = "未测"
+    @Published var wifiSpeed = "未测"
+    @Published var ethLatency = "未测"
+    @Published var wifiLatency = "未测"
+    @Published var speedRecheck = 300
+    @Published var latencyRecheck = 60
+    @Published var remeasuring = false
 
     // MARK: 日志页
     @Published var logAutoRefresh = true
@@ -550,6 +558,8 @@ final class NetworkModel: ObservableObject {
         routeOkN = Int(conf["OK_N"] ?? "2") ?? 2
         routeFailN = Int(conf["FAIL_N"] ?? "3") ?? 3
         routeCooldown = Int(conf["COOLDOWN"] ?? "45") ?? 45
+        speedRecheck = Int(conf["SPEED_RECHECK"] ?? "300") ?? 300
+        latencyRecheck = Int(conf["LATENCY_RECHECK"] ?? "60") ?? 60
     }
 
     func saveRoutingConfig() {
@@ -941,6 +951,52 @@ final class NetworkModel: ObservableObject {
                 DispatchQueue.main.async {
                     self.wifiLoading = false
                     self.wifiMessage = "设置失败: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    /// 读守护进程缓存的实测结果（state 文件里的 speed_<dev> / lat_<dev>）
+    func loadMeasurements() {
+        let script = ScriptLocator.scriptPath
+        DispatchQueue.global().async {
+            // 直接读 state 文件比再起一个进程快；App 已在轮询里调这个，要省着点
+            var es = "未测", ws = "未测", el = "未测", wl = "未测"
+            let st = Shell.run("'\(script)' measurements", timeout: 6).out
+            for line in st.components(separatedBy: "\n") {
+                if line.hasPrefix("speed:") {
+                    let p = line.dropFirst(6).components(separatedBy: "=")
+                    if p.count == 2 {
+                        if p[0] == "eth" { es = p[1] } else if p[0] == "wifi" { ws = p[1] }
+                    }
+                } else if line.hasPrefix("latency:") {
+                    let p = line.dropFirst(9).components(separatedBy: "=")
+                    if p.count == 2 {
+                        if p[0] == "eth" { el = p[1] } else if p[0] == "wifi" { wl = p[1] }
+                    }
+                }
+            }
+            DispatchQueue.main.async {
+                self.ethSpeed = es; self.wifiSpeed = ws
+                self.ethLatency = el; self.wifiLatency = wl
+            }
+        }
+    }
+
+    /// 立即重新测量（用户等不及 SPEED_RECHECK 时点这个）
+    func remeasureNow() {
+        remeasuring = true
+        let script = ScriptLocator.scriptPath
+        DispatchQueue.global().async {
+            do {
+                _ = try Privileged.run("'\(script)' measure now")
+                DispatchQueue.main.async {
+                    self.remeasuring = false
+                    self.loadMeasurements()
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.remeasuring = false
                 }
             }
         }

@@ -87,7 +87,7 @@ App 打开后，顶部会出现蓝色横幅：**「守护进程需要更新 / �
 | 双网并发 | 开启/关闭按连接分流；轮询或"最快线路"模式 |
 | Wi-Fi 网络 | 一键切换已保存的 Wi-Fi；上不了网时自动换能上网的 |
 | 分流规则 | 指定网段固定走某条线路（如公司内网走有线） |
-| 选路设置 | 选路模式、探测开关（TLS/通知/自动开 Wi-Fi）、判定阈值 |
+| 选路设置 | 选路模式（自动/网速优先/延时优先/强制有线/强制 Wi-Fi）、实测结果、探测开关、判定阈值 |
 | 体检 | 一键排查 + **导出诊断报告** |
 | 日志 | 守护进程判定记录 + **导出日志** |
 | 守护进程 | 安装/更新、**开机自启 App**、**彻底卸载（零残留）** |
@@ -113,6 +113,9 @@ sudo smartroute balance off       # 关闭并恢复原状
 smartroute set wifi               # 强制走 Wi-Fi（auto / ethernet / wifi）
 smartroute log 100                # 看最近 100 行日志
 smartroute fixconf                # App 提示"保存失败"时修配置属主（需 sudo）
+smartroute set speed              # 网速优先：实测吞吐大的赢（也可 latency / auto / ethernet / wifi）
+smartroute measurements          # 看上次实测的吞吐与延迟
+sudo smartroute measure now       # 立即重新测量
 sudo smartroute report > r.txt    # 一键诊断报告（贴给别人排查用）
 
 # —— Wi-Fi 选择与自动切换 ——

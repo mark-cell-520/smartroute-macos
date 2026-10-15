@@ -63,6 +63,7 @@ struct MainView: View {
             model.loadQuality()
             model.loadWifi()
             model.loadWifiFailover()
+            model.loadMeasurements()
             model.startSpeedMonitor()
         }
         .onReceive(timer) { _ in
@@ -75,6 +76,8 @@ struct MainView: View {
             if model.page == .balance { model.loadBalance() }
             if model.page == .wifi { model.loadWifi() }
             if model.page == .rules { model.loadRules() }
+            // 实测结果由守护进程缓存，App 只是读出来展示；只在相关页面读，别白起进程
+            if model.page == .routing || model.page == .status { model.loadMeasurements() }
         }
         .onReceive(qualityTimer) { _ in
             guard NSApp.isActive else { return }
@@ -733,7 +736,9 @@ struct RoutingView: View {
     private let modeDescriptions: [String: String] = [
         "auto": "自动：两个接口谁有外网就走谁，以太网恢复外网后自动切回。",
         "ethernet": "强制有线：只要以太网有外网就走以太网（没有则保持现状）。",
-        "wifi": "强制无线：只要 Wi-Fi 有外网就走 Wi-Fi，适合网线口是局域网/坏口的情况。"
+        "wifi": "强制无线：只要 Wi-Fi 有外网就走 Wi-Fi，适合网线口是局域网/坏口的情况。",
+        "speed": "网速优先：两边都能上网时，实测下载吞吐大的赢。适合网线只协商到 100M、\nWi-Fi 更快的情况。差距不到 30% 判平手，继续用当前线路。",
+        "latency": "延时优先：两边都能上网时，实测延迟低的赢。适合游戏/视频会议等对延迟敏感的场景。"
     ]
 
     var body: some View {
@@ -741,11 +746,31 @@ struct RoutingView: View {
             Section("选路模式") {
                 Picker("模式", selection: $model.routeMode) {
                     Text("自动").tag("auto")
+                    Text("网速优先").tag("speed")
+                    Text("延时优先").tag("latency")
                     Text("强制以太网").tag("ethernet")
                     Text("强制 Wi-Fi").tag("wifi")
                 }
-                .pickerStyle(.segmented)
-                Text(modeDescriptions[model.routeMode] ?? "").font(.caption).foregroundStyle(.secondary)
+                .pickerStyle(.menu)
+                Text(modeDescriptions[model.routeMode] ?? "")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                // 网速/延时模式下，把上次实测结果摆出来——用户最想看的就是"凭什么走这条"
+                if model.routeMode == "speed" || model.routeMode == "latency" {
+                    Divider()
+                    if model.routeMode == "speed" {
+                        KeyValueRow(key: "实测吞吐", value: "eth \(model.ethSpeed)   Wi-Fi \(model.wifiSpeed)")
+                        Text("实测要真下载一点数据，费流量，所以每 \(model.speedRecheck) 秒才重测一次。")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    } else {
+                        KeyValueRow(key: "实测延迟", value: "eth \(model.ethLatency)   Wi-Fi \(model.wifiLatency)")
+                        Text("延迟每 \(model.latencyRecheck) 秒重测一次。")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                    Button("立即重新测量") { model.remeasureNow() }
+                        .controlSize(.small)
+                }
             }
             Section("探测与通知") {
                 Toggle("TLS 层探测（识别“假互联网”）", isOn: $model.routeTLS)

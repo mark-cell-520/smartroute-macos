@@ -48,9 +48,15 @@ FASTEST_RECHECK=12          # fastest 模式下守护进程重新测延迟的轮
 WIFI_FAILOVER=0             # Wi-Fi 上不了网时，自动试连其它已保存的 Wi-Fi（1 开启）
 WIFI_PREFERRED=""           # 优先试连的 Wi-Fi 名（逗号分隔，靠前优先）。留空=按系统保存顺序
 WIFI_FAILOVER_COOLDOWN=120  # Wi-Fi 故障转移的最小间隔（秒），防止在网络间来回跳
+SPEED_TEST_URL="https://speed.cloudflare.com/__down?bytes=5000000"   # 网速优先模式的测速地址
+SPEED_TEST_TIMEOUT=8        # 单次测速超时（秒）
+SPEED_RECHECK=300           # 多久重新测一次网速（秒）。测速要真下载，太频繁费流量
+LATENCY_RECHECK=60          # 多久重新测一次延迟（秒）
+SPEED_SWITCH_RATIO=30       # 判定"明显更快"的吞吐差阈值（百分比）。低于它就继续用当前线路，
+                            # 避免在两条差不多的线路间来回切
 
 # 可用 set 命令修改的配置项
-VALID_KEYS="MODE OK_N FAIL_N COOLDOWN PROBE_TARGETS PING_TIMEOUT NC_TIMEOUT TLS_PROBE NOTIFY AUTO_WIFI_POWER BALANCE BALANCE_MODE FASTEST_SWITCH_RATIO WIFI_FAILOVER WIFI_PREFERRED WIFI_FAILOVER_COOLDOWN"
+VALID_KEYS="MODE OK_N FAIL_N COOLDOWN PROBE_TARGETS PING_TIMEOUT NC_TIMEOUT TLS_PROBE NOTIFY AUTO_WIFI_POWER BALANCE BALANCE_MODE FASTEST_SWITCH_RATIO WIFI_FAILOVER WIFI_PREFERRED WIFI_FAILOVER_COOLDOWN SPEED_TEST_URL SPEED_TEST_TIMEOUT SPEED_RECHECK LATENCY_RECHECK SPEED_SWITCH_RATIO"
 
 CONF="/etc/smartroute.conf"                     # 系统级配置（root 维护，install.sh 生成）
 USER_CONF="/Users/Shared/smartroute.conf"       # 用户级配置（App/普通用户可写，优先级更高）
@@ -619,6 +625,49 @@ cmd_watch() {
     case "$MODE" in
         ethernet) [ "$eth_ok" -eq 1 ] && [ -n "$ACTIVE_ETH_DEV" ] && want="$ACTIVE_ETH_DEV" ;;
         wifi)     [ "$wifi_ok" -eq 1 ] && [ -n "$ACTIVE_WIFI_DEV" ] && want="$ACTIVE_WIFI_DEV" ;;
+        speed)
+            # 网速优先：实测吞吐大的赢。两个都上不了网时交给可用性逻辑兜底
+            if [ "$eth_ok" -eq 1 ] && [ "$wifi_ok" -eq 1 ] \
+               && [ -n "$ACTIVE_ETH_DEV" ] && [ -n "$ACTIVE_WIFI_DEV" ]; then
+                ensure_throughput "$ACTIVE_ETH_DEV" "$ACTIVE_WIFI_DEV"
+                local _se _sw _pick
+                _se="$(_metric_val "speed_$ACTIVE_ETH_DEV")"
+                _sw="$(_metric_val "speed_$ACTIVE_WIFI_DEV")"
+                _pick="$(pick_by_speed "$ACTIVE_ETH_DEV" "$_se" "$ACTIVE_WIFI_DEV" "$_sw")"
+                case "$_pick" in
+                    "")   want="" ;;      # 都没测出来，保持现状更安全
+                    tie)  want="$cur" ;;  # 差距不够大，别折腾
+                    *)    want="$_pick" ;;
+                esac
+                log "网速优先: eth=$(fmt_bps "$_se") wifi=$(fmt_bps "$_sw") -> ${_pick:-保持}"
+            elif [ "$eth_ok" -eq 1 ] && [ -n "$ACTIVE_ETH_DEV" ]; then
+                want="$ACTIVE_ETH_DEV"
+            elif [ "$wifi_ok" -eq 1 ] && [ -n "$ACTIVE_WIFI_DEV" ]; then
+                want="$ACTIVE_WIFI_DEV"
+            fi
+            ;;
+        latency)
+            # 延时优先：延迟低的赢
+            if [ "$eth_ok" -eq 1 ] && [ "$wifi_ok" -eq 1 ] \
+               && [ -n "$ACTIVE_ETH_DEV" ] && [ -n "$ACTIVE_WIFI_DEV" ]; then
+                ensure_latency "$ACTIVE_ETH_DEV" "$(svc_router "$ACTIVE_ETH_SVC")" \
+                               "$ACTIVE_WIFI_DEV" "$(svc_router "$ACTIVE_WIFI_SVC")"
+                local _le _lw _lpick
+                _le="$(_metric_val "lat_$ACTIVE_ETH_DEV")"
+                _lw="$(_metric_val "lat_$ACTIVE_WIFI_DEV")"
+                _lpick="$(pick_fastest "$ACTIVE_ETH_DEV" "$_le" "$ACTIVE_WIFI_DEV" "$_lw")"
+                case "$_lpick" in
+                    "")   want="" ;;
+                    tie)  want="$cur" ;;
+                    *)    want="$_lpick" ;;
+                esac
+                log "延时优先: eth=${_le:-?}ms wifi=${_lw:-?}ms -> ${_lpick:-保持}"
+            elif [ "$eth_ok" -eq 1 ] && [ -n "$ACTIVE_ETH_DEV" ]; then
+                want="$ACTIVE_ETH_DEV"
+            elif [ "$wifi_ok" -eq 1 ] && [ -n "$ACTIVE_WIFI_DEV" ]; then
+                want="$ACTIVE_WIFI_DEV"
+            fi
+            ;;
         *)        if [ "$eth_ok" -eq 1 ] && [ -n "$ACTIVE_ETH_DEV" ]; then
                       want="$ACTIVE_ETH_DEV"
                   elif [ "$wifi_ok" -eq 1 ] && [ -n "$ACTIVE_WIFI_DEV" ]; then
@@ -660,6 +709,28 @@ cmd_status() {
     echo "选路模式     : $MODE"
     echo "判定结果     : eth_ok=$(state_get eth_ok) wifi_ok=$(state_get wifi_ok) streak_eth=$(state_get streak_eth) streak_wifi=$(state_get streak_wifi)"
     echo "最近切换     : $(human_ts "$(state_get last_switch)")（累计 $(state_get switch_count) 次）"
+    # 链路与实测：解释"为什么走了这条"。网线协商速率只有以太网读得到，
+    # Wi-Fi 在 macOS 上读不到（networksetup -getMedia 只回 autoselect），所以只显示实测。
+    if [ -n "$ACTIVE_ETH_DEV" ]; then
+        echo "以太网链路   : $(link_media "$ACTIVE_ETH_DEV" 2>/dev/null || echo 未知)"
+    fi
+    if [ -n "$ACTIVE_WIFI_DEV" ]; then
+        _wcur="$(wifi_current_signal 2>/dev/null)"
+        if [ -n "$_wcur" ]; then
+            set -- $_wcur
+            echo "Wi-Fi 信号    : $1 dBm（$(wifi_bars "$1")/4 格）  信道 ${2:-?}"
+        fi
+    fi
+    _es="$(_metric_val "speed_$ACTIVE_ETH_DEV")"
+    _ws="$(_metric_val "speed_$ACTIVE_WIFI_DEV")"
+    if [ -n "$_es" ] || [ -n "$_ws" ]; then
+        echo "实测吞吐     : eth=$(fmt_bps "$_es")  wifi=$(fmt_bps "$_ws")"
+    fi
+    _el="$(_metric_val "lat_$ACTIVE_ETH_DEV")"
+    _wl="$(_metric_val "lat_$ACTIVE_WIFI_DEV")"
+    if [ -n "$_el" ] || [ -n "$_wl" ]; then
+        echo "实测延迟     : eth=${_el:-?} ms  wifi=${_wl:-?} ms"
+    fi
     echo
     echo "服务顺序（* 为禁用，越靠前越优先）："
     networksetup -listnetworkserviceorder 2>/dev/null | grep -v '^An asterisk' | sed '/^[[:space:]]*$/d;s/^/  /'
@@ -708,7 +779,7 @@ cmd_test() {
 cmd_set() {
     local kv="$1" key val target
     if [ -z "$kv" ]; then
-        echo "用法: smartroute set auto|ethernet|wifi"
+        echo "用法: smartroute set auto|ethernet|wifi|speed|latency"
         echo "  或: smartroute set KEY=VALUE  （KEY 见 config 命令输出）"
         exit 1
     fi
@@ -716,6 +787,8 @@ cmd_set() {
         auto)          key="MODE"; val="auto" ;;
         ethernet|eth)  key="MODE"; val="ethernet" ;;
         wifi|wlan)     key="MODE"; val="wifi" ;;
+        speed|fast)    key="MODE"; val="speed" ;;
+        latency|lowdelay) key="MODE"; val="latency" ;;
         *=*)           key="${kv%%=*}"; val="${kv#*=}" ;;
         *) echo "无法识别: $kv"; exit 1 ;;
     esac
@@ -727,10 +800,10 @@ cmd_set() {
     esac
     case "$key" in
         MODE)
-            case "$val" in auto|ethernet|wifi) ;; *) echo "MODE 只能是 auto|ethernet|wifi"; exit 1 ;; esac ;;
+            case "$val" in auto|ethernet|wifi|speed|latency) ;; *) echo "MODE 只能是 auto|ethernet|wifi|speed|latency"; exit 1 ;; esac ;;
         OK_N|FAIL_N|COOLDOWN|PING_TIMEOUT|NC_TIMEOUT)
             [[ "$val" =~ ^[0-9]+$ ]] || { echo "$key 必须是正整数"; exit 1; } ;;
-        TLS_PROBE|NOTIFY|AUTO_WIFI_POWER|BALANCE|WIFI_FAILOVER|WIFI_PREFERRED|WIFI_FAILOVER_COOLDOWN)
+        TLS_PROBE|NOTIFY|AUTO_WIFI_POWER|BALANCE|WIFI_FAILOVER|WIFI_PREFERRED|WIFI_FAILOVER_COOLDOWN|SPEED_TEST_URL|SPEED_TEST_TIMEOUT|SPEED_RECHECK|LATENCY_RECHECK|SPEED_SWITCH_RATIO)
             case "$val" in 0|1) ;; *) echo "$key 只能是 0 或 1"; exit 1 ;; esac ;;
     esac
 
@@ -1846,6 +1919,47 @@ wifi_failover_if_needed() {   # $1=wifi_ok $2=eth_ok $3=wifi_res
     return 0
 }
 
+# 把缓存的实测结果打成 App 好解析的 key=value
+cmd_measurements() {
+    find_active
+    local es ws el wl
+    es="$(_metric_val "speed_$ACTIVE_ETH_DEV")"
+    ws="$(_metric_val "speed_$ACTIVE_WIFI_DEV")"
+    el="$(_metric_val "lat_$ACTIVE_ETH_DEV")"
+    wl="$(_metric_val "lat_$ACTIVE_WIFI_DEV")"
+    # 没测过要给个明确的值，别留空——App 那边空值会显示成一片空白，
+    # 用户分不清"没测"和"测出来是 0"
+    printf 'speed:eth=%s\n'  "$([ -n "$es" ] && fmt_bps "$es" || echo 未测)"
+    printf 'speed:wifi=%s\n' "$([ -n "$ws" ] && fmt_bps "$ws" || echo 未测)"
+    printf 'latency:eth=%s\n'  "$([ -n "$el" ] && echo "$el ms" || echo 未测)"
+    printf 'latency:wifi=%s\n' "$([ -n "$wl" ] && echo "$wl ms" || echo 未测)"
+}
+
+cmd_measure() {
+    local arg="${1:-show}"
+    case "$arg" in
+        now|refresh)
+            find_active
+            [ "$(id -u)" -eq 0 ] || die "测速需要 root（要加静态路由才能分别测两个接口）"
+            echo "正在测量，请稍候（两边串行测，各最多 ${SPEED_TEST_TIMEOUT} 秒）…"
+            # 先作废缓存，否则 ensure_* 看到"还新鲜"就跳过了
+            state_set "speed_$ACTIVE_ETH_DEV" "0"
+            state_set "speed_$ACTIVE_WIFI_DEV" "0"
+            state_set "lat_$ACTIVE_ETH_DEV" "0"
+            state_set "lat_$ACTIVE_WIFI_DEV" "0"
+            if [ -n "$ACTIVE_ETH_DEV" ] && [ -n "$ACTIVE_WIFI_DEV" ] \
+               && [ "$(state_get eth_ok)" = "1" ] && [ "$(state_get wifi_ok)" = "1" ]; then
+                ensure_throughput "$ACTIVE_ETH_DEV" "$ACTIVE_WIFI_DEV"
+                ensure_latency "$ACTIVE_ETH_DEV" "$(svc_router "$ACTIVE_ETH_SVC")" \
+                               "$ACTIVE_WIFI_DEV" "$(svc_router "$ACTIVE_WIFI_SVC")"
+            fi
+            cmd_measurements
+            ;;
+        show|st) cmd_measurements ;;
+        *) die "用法: smartroute measure now|show" ;;
+    esac
+}
+
 cmd_wifi() {
     local arg="${1:-status}"
     case "$arg" in
@@ -1914,6 +2028,117 @@ cmd_wifi() {
     esac
 }
 
+# ---------------- 网速优先 / 延时优先 ----------------
+# 背景：MODE=auto 只看"哪个能上网"，有线永远赢。但链路质量可以差很多——
+# 本例：网线协商到 100baseTX（100M），Wi-Fi 标称 1000M 但信号只有 2 格。
+# 只看链路标称值没用（Wi-Fi 在 macOS 上根本读不到协商速率，networksetup -getMedia
+# 对 en1 只回 autoselect），所以"网速优先"必须实测下载吞吐。
+#
+# 实测的两个约束：
+#   1) 费流量、耗时数秒 → 结果缓存，SPEED_RECHECK 秒才重测
+#   2) 两个接口不能并行测 → 会互相抢带宽，两个数都偏小，必须串行
+
+# 实测下载吞吐。$1=设备 $2=超时秒 -> stdout: 字节/秒；失败输出空
+measure_throughput() {
+    local dev="$1" tmo="${2:-$SPEED_TEST_TIMEOUT}" out
+    [ -n "$dev" ] || return 1
+    dev_active "$dev" || return 1
+    command -v curl >/dev/null 2>&1 || return 1
+    # --interface 强制从这个网卡出去，否则测到的是默认路由那条
+    out="$(curl --interface "$dev" -o /dev/null -s -w '%{speed_download}' \
+           --max-time "$tmo" "$SPEED_TEST_URL" 2>/dev/null)"
+    case "$out" in
+        ''|*[!0-9.]*) return 1 ;;
+    esac
+    # curl 连不上时也会输出 0，那不是"测出来是 0"而是没测到
+    awk -v v="$out" 'BEGIN{ exit !(v+0 > 0) }' || return 1
+    printf '%s' "$out"
+}
+
+# 字节/秒 -> "12.3 Mbps"
+fmt_bps() {   # $1=字节/秒
+    awk -v b="${1:-0}" 'BEGIN{
+        if (b <= 0) { print "未知"; exit }
+        m = b * 8 / 1000000
+        if (m >= 100) printf "%.0f Mbps", m
+        else printf "%.1f Mbps", m
+    }'
+}
+
+# 读链路协商速率（仅以太网有意义）。$1=设备 -> stdout: "100baseTX" 之类；读不到输出空
+link_media() {   # $1=设备
+    [ -n "$1" ] || return 1
+    networksetup -getMedia "$1" 2>/dev/null | sed -n 's/^Active:[[:space:]]*//p' | head -1
+}
+
+# 缓存 helpers：state 里存 "设备:值:时间戳"
+_metric_get() {   # $1=state 键 -> stdout: "值 时间戳"
+    state_get "$1" 2>/dev/null
+}
+_metric_set() {   # $1=state 键 $2=值
+    state_set "$1" "$2 $(date +%s)"
+}
+_metric_fresh() {   # $1=state 键 $2=有效期秒 -> 0 新鲜 / 1 过期
+    local v ts
+    v="$(_metric_get "$1")"
+    ts="${v##* }"
+    case "$ts" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ $(( $(date +%s) - ts )) -lt "$2" ]
+}
+
+# 确保两个接口的吞吐都测过（缓存新鲜就不重测）。
+# 串行测：并行会互相抢带宽，两个数都失真。
+ensure_throughput() {   # $1=eth_dev $2=wifi_dev
+    local d
+    for d in "$1" "$2"; do
+        [ -n "$d" ] || continue
+        _metric_fresh "speed_$d" "$SPEED_RECHECK" && continue
+        local v
+        v="$(measure_throughput "$d")"
+        if [ -n "$v" ]; then
+            _metric_set "speed_$d" "$v"
+            log "测速 $d: $(fmt_bps "$v")"
+        else
+            # 测不到不要覆盖旧值：旧值至少是个参考，清空了连参考都没了
+            log "测速 $d: 失败（保留上次结果）"
+            [ -n "$(_metric_get "speed_$d")" ] || _metric_set "speed_$d" "0"
+        fi
+    done
+}
+
+ensure_latency() {   # $1=eth_dev $2=eth_gw $3=wifi_dev $4=wifi_gw
+    local pair d gw v
+    for pair in "$1:$2:eth" "$3:$4:wifi"; do
+        d="${pair%%:*}"
+        gw="${pair#*:}"; gw="${gw%:*}"
+        [ -n "$d" ] || continue
+        _metric_fresh "lat_${d}" "$LATENCY_RECHECK" && continue
+        v="$(measure_latency "$d" "$gw")"
+        [ -n "$v" ] && _metric_set "lat_$d" "$v"
+    done
+}
+
+_metric_val() {   # $1=state 键 -> stdout: 数值（无记录输出空）
+    local v
+    v="$(_metric_get "$1")"
+    v="${v%% *}"
+    case "$v" in ''|*[!0-9.]*) echo "" ;; *) echo "$v" ;; esac
+}
+
+# 按吞吐挑赢家：大的赢，差距不到 SPEED_SWITCH_RATIO 判 tie（保持现状）
+pick_by_speed() {   # $1=设备A $2=BpsA $3=设备B $4=BpsB -> stdout: 设备名 | tie | 空
+    awk -v d1="$1" -v a="$2" -v d2="$3" -v b="$4" -v r="$SPEED_SWITCH_RATIO" 'BEGIN{
+        if (a+0 <= 0 && b+0 <= 0) { exit }              # 都没测出来
+        if (a+0 <= 0) { print d2; exit }                # 只有 B 有数
+        if (b+0 <= 0) { print d1; exit }
+        lo = (a < b ? a : b); hi = (a < b ? b : a)
+        if (hi < lo * (100 + r) / 100) { print "tie"; exit }
+        print (a > b ? d1 : d2)
+    }'
+}
+
 # ---------------- 入口 ----------------
 
 main() {
@@ -1929,6 +2154,8 @@ main() {
         log)            cmd_log "$@" ;;
         balance|bal)    cmd_balance "$@" ;;
         wifi|w)         cmd_wifi "$@" ;;
+        measure|m)      cmd_measure "$@" ;;
+        measurements)   cmd_measurements ;;
         fixconf)        cmd_fixconf ;;
         rule)           cmd_rule "$@" ;;
         stats)          cmd_stats ;;
