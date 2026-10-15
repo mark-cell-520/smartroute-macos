@@ -764,11 +764,24 @@ struct RoutingView: View {
                 HStack {
                     Button("保存并生效") { model.saveRoutingConfig() }
                     if let saved = model.routingSavedText {
-                        Label(saved, systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+                        Label(saved, systemImage: "checkmark.circle.fill").foregroundStyle(Theme.ok)
                     }
                     Spacer()
                     Text("写入 \(ScriptLocator.userConf)，无需密码，≤20 秒生效")
                         .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            Section("备份与恢复") {
+                HStack(spacing: Theme.gapS) {
+                    Button { model.exportConfig() } label: { Label("导出配置…", systemImage: "square.and.arrow.up") }
+                    Button { model.importConfig() } label: { Label("导入配置…", systemImage: "square.and.arrow.down") }
+                }
+                Text("导出的是纯文本配置文件（选路模式、探测开关、阈值、分流规则），"
+                     + "可以在另一台 Mac 上导入。导入后会立即保存并生效。")
+                    .font(.caption).foregroundStyle(.secondary)
+                if !model.configIOError.isEmpty {
+                    Label(model.configIOError, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption).foregroundStyle(Theme.warn)
                 }
             }
         }
@@ -783,29 +796,70 @@ struct DoctorView: View {
     @ObservedObject var model: NetworkModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Button("运行体检") { model.runDoctor() }.disabled(model.doctorRunning)
-                if model.doctorRunning { ProgressView().controlSize(.small) }
+        VStack(alignment: .leading, spacing: Theme.gapM) {
+            HStack(spacing: Theme.gapS) {
+                LoadingButton(title: "运行体检", icon: "stethoscope",
+                              loading: model.doctorRunning) { model.runDoctor() }
                 Spacer()
-                Button("复制结果") { copyResult() }.disabled(model.doctorOutput.isEmpty)
+                Button { copyResult() } label: { Label("复制", systemImage: "doc.on.doc") }
+                    .disabled(model.doctorOutput.isEmpty)
+                    .controlSize(.small)
+                Button { exportReport() } label: { Label("导出诊断报告", systemImage: "square.and.arrow.up") }
+                    .controlSize(.small)
+                    .help("生成一份包含接口/路由/pf/配置/日志的完整报告，适合贴给别人排查")
             }
             Text("检查默认路由/网关/DNS/HTTPS/门户劫持/网段冲突，并给出修复建议")
                 .font(.caption).foregroundStyle(.secondary)
             ScrollView {
-                Text(model.doctorOutput)
+                Text(model.doctorOutput.isEmpty ? "（还没运行，点左上角「运行体检」）" : model.doctorOutput)
                     .font(.system(.caption, design: .monospaced))
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(4)
+                    .padding(Theme.gapXS)
+            }
+            if !model.exportMessage.isEmpty {
+                Text(model.exportMessage)
+                    .font(.caption)
+                    .foregroundStyle(Theme.ok)
             }
         }
-        .padding()
+        .padding(Theme.gapL)
     }
 
     private func copyResult() {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(model.doctorOutput, forType: .string)
+    }
+
+    /// 导出完整诊断报告到桌面。root 下信息更全，所以用管理员权限跑一次。
+    private func exportReport() {
+        model.exportMessage = "正在生成…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let desktop = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
+                ?? URL(fileURLWithPath: NSHomeDirectory())
+            let fmt = DateFormatter()
+            fmt.dateFormat = "yyyyMMdd-HHmmss"
+            let file = desktop.appendingPathComponent("smartroute-诊断报告-\(fmt.string(from: Date())).txt")
+            let cmd = "'\(ScriptLocator.scriptPath)' report"
+            do {
+                // 优先管理员权限（pf/launchctl 部分只有 root 能看到）；失败就退回普通权限
+                var out = ""
+                do { out = try Privileged.run(cmd) } catch { out = "" }
+                if out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    let (o, _) = Shell.run(cmd, timeout: 30)
+                    out = o
+                }
+                try out.write(to: file, atomically: true, encoding: .utf8)
+                DispatchQueue.main.async {
+                    model.exportMessage = "✅ 已导出到桌面：\(file.lastPathComponent)"
+                    NSWorkspace.shared.activateFileViewerSelecting([file])
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    model.exportMessage = "导出失败：\(error.localizedDescription)"
+                }
+            }
+        }
     }
 }
 
@@ -816,12 +870,17 @@ struct LogView: View {
     private let timer = Timer.publish(every: 3, on: .main, in: .common).autoconnect()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
+        VStack(alignment: .leading, spacing: Theme.gapM) {
+            HStack(spacing: Theme.gapS) {
                 Toggle("自动刷新", isOn: $model.logAutoRefresh).toggleStyle(.switch)
-                Button("刷新") { model.loadLog() }
+                Button { model.loadLog() } label: { Label("刷新", systemImage: "arrow.clockwise") }
+                    .controlSize(.small)
                 Spacer()
+                Button { exportLog() } label: { Label("导出日志", systemImage: "square.and.arrow.up") }
+                    .disabled(model.logText.isEmpty)
+                    .controlSize(.small)
                 Button("清空日志") { model.clearLog() }.disabled(model.busy)
+                    .controlSize(.small)
             }
             Text(ScriptLocator.logFile).font(.caption).foregroundStyle(.secondary)
             ScrollView {
@@ -829,12 +888,40 @@ struct LogView: View {
                     .font(.system(.caption, design: .monospaced))
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(4)
+                    .padding(Theme.gapXS)
+            }
+            if !model.exportMessage.isEmpty {
+                Text(model.exportMessage).font(.caption).foregroundStyle(Theme.ok)
             }
         }
-        .padding()
+        .padding(Theme.gapL)
         .onAppear { model.loadLog() }
-        .onReceive(timer) { _ in if model.logAutoRefresh { model.loadLog() } }
+        .onReceive(timer) { _ in
+            // 日志页 3 秒一采，同样遵守"失焦不采集"
+            guard NSApp.isActive else { return }
+            if model.logAutoRefresh { model.loadLog() }
+        }
+    }
+
+    private func exportLog() {
+        model.exportMessage = ""
+        let panel = NSSavePanel()
+        let fmt = DateFormatter(); fmt.dateFormat = "yyyyMMdd-HHmmss"
+        panel.nameFieldStringValue = "smartroute-log-\(fmt.string(from: Date())).txt"
+        panel.allowedContentTypes = [.plainText]
+        DispatchQueue.main.async {
+            panel.beginSheetModal(for: NSApp.keyWindow ?? NSApp.windows.first ?? NSWindow()) { resp in
+                if resp == .OK, let url = panel.url {
+                    do {
+                        try model.logText.write(to: url, atomically: true, encoding: .utf8)
+                        model.exportMessage = "✅ 已导出 \(url.lastPathComponent)"
+                        NSWorkspace.shared.activateFileViewerSelecting([url])
+                    } catch {
+                        model.exportMessage = "导出失败：\(error.localizedDescription)"
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -871,6 +958,18 @@ struct DaemonView: View {
                 Button("安装 / 重装守护进程") { model.installDaemon() }
                     .disabled(model.daemonInstalling)
                 Button("立即运行一次检测（需要管理员密码）") { runWatchOnce() }
+            }
+            Section("登录时启动 App") {
+                Toggle("开机自启 SmartRoute", isOn: .init(
+                    get: { model.appAutoLaunch },
+                    set: { model.setAppAutoLaunch($0) }
+                ))
+                Text("守护进程本身已经开机自启（负责自动选路）。这一项只是让 App 的菜单栏图标也跟着登录出现，方便随时点开看状态。")
+                    .font(.caption).foregroundStyle(.secondary)
+                if !model.configIOError.isEmpty {
+                    Label(model.configIOError, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption).foregroundStyle(Theme.warn)
+                }
             }
             Section {
                 Text("守护进程以 root 每 20 秒检测一次：以太网没有外网时自动把默认路由切到 Wi-Fi，恢复后自动切回；"
@@ -923,6 +1022,7 @@ struct DaemonView: View {
             }
         }
         .formStyle(.grouped)
+        .onAppear { model.loadAppAutoLaunch() }
         .alert("确认彻底卸载？", isPresented: $model.confirmFullUninstall) {
             Button("取消", role: .cancel) {}
             Button("彻底卸载", role: .destructive) {

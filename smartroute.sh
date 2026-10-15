@@ -106,6 +106,8 @@ usage() {
 
 监控:
   stats        各活跃接口的累计收发字节（供 App 计算实时速率）
+  report       一键诊断报告（纯文本）：接口/路由/pf/配置/日志全量快照，
+               适合贴给别人排查。root 下信息更全：sudo smartroute report > r.txt
   quality      逐接口测延迟/丢包（root 下强制走指定接口）
 
 示例:
@@ -1588,6 +1590,88 @@ cmd_fixconf() {
     return 0
 }
 
+# ---------------- 一键诊断报告 ----------------
+# 输出纯文本（不带颜色码），可直接重定向到文件贴给别人看。
+# 用法: smartroute report > report.txt   （root 下信息更全）
+cmd_report() {
+    echo "===== smartroute 诊断报告 ====="
+    echo "生成时间: $(ts)"
+    echo "运行身份: $(id -un) (uid=$(id -u))"
+    echo "系统: $(sw_vers -productVersion 2>/dev/null) $(sw_vers -buildVersion 2>/dev/null)"
+    echo "架构: $(uname -m)"
+
+    echo
+    echo "----- [1] 硬件接口 -----"
+    find_active
+    echo "以太网设备: ${ACTIVE_ETH_DEV:-无}   服务: ${ACTIVE_ETH_SVC:-无}"
+    echo "Wi-Fi 设备: ${ACTIVE_WIFI_DEV:-无}   服务: ${ACTIVE_WIFI_SVC:-无}"
+    echo "默认路由: $(default_dev)  via  $(default_gw)"
+
+    echo
+    echo "----- [2] 接口地址（含未激活的） -----"
+    service_devices | while IFS=$'\t' read -r name dev; do
+        [ -n "$dev" ] || continue
+        local ip; ip="$(dev_ipv4 "$dev" 2>/dev/null)"
+        printf '    %-8s %-22s %s\n' "$dev" "$name" "${ip:-(无 IPv4)}"
+    done
+
+    echo
+    echo "----- [3] 路由表（默认 + 非常规） -----"
+    # 只看 IPv4（目标列不含冒号），否则 utun/fe80 的 IPv6 行会把报告撑爆
+    netstat -rn 2>/dev/null | awk 'NR==1 || ($1 !~ /:/ && $2 !~ /:/ && (/^default/ || /^169.254/ || /utun/)) {print "    " $0}'
+
+    echo
+    echo "----- [4] pf 状态 -----"
+    if [ "$(id -u)" -eq 0 ]; then
+        echo "pf 启用状态: $(pfctl -s info 2>/dev/null | awk '/^Status/{print $2}')"
+        echo "本工具锚点 ($PF_ANCHOR) 规则:"
+        local rules
+        rules="$(pfctl -a "$PF_ANCHOR" -s rules 2>/dev/null)"
+        if [ -n "$rules" ]; then printf '%s\n' "$rules" | sed 's/^/    /'; else echo "    (空 / 未加载)"; fi
+    else
+        echo "（非 root，跳过。要完整报告请用: sudo smartroute report）"
+    fi
+    echo "锚点文件 $PF_ANCHOR_FILE: $([ -f "$PF_ANCHOR_FILE" ] && echo 存在 || echo 不存在)"
+
+    echo
+    echo "----- [5] 配置 -----"
+    echo "# $CONF"
+    [ -f "$CONF" ] && sed 's/^/    /' "$CONF" || echo "    (不存在)"
+    echo "# $USER_CONF"
+    [ -f "$USER_CONF" ] && sed 's/^/    /' "$USER_CONF" || echo "    (不存在)"
+    echo "# 静态分流规则 $RULES_FILE"
+    [ -f "$RULES_FILE" ] && sed 's/^/    /' "$RULES_FILE" || echo "    (空 / 不存在)"
+
+    echo
+    echo "----- [6] 守护进程状态 -----"
+    if [ "$(id -u)" -eq 0 ]; then
+        launchctl print system/com.user.smartroute >/dev/null 2>&1 \
+            && echo "launchd: 已加载" || echo "launchd: 未加载"
+    else
+        echo "（非 root，跳过 launchctl 查询）"
+    fi
+    echo "plist: $([ -f /Library/LaunchDaemons/com.user.smartroute.plist ] && echo 存在 || echo 不存在)"
+    echo "命令行: $([ -x /usr/local/bin/smartroute ] && echo 已安装 || echo 未安装)"
+    echo "脚本路径: $0"
+
+    echo
+    echo "----- [7] 状态文件 -----"
+    if [ -f "$STATE_FILE" ]; then sed 's/^/    /' "$STATE_FILE"; else echo "    (不存在)"; fi
+
+    echo
+    echo "----- [8] 最近日志（最后 30 行） -----"
+    if [ -f "$LOG_FILE" ]; then tail -n 30 "$LOG_FILE" | sed 's/^/    /'; else echo "    (无日志)"; fi
+
+    echo
+    echo "----- [9] 双网并发状态 -----"
+    balance_status 2>/dev/null | sed 's/^/    /' || echo "    (读取失败，可能需要 root)"
+
+    echo
+    echo "===== 报告结束 ====="
+    echo "提示：把这份报告贴给别人时，里面的 IP 都是内网地址（192.168.x.x 之类），"
+    echo "     不包含密码或令牌，可以放心分享。"
+}
+
 # ---------------- 入口 ----------------
 
 main() {
@@ -1605,6 +1689,7 @@ main() {
         fixconf)        cmd_fixconf ;;
         rule)           cmd_rule "$@" ;;
         stats)          cmd_stats ;;
+        report|rep)     cmd_report ;;
         quality|q)      cmd_quality ;;
         -h|--help|help) usage ;;
         *)              usage ;;

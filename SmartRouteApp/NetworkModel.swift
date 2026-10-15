@@ -124,6 +124,12 @@ final class NetworkModel: ObservableObject {
     @Published var daemonMessage = ""
     /// 彻底卸载的二次确认弹窗（此环境 @State 宏不可用，只能放 Model 里）
     @Published var confirmFullUninstall = false
+    /// 体检页"导出诊断报告"的结果提示
+    @Published var exportMessage = ""
+    /// 选路页配置导入/导出的错误或结果提示
+    @Published var configIOError = ""
+    /// App 是否开机自启（登录时把菜单栏图标带出来）
+    @Published var appAutoLaunch = false
 
     // MARK: - 自适应轮询
     /// 连续多少次快照"关键字段"完全没变（用于降频省电）
@@ -369,6 +375,137 @@ final class NetworkModel: ObservableObject {
     }
 
     // MARK: - 选路表单
+
+    // MARK: - App 开机自启
+    // 用一个 ~/Library/LaunchAgents 里的 plist 实现：比 SMAppService 少受签名/位置限制，
+    // 用户在访达里把 App 挪了位置也能靠 path 判断。
+
+    private var launchAgentPlist: String {
+        NSHomeDirectory() + "/Library/LaunchAgents/com.user.smartroute.app.plist"
+    }
+
+    private var appPath: String {
+        // 优先 /Applications 里的安装副本；开发构建时用当前 bundle
+        let installed = "/Applications/SmartRoute.app"
+        if FileManager.default.fileExists(atPath: installed) { return installed }
+        return Bundle.main.bundlePath
+    }
+
+    func loadAppAutoLaunch() {
+        appAutoLaunch = FileManager.default.fileExists(atPath: launchAgentPlist)
+    }
+
+    func setAppAutoLaunch(_ on: Bool) {
+        configIOError = ""
+        let plist = launchAgentPlist
+        let app = appPath
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                if on {
+                    let fm = FileManager.default
+                    try fm.createDirectory(atPath: NSHomeDirectory() + "/Library/LaunchAgents",
+                                          withIntermediateDirectories: true)
+                    let xml = """
+                    <?xml version="1.0" encoding="UTF-8"?>
+                    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+                    <plist version="1.0">
+                    <dict>
+                        <key>Label</key>
+                        <string>com.user.smartroute.app</string>
+                        <key>ProgramArguments</key>
+                        <array>
+                            <string>/usr/bin/open</string>
+                            <string>-a</string>
+                            <string>\(app)</string>
+                        </array>
+                        <key>RunAtLoad</key>
+                        <true/>
+                    </dict>
+                    </plist>
+
+                    """
+                    try xml.write(toFile: plist, atomically: true, encoding: .utf8)
+                } else {
+                    try? FileManager.default.removeItem(atPath: plist)
+                }
+                DispatchQueue.main.async { self.loadAppAutoLaunch() }
+            } catch {
+                DispatchQueue.main.async {
+                    self.configIOError = "设置开机自启失败：\(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    // MARK: - 配置导出 / 导入
+
+    /// 导出当前生效的配置（用户配置 + 静态规则）成一个 .conf 文本文件
+    func exportConfig() {
+        configIOError = ""
+        DispatchQueue.global(qos: .userInitiated).async {
+            var text = "# smartroute 配置导出  生成于 \(Date())\n"
+            text += "# 导入方式：App → 选路设置 → 导入配置\n\n"
+            for f in [ScriptLocator.userConf, ScriptLocator.userRules] {
+                if let s = try? String(contentsOfFile: f, encoding: .utf8), !s.isEmpty {
+                    text += "# ===== \(f) =====\n" + s + "\n"
+                }
+            }
+            let panel = NSSavePanel()
+            panel.nameFieldStringValue = "smartroute-config.conf"
+            panel.allowedContentTypes = [.plainText]
+            DispatchQueue.main.async {
+                panel.beginSheetModal(for: NSApp.keyWindow ?? NSApp.windows.first ?? NSWindow()) { resp in
+                    if resp == .OK, let url = panel.url {
+                        do {
+                            try text.write(to: url, atomically: true, encoding: .utf8)
+                            self.configIOError = "✅ 已导出 \(url.lastPathComponent)"
+                        } catch {
+                            self.configIOError = "导出失败：\(error.localizedDescription)"
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// 从文件导入配置：只认 KEY=VALUE 行与规则行，其余忽略
+    func importConfig() {
+        configIOError = ""
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.plainText]
+        panel.allowsMultipleSelection = false
+        DispatchQueue.main.async {
+            panel.beginSheetModal(for: NSApp.keyWindow ?? NSApp.windows.first ?? NSWindow()) { resp in
+                guard resp == .OK, let url = panel.url else { return }
+                do {
+                    let raw = try String(contentsOf: url, encoding: .utf8)
+                    var conf = "", rules = ""
+                    var inRules = false
+                    for line in raw.components(separatedBy: "\n") {
+                        let t = line.trimmingCharacters(in: .whitespaces)
+                        if t.hasPrefix("# ===== ") && t.contains("rules") { inRules = true; continue }
+                        if t.hasPrefix("#") || t.isEmpty { continue }
+                        if inRules { rules += t + "\n" }
+                        else if t.contains("=") { conf += t + "\n" }
+                    }
+                    guard !conf.isEmpty else {
+                        self.configIOError = "文件里没找到 KEY=VALUE 配置行"
+                        return
+                    }
+                    try conf.write(toFile: ScriptLocator.userConf, atomically: true, encoding: .utf8)
+                    if !rules.isEmpty {
+                        try rules.write(toFile: ScriptLocator.userRules, atomically: true, encoding: .utf8)
+                    }
+                    self.loadRoutingConfig()
+                    self.loadRules()
+                    self.refresh()
+                    self.configIOError = "✅ 已导入并生效（≤20 秒守护进程会跟上）"
+                } catch {
+                    self.configIOError = "导入失败：\(error.localizedDescription)"
+                }
+            }
+        }
+    }
 
     func loadRoutingConfig() {
         let conf = loadConfig()

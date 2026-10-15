@@ -108,6 +108,7 @@ run "分流规则 /Users/Shared/smartroute.rules"    rm -f /Users/Shared/smartro
 run "状态目录 /var/db/smartroute"                rm -rf /var/db/smartroute
 run "锁目录 /var/run/smartroute.lock"            rm -rf /var/run/smartroute.lock
 run "/tmp 探测残留"                              bash -c 'rm -f /tmp/.smartroute.probe.*'
+run "登录自启 plist（App 开机自启）"            bash -c 'rm -f "$HOME/Library/LaunchAgents/com.user.smartroute.app.plist"' 
 if [ "$KEEP_LOGS" = "1" ]; then
     warn "按要求保留日志：/var/log/smartroute.{log,out,err}"
 else
@@ -146,6 +147,7 @@ if [ "$DRY" = "0" ]; then
     for f in /usr/local/bin/smartroute /Library/LaunchDaemons/com.user.smartroute.plist \
              /etc/smartroute.conf /Users/Shared/smartroute.conf /Users/Shared/smartroute.rules \
              /etc/pf.anchors/com.user.smartroute /var/db/smartroute /var/run/smartroute.lock \
+             "$HOME/Library/LaunchAgents/com.user.smartroute.app.plist" \
              "$APP"; do
         if [ -e "$f" ] || [ -L "$f" ]; then printf '    %s✗%s 仍在: %s\n' "$C_R" "$C_0" "$f"; left=$((left+1)); fi
     done
