@@ -8,7 +8,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION="2.1"
+VERSION="2.2"
 VOL="SmartRoute ${VERSION}"
 APP="SmartRoute.app"
 DMG="dist/SmartRoute-${VERSION}-macOS.dmg"

@@ -7,11 +7,12 @@ APP="SmartRoute.app"
 DIST="dist"
 MC="$PWD/.build/module-cache"
 MIN_OS="13.0"
+VERSION="2.2"          # 改版本号只改这一行（Info.plist / ZIP / DMG 都跟着变）
 
 echo "==> 清理"
 # 只清自己生产的 ZIP 和暂存目录；*.dmg 是 build_dmg.sh 的产物，要留着，
 # 否则跑一次 build_release.sh 就把用户辛苦打好的 DMG 删了
-rm -rf "$APP" "$DIST/SmartRoute" "$DIST/SmartRoute-2.1" "$DIST"/SmartRoute-*-macOS.zip
+rm -rf "$APP" "$DIST/SmartRoute" "$DIST/SmartRoute-$VERSION" "$DIST"/SmartRoute-*-macOS.zip
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$DIST" "$MC"
 
 # ---------- 1. 生成图标 ----------
@@ -82,7 +83,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>2.1</string>
+    <string>$VERSION</string>
     <key>CFBundleVersion</key>
     <string>3</string>
     <key>CFBundleIconFile</key>
@@ -110,7 +111,7 @@ codesign --verify --verbose "$APP" 2>&1 | head -3
 
 # ---------- 6. 打包 ----------
 STAGE="$DIST/SmartRoute"          # DMG 用：App + Applications 快捷方式 + 说明
-ZROOT="$DIST/SmartRoute-2.1"      # ZIP 用：统一放进版本文件夹，解压即得
+ZROOT="$DIST/SmartRoute-$VERSION"      # ZIP 用：统一放进版本文件夹，解压即得
 mkdir -p "$STAGE" "$ZROOT"
 cp -R "$APP" "$STAGE/"
 cp -R "$APP" "$ZROOT/"
@@ -138,11 +139,11 @@ chmod 644 "$STAGE/安装说明.txt"
 cp "$STAGE/安装说明.txt" "$ZROOT/"
 
 echo "==> 生成 ZIP（ditto：UTF-8 文件名 + 保留权限）"
-ditto -c -k --sequesterRsrc --keepParent "$ZROOT" "$DIST/SmartRoute-2.1-macOS.zip"
+ditto -c -k --sequesterRsrc --keepParent "$ZROOT" "$DIST/SmartRoute-$VERSION-macOS.zip"
 # 去掉 ditto 产生的 __MACOSX 元数据条目，让压缩包更干净
-zip -q -d "$DIST/SmartRoute-2.1-macOS.zip" "__MACOSX/*" 2>/dev/null || true
-ls -la "$DIST/SmartRoute-2.1-macOS.zip"
-python3 - "$DIST/SmartRoute-2.1-macOS.zip" <<'PYEOF2'
+zip -q -d "$DIST/SmartRoute-$VERSION-macOS.zip" "__MACOSX/*" 2>/dev/null || true
+ls -la "$DIST/SmartRoute-$VERSION-macOS.zip"
+python3 - "$DIST/SmartRoute-$VERSION-macOS.zip" <<'PYEOF2'
 import sys, zipfile
 z = zipfile.ZipFile(sys.argv[1])
 names = z.namelist()
@@ -154,8 +155,8 @@ PYEOF2
 
 echo "==> 生成 DMG（需要磁盘镜像权限；被系统策略阻止时用 ZIP 代替）"
 if hdiutil create -volname "SmartRoute" -srcfolder "$STAGE" -ov -format UDZO \
-        "$DIST/SmartRoute-2.1-macOS.dmg" >/tmp/hdi.log 2>&1; then
-    ls -la "$DIST/SmartRoute-2.1-macOS.dmg"
+        "$DIST/SmartRoute-$VERSION-macOS.dmg" >/tmp/hdi.log 2>&1; then
+    ls -la "$DIST/SmartRoute-$VERSION-macOS.dmg"
     echo "    DMG 创建成功"
 else
     echo "    ℹ️  当前环境不允许创建 DMG（沙箱/权限限制）"

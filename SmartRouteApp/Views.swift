@@ -1068,7 +1068,7 @@ struct AboutView: View {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("SmartRoute").font(.title2.bold())
                         Text("macOS 智能选路 · 双网并发 · 分流规则").foregroundStyle(.secondary)
-                        Text("版本 2.1").font(.caption).foregroundStyle(.secondary)
+                        Text("版本 2.2").font(.caption).foregroundStyle(.secondary)
                     }
                 }
                 .padding(.vertical, 6)
