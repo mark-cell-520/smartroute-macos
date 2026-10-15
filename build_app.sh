@@ -40,6 +40,7 @@ echo "==> 编译 Swift 源码（SwiftUI + AppKit）"
 swiftc -O -swift-version 5 \
     -module-cache-path "$PWD/.build/module-cache" \
     -o "$APP/Contents/MacOS/SmartRoute" \
+    SmartRouteApp/Theme.swift \
     SmartRouteApp/Shell.swift \
     SmartRouteApp/Privileged.swift \
     SmartRouteApp/ScriptLocator.swift \

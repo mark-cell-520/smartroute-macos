@@ -36,7 +36,7 @@ PYEOF
 cp "$PWD/.build/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 
 # ---------- 2. 编译两个架构 ----------
-SRCS="SmartRouteApp/Shell.swift SmartRouteApp/Privileged.swift SmartRouteApp/ScriptLocator.swift \
+SRCS="SmartRouteApp/Theme.swift SmartRouteApp/Shell.swift SmartRouteApp/Privileged.swift SmartRouteApp/ScriptLocator.swift \
       SmartRouteApp/NetworkModel.swift SmartRouteApp/Views.swift SmartRouteApp/SmartRouteApp.swift"
 
 echo "==> 编译 Apple Silicon 切片 (arm64, macOS $MIN_OS+)"

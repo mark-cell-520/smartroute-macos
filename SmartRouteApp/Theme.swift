@@ -1,0 +1,268 @@
+import SwiftUI
+
+// MARK: - 设计系统
+//
+// 目标：把散落在各页面里的"随手写的字体/颜色/间距"收敛成一套统一的视觉语言。
+// 规则：
+//   · 颜色只用语义色（ok/warn/bad/info），不直接写 Color.orange 这类原始色
+//   · 卡片一律用 Card 组件，圆角/内边距/描边全站一致
+//   · 状态徽标一律用 Pill，不再到处 .padding(.horizontal, 6).clipShape(Capsule())
+//   · 空状态用 EmptyState，不再让页面白茫茫一片
+enum Theme {
+
+    // MARK: 品牌色（与 App 图标同一套渐变）
+    static let brand     = Color(red: 0.20, green: 0.58, blue: 1.00)
+    static let brandDeep = Color(red: 0.42, green: 0.28, blue: 0.98)
+
+    // MARK: 语义色
+    static let ok   = Color.green
+    static let warn = Color.orange
+    static let bad  = Color.red
+    static let info = Color.blue
+    static let idle = Color.secondary
+
+    // MARK: 间距（4 的倍数）
+    static let gapXS: CGFloat = 4
+    static let gapS:  CGFloat = 8
+    static let gapM:  CGFloat = 12
+    static let gapL:  CGFloat = 18
+    static let gapXL: CGFloat = 24
+
+    // MARK: 圆角与描边
+    static let radius: CGFloat = 12
+    static let hairline: CGFloat = 1
+
+    /// 探测结果 -> 语义色
+    static func color(forProbe probe: String) -> Color {
+        switch probe {
+        case "ok":   return ok
+        case "fail": return bad
+        case "na":   return idle
+        default:     return warn      // "-" 或未知：还没采到
+        }
+    }
+
+    /// 探测结果 -> 中文
+    static func text(forProbe probe: String) -> String {
+        switch probe {
+        case "ok":   return "有外网"
+        case "fail": return "无外网"
+        case "na":   return "未激活"
+        default:     return "检测中"
+        }
+    }
+
+    /// 探测结果 -> SF Symbol
+    static func icon(forProbe probe: String) -> String {
+        switch probe {
+        case "ok":   return "checkmark.circle.fill"
+        case "fail": return "xmark.circle.fill"
+        case "na":   return "minus.circle.fill"
+        default:     return "questionmark.circle.fill"
+        }
+    }
+}
+
+// MARK: - 卡片（替代裸 GroupBox）
+
+/// 全站统一的卡片容器：圆角 + 细描边 + 极淡阴影，暗色模式下自动变深
+struct Card<Content: View>: View {
+    var title: String? = nil
+    var subtitle: String? = nil
+    @ViewBuilder var content: Content
+
+    @Environment(\.colorScheme) private var scheme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.gapM) {
+            if let title {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(title).font(.headline)
+                    if let subtitle {
+                        Spacer()
+                        Text(subtitle).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            content
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(Theme.gapL)
+        .background(
+            RoundedRectangle(cornerRadius: Theme.radius, style: .continuous)
+                .fill(Color(nsColor: scheme == .dark ? .controlBackgroundColor : .windowBackgroundColor))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: Theme.radius, style: .continuous)
+                .strokeBorder(Color.primary.opacity(scheme == .dark ? 0.10 : 0.07), lineWidth: Theme.hairline)
+        )
+        .shadow(color: .black.opacity(scheme == .dark ? 0.28 : 0.05), radius: scheme == .dark ? 6 : 3, x: 0, y: 1)
+    }
+}
+
+// MARK: - 状态徽标（替代到处手写的 Capsule）
+
+struct Pill: View {
+    let text: String
+    var color: Color = Theme.info
+    var icon: String? = nil
+    var filled = false
+
+    var body: some View {
+        HStack(spacing: 4) {
+            if let icon { Image(systemName: icon).font(.caption2) }
+            Text(text).font(.caption2.weight(.medium))
+        }
+        .padding(.horizontal, Theme.gapS)
+        .padding(.vertical, 3)
+        .foregroundStyle(filled ? Color.white : color)
+        .background(filled ? color : color.opacity(0.14))
+        .clipShape(Capsule())
+    }
+}
+
+// MARK: - 横幅提示（守护进程未装/需更新等）
+
+struct Banner: View {
+    let icon: String
+    let color: Color
+    let title: String
+    let message: String
+    let buttonTitle: String?
+    let action: (() -> Void)?
+
+    init(icon: String, color: Color, title: String, message: String,
+         buttonTitle: String? = nil, action: (() -> Void)? = nil) {
+        self.icon = icon; self.color = color
+        self.title = title; self.message = message
+        self.buttonTitle = buttonTitle; self.action = action
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: Theme.gapM) {
+            Image(systemName: icon)
+                .font(.title2)
+                .foregroundStyle(color)
+                .frame(width: 28)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title).font(.headline)
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: Theme.gapM)
+            if let buttonTitle, let action {
+                Button(buttonTitle, action: action)
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+            }
+        }
+        .padding(Theme.gapM)
+        .background(color.opacity(0.10))
+        .overlay(
+            RoundedRectangle(cornerRadius: Theme.radius, style: .continuous)
+                .strokeBorder(color.opacity(0.28), lineWidth: Theme.hairline)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: Theme.radius, style: .continuous))
+    }
+}
+
+// MARK: - 空状态
+
+struct EmptyState: View {
+    let icon: String
+    let title: String
+    let message: String?
+
+    var body: some View {
+        VStack(spacing: Theme.gapS) {
+            Image(systemName: icon)
+                .font(.system(size: 34))
+                .foregroundStyle(.tertiary)
+            Text(title).font(.headline).foregroundStyle(.secondary)
+            if let message {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 320)
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 120)
+    }
+}
+
+// MARK: - 加载中的按钮
+
+struct LoadingButton: View {
+    let title: String
+    let icon: String
+    var loading = false
+    var prominent = true
+    let action: () -> Void
+
+    var body: some View {
+        // 三元表达式没法同时推两种 ButtonStyle，用 Group 分流
+        Group {
+            if prominent {
+                Button(action: action) { label }
+                    .buttonStyle(.borderedProminent)
+            } else {
+                Button(action: action) { label }
+                    .buttonStyle(.bordered)
+            }
+        }
+        .disabled(loading)
+    }
+
+    @ViewBuilder private var label: some View {
+        HStack(spacing: Theme.gapXS) {
+            if loading {
+                ProgressView().controlSize(.small)
+            } else {
+                Image(systemName: icon)
+            }
+            Text(loading ? "处理中…" : title)
+        }
+    }
+}
+
+// MARK: - 键值行（设置页/关于页常用）
+
+struct KeyValueRow: View {
+    let key: String
+    let value: String
+    var valueColor: Color = .primary
+    var monospaced = false
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text(key).foregroundStyle(.secondary)
+            Spacer()
+            Text(value)
+                .foregroundStyle(valueColor)
+                .font(monospaced ? .system(.body, design: .monospaced) : .body)
+                .textSelection(.enabled)
+        }
+        .font(.callout)
+    }
+}
+
+// MARK: - 页面标题
+
+struct PageHeader: View {
+    let title: String
+    let subtitle: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title).font(.largeTitle.weight(.semibold))
+            if let subtitle {
+                Text(subtitle).font(.callout).foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.bottom, Theme.gapXS)
+    }
+}

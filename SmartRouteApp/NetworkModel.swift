@@ -19,6 +19,20 @@ enum AppPage: String, CaseIterable, Identifiable {
         case .about:   return "关于"
         }
     }
+    /// 副标题：显示在 detail 栏顶部，说明这一页是干什么的
+    var subtitle: String {
+        switch self {
+        case .status:  return "谁在上网、网关通不通、服务顺序一览"
+        case .speed:   return "实时速率与延迟；失焦时自动停采"
+        case .balance: return "按连接把流量分摊到两条线路（实验特性）"
+        case .rules:   return "指定网段固定走某条线路"
+        case .routing: return "选路模式与探测参数"
+        case .doctor:  return "一键排查守护进程、路由与 pf"
+        case .log:     return "守护进程的判定记录"
+        case .daemon: return "安装 / 更新 / 卸载自动选路服务"
+        case .about:   return "版本、作者与致谢"
+        }
+    }
     var icon: String {
         switch self {
         case .status:  return "dot.radiowaves.left.and.right"

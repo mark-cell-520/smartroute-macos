@@ -25,6 +25,7 @@ struct MainView: View {
             }
             .listStyle(.sidebar)
             .navigationSplitViewColumnWidth(min: 190, ideal: 210, max: 250)
+            .scrollContentBackground(.hidden)
         } detail: {
             Group {
                 switch model.page {
@@ -40,8 +41,11 @@ struct MainView: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .navigationTitle(model.page.title)
+            .navigationSubtitle(model.page.subtitle)
         }
         .frame(minWidth: 820, minHeight: 580)
+        .background(Color(nsColor: .underPageBackgroundColor))
         .onAppear {
             NetworkModel.shared = model
             model.refresh()
@@ -76,14 +80,14 @@ struct StatusView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: Theme.gapM) {
                 if !ScriptLocator.daemonInstalled {
                     daemonBanner
                 } else if model.snapshot.daemonScriptOutdated {
                     daemonOutdatedBanner
                 }
                 defaultRouteCard
-                HStack(alignment: .top, spacing: 14) {
+                HStack(alignment: .top, spacing: Theme.gapM) {
                     InterfaceCard(iface: ethInterface, role: "以太网", icon: "cable.connector",
                                   probe: model.snapshot.ethOK, streak: model.snapshot.streakEth)
                     InterfaceCard(iface: wifiInterface, role: "Wi-Fi", icon: "wifi",
@@ -91,7 +95,7 @@ struct StatusView: View {
                 }
                 serviceOrderCard
                 if let watchResult = model.watchResult {
-                    GroupBox("上次手动检测输出") {
+                    Card(title: "上次手动检测输出") {
                         Text(watchResult)
                             .font(.system(.caption, design: .monospaced))
                             .textSelection(.enabled)
@@ -99,98 +103,83 @@ struct StatusView: View {
                     }
                 }
             }
-            .padding()
+            .padding(Theme.gapL)
         }
     }
 
     private var daemonBanner: some View {
-        GroupBox {
-            HStack(spacing: 12) {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.title2).foregroundStyle(.orange)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("守护进程尚未安装").font(.headline)
-                    Text("安装后每 20 秒自动检测：以太网没有外网时自动切到 Wi-Fi，恢复后自动切回（开机自启）")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-                Spacer()
-                Button("安装守护进程") { model.installDaemon() }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(model.daemonInstalling)
-            }
-            .padding(4)
+        Banner(icon: "exclamationmark.triangle.fill", color: Theme.warn,
+               title: "守护进程尚未安装",
+               message: "安装后每 20 秒自动检测：以太网没有外网时自动切到 Wi-Fi，恢复后自动切回（开机自启）",
+               buttonTitle: model.daemonInstalling ? nil : "安装守护进程") {
+            model.installDaemon()
         }
     }
 
     /// 守护进程的脚本比 App 旧：App 功能照常跑（用内置脚本），但自动选路还是旧逻辑
     private var daemonOutdatedBanner: some View {
-        GroupBox {
-            HStack(spacing: 12) {
-                Image(systemName: "arrow.triangle.2.circlepath.circle.fill")
-                    .font(.title2).foregroundStyle(.blue)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("守护进程需要更新").font(.headline)
-                    Text("已安装的守护进程脚本比当前 App 旧，自动选路/探测判定可能不准确。点右侧同步（会要一次管理员密码）。")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-                Spacer()
-                Button("更新守护进程") { model.installDaemon() }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(model.daemonInstalling)
-            }
-            .padding(4)
+        Banner(icon: "arrow.triangle.2.circlepath.circle.fill", color: Theme.info,
+               title: "守护进程需要更新",
+               message: "已安装的守护进程脚本比当前 App 旧，自动选路/探测判定可能不准确。点右侧同步（会要一次管理员密码）。",
+               buttonTitle: model.daemonInstalling ? nil : "更新守护进程") {
+            model.installDaemon()
         }
     }
 
     private var defaultRouteCard: some View {
-        GroupBox {
-            HStack(spacing: 14) {
-                Image(systemName: model.snapshot.defaultReachable ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                    .font(.system(size: 36))
-                    .foregroundStyle(model.snapshot.defaultReachable ? Color.green : Color.orange)
-                VStack(alignment: .leading, spacing: 4) {
+        Card {
+            HStack(spacing: Theme.gapM) {
+                ZStack {
+                    Circle()
+                        .fill((model.snapshot.defaultReachable ? Theme.ok : Theme.warn).opacity(0.14))
+                        .frame(width: 52, height: 52)
+                    Image(systemName: model.snapshot.defaultReachable ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                        .font(.system(size: 26))
+                        .foregroundStyle(model.snapshot.defaultReachable ? Theme.ok : Theme.warn)
+                }
+                VStack(alignment: .leading, spacing: 3) {
                     Text("当前默认路由").font(.headline)
                     Text("\(deviceDisplayName(model.snapshot.defaultDevice))   via   \(model.snapshot.defaultGateway.isEmpty ? "?" : model.snapshot.defaultGateway)")
                         .font(.title3.monospaced())
-                    Text("网关\(model.snapshot.defaultReachable ? "可达" : "不可达") · 更新于 \(model.snapshot.lastUpdated) · 最近切换 \(model.snapshot.lastSwitch)（共 \(model.snapshot.switchCount) 次）")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    HStack(spacing: Theme.gapXS) {
+                        Pill(text: model.snapshot.defaultReachable ? "网关可达" : "网关不可达",
+                             color: model.snapshot.defaultReachable ? Theme.ok : Theme.warn)
+                        Text("更新于 \(model.snapshot.lastUpdated)")
+                            .font(.caption).foregroundStyle(.secondary)
+                        Text("最近切换 \(model.snapshot.lastSwitch)（共 \(model.snapshot.switchCount) 次）")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                 }
                 Spacer()
-                VStack(spacing: 8) {
+                VStack(spacing: Theme.gapS) {
                     Button { model.refresh() } label: { Label("刷新", systemImage: "arrow.clockwise") }
                     Button { runWatch() } label: { Label("立即检测", systemImage: "play.fill") }
                         .disabled(model.watchRunning)
                 }
+                .controlSize(.small)
             }
-            .padding(6)
         }
     }
 
     private var serviceOrderCard: some View {
-        GroupBox("服务顺序（越靠前越优先，第一个活跃的服务提供默认路由）") {
-            VStack(alignment: .leading, spacing: 6) {
-                ForEach(model.snapshot.services) { svc in
-                    HStack {
-                        Text(svc.name)
-                        if !svc.enabled {
-                            Text("已禁用")
-                                .font(.caption2)
-                                .padding(.horizontal, 6).padding(.vertical, 2)
-                                .background(Color.secondary.opacity(0.15))
-                                .clipShape(Capsule())
+        Card(title: "服务顺序", subtitle: "越靠前越优先") {
+            if model.snapshot.services.isEmpty {
+                EmptyState(icon: "list.bullet", title: "暂无网络服务", message: nil)
+            } else {
+                VStack(alignment: .leading, spacing: Theme.gapS) {
+                    ForEach(model.snapshot.services) { svc in
+                        HStack {
+                            Text(svc.name)
+                            if !svc.enabled { Pill(text: "已禁用", color: Theme.idle) }
+                            Spacer()
+                            if svc.device == model.snapshot.defaultDevice {
+                                Pill(text: "当前默认", color: Theme.brand, icon: "star.fill", filled: true)
+                            }
+                            Text(svc.device).font(.caption).foregroundStyle(.secondary)
                         }
-                        Spacer()
-                        if svc.device == model.snapshot.defaultDevice {
-                            Text("当前默认")
-                                .font(.caption2)
-                                .foregroundStyle(.blue)
-                        }
-                        Text(svc.device).font(.caption).foregroundStyle(.secondary)
                     }
                 }
             }
-            .padding(6)
         }
     }
 
@@ -225,26 +214,26 @@ struct InterfaceCard: View {
     let streak: String
 
     var body: some View {
-        GroupBox {
-            VStack(alignment: .leading, spacing: 8) {
+        Card {
+            VStack(alignment: .leading, spacing: Theme.gapS) {
                 HStack {
-                    Image(systemName: icon).font(.title2)
+                    Image(systemName: icon).font(.title2).foregroundStyle(Theme.brand)
                     Text(role).font(.headline)
                     Spacer()
                     ProbePill(value: probe, streak: streak)
                 }
                 if let iface, iface.active {
-                    LabeledContent("设备", value: iface.device)
-                    LabeledContent("IP", value: iface.ip)
-                    LabeledContent("网关", value: iface.gateway)
-                    LabeledContent("服务", value: iface.service)
-                    LabeledContent("连续探测", value: "\(streak) 次")
+                    KeyValueRow(key: "设备", value: iface.device, monospaced: true)
+                    KeyValueRow(key: "IP", value: iface.ip, monospaced: true)
+                    KeyValueRow(key: "网关", value: iface.gateway, monospaced: true)
+                    KeyValueRow(key: "服务", value: iface.service)
+                    KeyValueRow(key: "连续探测", value: "\(streak) 次")
                 } else {
-                    Text("未连接").foregroundStyle(.secondary)
-                    Text("插上线后会自动出现在这里").font(.caption).foregroundStyle(.secondary)
+                    EmptyState(icon: "cable.connector.slash",
+                               title: "未连接",
+                               message: "插上线后会自动出现在这里")
                 }
             }
-            .padding(6)
         }
     }
 }
@@ -271,19 +260,14 @@ struct ProbePill: View {
 
     private var color: Color {
         switch effective {
-        case "1": return .green
-        case "0": return .red
-        default: return .secondary
+        case "1": return Theme.ok
+        case "0": return Theme.bad
+        default: return Theme.idle
         }
     }
 
     var body: some View {
-        Text(text)
-            .font(.caption.bold())
-            .padding(.horizontal, 8).padding(.vertical, 3)
-            .background(color.opacity(0.15))
-            .foregroundStyle(color)
-            .clipShape(Capsule())
+        Pill(text: text, color: color)
     }
 }
 
@@ -296,7 +280,7 @@ struct SpeedView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 if model.monitoredDevices.isEmpty {
-                    GroupBox {
+                    Card {
                         Text("没有检测到活跃接口")
                             .foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, alignment: .center)
@@ -315,7 +299,7 @@ struct SpeedView: View {
     }
 
     private var qualityCard: some View {
-        GroupBox("延迟与丢包（每 30 秒更新；root 下按接口分别探测，否则按默认路由）") {
+        Card(title: "延迟与丢包", subtitle: "每 30 秒更新；root 下按接口分别探测") {
             VStack(alignment: .leading, spacing: 10) {
                 if model.quality.isEmpty {
                     Text("测量中…").foregroundStyle(.secondary)
@@ -349,7 +333,7 @@ struct SpeedView: View {
     }
 
     private var hintCard: some View {
-        GroupBox {
+        Card {
             VStack(alignment: .leading, spacing: 6) {
                 Label("想两个接口同时跑流量？去「双网并发」页开启 pf 分流。", systemImage: "arrow.triangle.branch")
                     .font(.callout)
@@ -372,7 +356,7 @@ struct SpeedCard: View {
     private var icon: String { role == "Wi-Fi" ? "wifi" : "cable.connector" }
 
     var body: some View {
-        GroupBox {
+        Card {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
                     Image(systemName: icon).font(.title3)
@@ -462,7 +446,7 @@ struct BalanceView: View {
     }
 
     private var statusCard: some View {
-        GroupBox("并发分流状态") {
+        Card(title: "并发分流状态") {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
                     statusDot(on: model.balanceOn, text: model.balanceOn ? "已开启" : "未开启")
@@ -500,13 +484,13 @@ struct BalanceView: View {
 
     private func statusDot(on: Bool, text: String) -> some View {
         HStack(spacing: 6) {
-            Circle().fill(on ? Color.green : Color.secondary).frame(width: 10, height: 10)
+            Circle().fill(on ? Theme.ok : Theme.idle).frame(width: 10, height: 10)
             Text(text).font(.headline)
         }
     }
 
     private var controlCard: some View {
-        GroupBox {
+        Card {
             VStack(alignment: .leading, spacing: 10) {
                 Text(model.balanceOn
                      ? (model.balanceMode == "fastest" ? "正在把新连接全部送到延迟更低的那条线路。" : "正在把新连接轮询分发到两个接口。")
@@ -564,8 +548,8 @@ struct BalanceView: View {
     }
 
     private var liveCard: some View {
-        GroupBox(model.balanceMode == "fastest"
-                 ? "实时流量（只有一条在动 = 正在走最快线路）"
+        Card(title: model.balanceMode == "fastest"
+             ? "实时流量（只有一条在动 = 正在走最快线路）"
                  : "实时流量（两个接口一起动 = 分流生效）") {
             VStack(alignment: .leading, spacing: 8) {
                 ForEach(model.monitoredDevices, id: \.self) { dev in
@@ -596,7 +580,7 @@ struct BalanceView: View {
     }
 
     private var explainCard: some View {
-        GroupBox("原理与限制（务必阅读）") {
+        Card(title: "原理与限制", subtitle: "务必阅读") {
             VStack(alignment: .leading, spacing: 8) {
                 point("✅", "不同连接走不同接口：浏览、多线程下载、云同步、视频会议等会自然分摊到两个接口")
                 point("✅", "开启前会自动做 10 个连接验证；流量没分布到两个接口就自动还原，不会留下半截配置")
