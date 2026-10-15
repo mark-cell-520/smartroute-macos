@@ -1837,13 +1837,23 @@ wifi_join() {   # $1=SSID -> 0 成功 / 1 失败
     local ssid="$1" out
     [ -n "$ssid" ] || return 1
     out="$(networksetup -setairportnetwork "$ACTIVE_WIFI_DEV" "$ssid" 2>&1)"
+    WIFI_JOIN_REASON=""
     case "$out" in
-        *"Could not find network"*|*"Failed"*|*"Error"*|*"error"*|*"not associated"*|*"Invalid"*)
+        *"Could not find network"*)
+            # 旁边没这个路由器—— saved 列表里绝大多数都是这种情况，属正常
+            WIFI_JOIN_REASON="outofrange"
+            log "wifi join '$ssid': 不在范围"
+            return 1 ;;
+        *"Failed"*|*"Error"*|*"error"*|*"not associated"*|*"Invalid"*)
+            WIFI_JOIN_REASON="joinfailed"
             log "wifi join '$ssid' 失败: $out"
             return 1 ;;
         *) return 0 ;;
     esac
 }
+
+# 上一次 wifi_join 的失败类别：outofrange=不在范围 / joinfailed=找到了但连不上
+wifi_join_reason() { printf '%s' "${WIFI_JOIN_REASON:-joinfailed}"; }
 
 # 连上之后等接口真正拿到地址（DHCP 可能要一两秒）
 wifi_wait_associated() {   # $1=最多等几秒
@@ -1860,16 +1870,61 @@ wifi_wait_associated() {   # $1=最多等几秒
 # 试连列表里的 Wi-Fi，返回第一个"能上网"的 SSID（stdout）。
 # $1=候选列表（空格分隔，可为空=用已保存列表）；$2=每个最多等几秒
 # 副作用：会真的切换网络。调用方负责确认"现在确实上不了网"。
-wifi_try_candidates() {   # ->  stdout: 成功的 SSID（全失败输出空）
+# 当前 Wi-Fi 是否已经能上网（不切任何网络，只探测）
+wifi_current_ok() {
+    [ -n "$ACTIVE_WIFI_DEV" ] || return 1
+    dev_active "$ACTIVE_WIFI_DEV" || return 1
+    probe_dev "$ACTIVE_WIFI_DEV" "$(svc_router "$ACTIVE_WIFI_SVC")" | sed -n 1p | grep -q '^ok$'
+}
+
+# 把 Wi-Fi 断电重连一次。macOS 会因此自动重新加入它记住的网络——
+# 这是"当前 SSID 读不到"（要位置权限）时唯一的还原手段。
+wifi_power_cycle() {   # $1=设备
+    local d="$1"
+    [ -n "$d" ] || return 1
+    log "循环 Wi-Fi 电源以恢复原网络 ($d)"
+    set_wifi_power "$d" off
+    sleep 2
+    set_wifi_power "$d" on
+    wifi_wait_associated 10
+}
+
+wifi_try_candidates() {   # $1=候选列表 $2=每个等几秒 -> stdout: 成功的 SSID；另设 WIFI_TRY_* 汇总
     local cands="$1" wait_s="${2:-6}" ssid gw
+    WIFI_TRY_TOTAL=0; WIFI_TRY_OUTOFRANGE=0; WIFI_TRY_NOINET=0; WIFI_TRY_JOINFAIL=0
     [ -n "$cands" ] || cands="$(wifi_saved_list | tr '\n' ' ')"
     [ -n "$cands" ] || return 1
 
+    # 【安全】当前网络已经能上网就什么都别做。
+    # 用户碰到的真实 case：当前 Wi-Fi 有网，tryall 却把当前网络重新 join 了一遍，
+    # 结果 "Failed to join network" —— 等于自己把一条好线路踢掉了。
+    # 当前 SSID 读不到（要位置权限），所以没法"跳过当前网络"，
+    # 但"已经能上网就不动手"不需要知道 SSID，而且更彻底。
+    if wifi_current_ok; then
+        log "wifi tryall: 当前 Wi-Fi 已能上网，不切换"
+        WIFI_TRY_ALREADY_OK=1
+        return 1
+    fi
+    WIFI_TRY_ALREADY_OK=0
+
+    # 记住动手前是否关联着：全失败时如果是被我们踢下来的，要负责还原
+    local was_assoc=0
+    dev_active "$ACTIVE_WIFI_DEV" && was_assoc=1
+
     for ssid in $cands; do
         [ -n "$ssid" ] || continue
+        WIFI_TRY_TOTAL=$((WIFI_TRY_TOTAL+1))
         log "wifi 故障转移：试连 '$ssid'"
-        wifi_join "$ssid" || continue
-        wifi_wait_associated "$wait_s" || { log "'$ssid' 连上了但没拿到 IP，跳过"; continue; }
+        if ! wifi_join "$ssid"; then
+            # 区分"不在范围"和"连不上"：前者是正常的（旁边没这个路由器），
+            # 后者才值得用户关注（密码改了？）。原来混在一起报"没有外网"，没法判断。
+            case "$(wifi_join_reason)" in
+                outofrange) WIFI_TRY_OUTOFRANGE=$((WIFI_TRY_OUTOFRANGE+1)) ;;
+                *)          WIFI_TRY_JOINFAIL=$((WIFI_TRY_JOINFAIL+1)) ;;
+            esac
+            continue
+        fi
+        wifi_wait_associated "$wait_s" || { log "'$ssid' 连上了但没拿到 IP，跳过"; WIFI_TRY_NOINET=$((WIFI_TRY_NOINET+1)); continue; }
         # 连上≠能上网：门户认证/假连接很常见，必须真探一次
         gw="$(svc_router "$ACTIVE_WIFI_SVC")"
         if probe_dev "$ACTIVE_WIFI_DEV" "$gw" | sed -n 1p | grep -q '^ok$'; then
@@ -1878,7 +1933,14 @@ wifi_try_candidates() {   # ->  stdout: 成功的 SSID（全失败输出空）
             return 0
         fi
         log "'$ssid' 能连上但没有外网，试下一个"
+        WIFI_TRY_NOINET=$((WIFI_TRY_NOINET+1))
     done
+
+    # 全失败。如果动手前是关联着的、现在被我们踢断了，循环电源让 macOS 自动重连回去
+    if [ "$was_assoc" = "1" ] && ! dev_active "$ACTIVE_WIFI_DEV"; then
+        log "wifi tryall 全失败，且原网络被断开，尝试恢复"
+        wifi_power_cycle "$ACTIVE_WIFI_DEV"
+    fi
     return 1
 }
 
@@ -2011,14 +2073,48 @@ cmd_wifi() {
         tryall|scan-join)
             find_active
             [ -n "$ACTIVE_WIFI_DEV" ] || die "没有检测到 Wi-Fi 接口"
-            echo "正在逐个试连已保存的 Wi-Fi，找第一个能上网的…"
+            [ "$(wifi_power "$ACTIVE_WIFI_DEV")" = "off" ] && set_wifi_power "$ACTIVE_WIFI_DEV" on
+
+            # 已经能上网就直接说，别折腾。这是最重要的安全护栏：
+            # 当前 SSID 读不到（要位置权限），没法"跳过当前网络"，
+            # 但"已经能上网就不动手"不需要知道 SSID，而且更彻底。
+            # 用户碰到的真实 case：当前 Wi-Fi 有网，tryall 却把当前网络重新 join
+            # 了一遍，结果 Failed to join network —— 自己把好线路踢掉了。
+            if wifi_current_ok; then
+                echo "✅ 当前 Wi-Fi 已经可以上网，不需要切换。"
+                _sig="$(wifi_current_signal 2>/dev/null)"
+                if [ -n "$_sig" ]; then
+                    set -- $_sig
+                    echo "   信号 $1 dBm（$(wifi_bars "$1")/4 格）  信道 ${2:-?}"
+                fi
+                return 0
+            fi
+
+            echo "当前 Wi-Fi 上不了网，正在逐个试连已保存的网络…"
             local got
             got="$(wifi_try_candidates "" 6)"
             if [ -n "$got" ]; then
                 echo "✅ 找到可用的网络：$got"
                 [ "$NOTIFY" = "1" ] && notify "SmartRoute" "已切换到可用 Wi-Fi：$got"
+                return 0
+            fi
+
+            # 失败要把原因说清楚。原来一律报"都没有外网"，
+            # 但绝大多数是"不在范围"（旁边没这个路由器），那是正常的；
+            # 真正值得用户处理的是"找到了却连不上"。
+            echo "❌ 没找到能上网的网络。试了 $WIFI_TRY_TOTAL 个："
+            [ "$WIFI_TRY_OUTOFRANGE" -gt 0 ] && echo "   · $WIFI_TRY_OUTOFRANGE 个不在范围（旁边没有这个路由器，属正常）"
+            [ "$WIFI_TRY_JOINFAIL" -gt 0 ] && echo "   · $WIFI_TRY_JOINFAIL 个找到了但连不上（密码可能改过了）"
+            [ "$WIFI_TRY_NOINET"   -gt 0 ] && echo "   · $WIFI_TRY_NOINET 个能连上但没有外网（可能要网页认证）"
+            if [ "$WIFI_TRY_JOINFAIL" -gt 0 ]; then
+                echo
+                echo "提示：连不上的那些网络，请在系统菜单栏的 Wi-Fi 里重新输一次密码，"
+                echo "     之后这里就能一键切换了。"
+            fi
+            if dev_active "$ACTIVE_WIFI_DEV"; then
+                echo "已保留当前连接。"
             else
-                echo "❌ 已保存的 Wi-Fi 都没有外网"
+                echo "原网络已断开，已尝试循环 Wi-Fi 电源让系统自动重连。"
             fi
             ;;
         auto)

@@ -29,7 +29,20 @@ mkdir -p "$T/bin" "$T/state" "$T/etc"
 #   MOCK_JOIN_CURRENT 当前连接到的 SSID
 cat > "$T/bin/networksetup" <<'EOF'
 #!/bin/bash
+# MOCK_JOIN_FAIL_TEXT：让指定的 SSID 返回"Failed to join"而不是"Could not find"，
+# 用来区分"不在范围"和"找到了但连不上"这两种失败
 case "$1" in
+    -setairportnetwork)
+        ssid="$3"
+        for f in $MOCK_JOIN_FAIL_TEXT; do
+            [ "$f" = "$ssid" ] && { echo "Failed to join network $ssid."; exit 0; }
+        done
+        for ok in $MOCK_JOIN_OK; do
+            [ "$ok" = "$ssid" ] && { echo "$ssid" > "$MOCK_STATE/current"; exit 0; }
+        done
+        echo "Could not find network $ssid."
+        exit 0
+        ;;
     -listpreferredwirelessnetworks)
         echo "Preferred networks on en1:"
         printf '%s\n' $MOCK_SAVED | sed '/^$/d' | sed 's/^/\t/'
@@ -156,7 +169,9 @@ out="$(run 'wifi_join NOT_SAVED; echo "rc=$?"')"
 printf '%s' "$out" | grep -q "rc=1" && ok "不存在的网络 → 判定失败（没被退出码 0 骗到）" || bad "应失败: $out"
 
 echo "=== 4. tryall：跳过不能上网的，找到第一个能用的 ==="
-# 当前连的 m 上不了网；CZ-305/mm 能连但没外网；CZ-BH-407 才是真能上网
+# 注意：上一节的 wifi_join 把 current 留在了 CZ-BH-407（正好是有外网的那个），
+# 不复位的话会触发"已能上网就不动"的护栏，本节就永远测不到东西了。
+echo m > "$MOCK_STATE/current"
 out="$(run 'wifi_try_candidates "CZ-305 CZ-BH-407 mm" 1')"
 [ "$out" = "CZ-BH-407" ] && ok "跳过头两个假连接，返回 $out" || bad "期望 CZ-BH-407，得到: $out"
 cur="$(cat "$T/state/current")"
@@ -175,6 +190,9 @@ out="$(run 'export MOCK_SAVED=""; wifi_try_candidates "" 1; echo "rc=$?"')"
 printf '%s' "$out" | grep -q "rc=1" && ok "空列表安全返回失败" || bad "应返回 1: $out"
 
 echo "=== 8. 候选列表尊重传入顺序 ==="
+# 第 5/6 节把 current 留在了一个没有外网的状态，但第 7 节空列表测试没动它；
+# 这里显式复位，避免受前面章节影响
+echo m > "$MOCK_STATE/current"
 out="$(run 'wifi_try_candidates "mm CZ-BH-407" 1')"
 [ "$out" = "CZ-BH-407" ] && ok "按给定顺序试（mm 先失败）" || bad "得到: $out"
 
@@ -241,6 +259,40 @@ out="$(run 'WIFI_PREFERRED=""; echo "cands=[$(wifi_preferred_candidates)]"')"
 # 首选里出现没保存过的名字，不能因此挡住后面的
 out="$(run 'WIFI_PREFERRED="GHOST,CZ-305"; echo "cands=[$(wifi_preferred_candidates)]"')"
 [ "$out" = "cands=[GHOST CZ-305 m CZ-BH-407 mm]" ] && ok "保留未保存的首选名（让 join 去失败）: $out" || bad "得到: $out"
+
+echo "=== 14. tryall 护栏：当前 Wi-Fi 已能上网时绝不切换（用户实测踩到的坑）==="
+# 真实 case：当前 Wi-Fi 有网，tryall 却把当前网络重新 join 了一遍，
+# 结果 "Failed to join network CZ-305" —— 自己把一条好线路踢掉了，
+# 最后还报"已保存的 Wi-Fi 都没有外网"，完全误导。
+# 当前 SSID 读不到（要位置权限），所以没法"跳过当前网络"；
+# 但"已经能上网就不动手"不需要知道 SSID。
+echo m > "$MOCK_STATE/current"
+export MOCK_NET_OK="m"        # 当前网络有外网
+out="$(run 'wifi_current_ok && echo OK || echo NO')"
+[ "$out" = "OK" ] && ok "wifi_current_ok 认出当前网络能上网" || bad "得到: $out"
+# wifi_try_candidates 必须直接放弃，且一个网络都不碰
+out="$(run 'wifi_try_candidates "CZ-305 CZ-BH-407 mm" 1; echo "rc=$? tried=$WIFI_TRY_TOTAL already=$WIFI_TRY_ALREADY_OK"')"
+printf '%s' "$out" | grep -q "tried=0" && ok "已能上网时一个网络都不试" || bad "还是试了: $out"
+printf '%s' "$out" | grep -q "already=1" && ok "置上 ALREADY_OK 标志" || bad "没置标志: $out"
+cur="$(cat "$T/state/current")"
+[ "$cur" = "m" ] && ok "当前连接未被改动" || bad "连接被改成 $cur"
+
+echo "=== 15. 失败原因要分类，不能一律说"没有外网" ==="
+# 不在范围 vs 连不上 vs 连上没外网，是三回事，用户能采取的行动完全不同
+export MOCK_NET_OK="__none__"     # 谁都没有外网
+export MOCK_JOIN_OK="CZ-305 mm"   # 这两个"在范围"，其它不在
+echo m > "$T/state/current"
+out="$(run 'wifi_try_candidates "CZ-305 CZ-BH-407 mm" 1
+    echo "total=$WIFI_TRY_TOTAL oor=$WIFI_TRY_OUTOFRANGE jf=$WIFI_TRY_JOINFAIL ni=$WIFI_TRY_NOINET"')"
+printf '%s' "$out" | grep -q "total=3" && ok "试了 3 个" || bad "总数错: $out"
+printf '%s' "$out" | grep -q "oor=1" && ok "识别出 1 个不在范围（CZ-BH-407）" || bad "不在范围数错: $out"
+printf '%s' "$out" | grep -q "ni=2" && ok "识别出 2 个能连上但没外网" || bad "没外网数错: $out"
+
+echo "=== 16. wifi_join 的失败分类 ==="
+out="$(run 'wifi_join CZ-BH-407; wifi_join_reason')"
+[ "$out" = "outofrange" ] && ok "Could not find network → outofrange" || bad "得到: $out"
+out="$(run 'export MOCK_JOIN_FAIL_TEXT="CZ-305"; wifi_join CZ-305; wifi_join_reason')"
+[ "$out" = "joinfailed" ] && ok "Failed to join → joinfailed（值得用户关注）" || bad "得到: $out"
 
 echo
 echo "结果: $PASS 通过, $FAIL 失败"
