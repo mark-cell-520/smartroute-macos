@@ -120,6 +120,8 @@ final class NetworkModel: ObservableObject {
     @Published var doctorRunning = false
     @Published var logText = ""
     @Published var daemonMessage = ""
+    /// 彻底卸载的二次确认弹窗（此环境 @State 宏不可用，只能放 Model 里）
+    @Published var confirmFullUninstall = false
     @Published var daemonInstalling = false
 
     // MARK: 选路表单
@@ -442,7 +444,8 @@ final class NetworkModel: ObservableObject {
         DispatchQueue.global().async {
             var result = ""
             do {
-                result = try Privileged.run("bash '\(ScriptLocator.resource("uninstall.sh"))'")
+                // 带 --keep-app：否则会把正在运行的 App 自己删掉
+                result = try Privileged.run("bash '\(ScriptLocator.resource("uninstall.sh"))' --keep-app --yes")
             } catch {
                 result = "失败: \(error.localizedDescription)"
             }

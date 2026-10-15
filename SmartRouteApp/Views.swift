@@ -46,6 +46,13 @@ struct MainView: View {
         }
         .frame(minWidth: 820, minHeight: 580)
         .background(Color(nsColor: .underPageBackgroundColor))
+        // 首次启动且守护进程还没装：弹一次引导页（老用户/已装的不打扰）
+        .sheet(isPresented: Binding(
+            get: { !ScriptLocator.daemonInstalled && !UserDefaults.standard.bool(forKey: "didSeeWelcome") },
+            set: { if !$0 { UserDefaults.standard.set(true, forKey: "didSeeWelcome") } }
+        )) {
+            WelcomeView(model: model)
+        }
         .onAppear {
             NetworkModel.shared = model
             model.refresh()
@@ -789,12 +796,20 @@ struct DaemonView: View {
         Form {
             Section("守护进程状态") {
                 LabeledContent("安装状态") {
-                    Text(ScriptLocator.daemonInstalled ? "已安装" : "未安装")
-                        .foregroundStyle(ScriptLocator.daemonInstalled ? .green : .orange)
+                    HStack(spacing: Theme.gapXS) {
+                        Circle()
+                            .fill(ScriptLocator.daemonInstalled ? Theme.ok : Theme.idle)
+                            .frame(width: 8, height: 8)
+                        Text(ScriptLocator.daemonInstalled ? "已安装" : "未安装")
+                    }
                 }
                 LabeledContent("运行状态") {
-                    Text(model.snapshot.daemonRunning ? "运行中" : "未在运行")
-                        .foregroundStyle(model.snapshot.daemonRunning ? .green : .secondary)
+                    HStack(spacing: Theme.gapXS) {
+                        Circle()
+                            .fill(model.snapshot.daemonRunning ? Theme.ok : Theme.idle)
+                            .frame(width: 8, height: 8)
+                        Text(model.snapshot.daemonRunning ? "运行中" : "未在运行")
+                    }
                 }
                 LabeledContent("检测频率") { Text("每 20 秒（开机自启）") }
                 LabeledContent("当前脚本") {
@@ -804,24 +819,77 @@ struct DaemonView: View {
             Section("操作") {
                 Button("安装 / 重装守护进程") { model.installDaemon() }
                     .disabled(model.daemonInstalling)
-                Button("卸载守护进程") { model.uninstallDaemon() }
-                    .disabled(!ScriptLocator.daemonInstalled || model.daemonInstalling)
                 Button("立即运行一次检测（需要管理员密码）") { runWatchOnce() }
             }
             Section {
                 Text("守护进程以 root 每 20 秒检测一次：以太网没有外网时自动把默认路由切到 Wi-Fi，恢复后自动切回；"
-                     + "同时应用分流规则，并在双网并发开启时監控接口健康（掉线自动还原）。安装后本 App 主要用作仪表盘和手动干预。")
+                     + "同时应用分流规则，并在双网并发开启时监控接口健康（掉线自动还原）。安装后本 App 主要用作仪表盘和手动干预。")
                     .font(.caption).foregroundStyle(.secondary)
             }
+
+            // MARK: 彻底卸载（零残留）
+            Section {
+                VStack(alignment: .leading, spacing: Theme.gapS) {
+                    HStack(spacing: Theme.gapS) {
+                        Image(systemName: "trash.circle.fill")
+                            .foregroundStyle(Theme.bad)
+                            .font(.title3)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("彻底卸载（零残留）").font(.headline)
+                            Text("会一次清掉下面全部内容，卸载完不留任何痕迹")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    VStack(alignment: .leading, spacing: 3) {
+                        uninstallItem("守护进程（停止 + 删 plist）")
+                        uninstallItem("命令行工具 /usr/local/bin/smartroute")
+                        uninstallItem("双网并发的 pf 分流规则与锚点文件")
+                        uninstallItem("探测用的临时主机路由")
+                        uninstallItem("全部配置文件（/etc 与 /Users/Shared）")
+                        uninstallItem("状态目录、日志、/tmp 残留")
+                        uninstallItem("App 本体 /Applications/SmartRoute.app")
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                    Button(role: .destructive) { model.confirmFullUninstall = true } label: {
+                        Label("彻底卸载…", systemImage: "trash")
+                    }
+                    .disabled(model.daemonInstalling)
+                    Text("卸载后网络设置保持原样，不会动你现有的路由。")
+                        .font(.caption2).foregroundStyle(.tertiary)
+                }
+                .padding(.vertical, Theme.gapXS)
+            }
+
             if !model.daemonMessage.isEmpty {
                 Section("输出") {
                     Text(model.daemonMessage)
                         .font(.system(.caption, design: .monospaced))
                         .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
         }
         .formStyle(.grouped)
+        .alert("确认彻底卸载？", isPresented: $model.confirmFullUninstall) {
+            Button("取消", role: .cancel) {}
+            Button("彻底卸载", role: .destructive) {
+                model.uninstallDaemon()
+            }
+        } message: {
+            Text("将停止并删除守护进程、命令行工具、pf 分流规则、全部配置与日志，以及 /Applications/SmartRoute.app。\n\n"
+                 + "这个操作不可撤销，建议先导出配置。")
+        }
+    }
+
+    private func uninstallItem(_ text: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: Theme.gapXS) {
+            Image(systemName: "minus.circle.fill")
+                .font(.caption2)
+                .foregroundStyle(Theme.bad.opacity(0.7))
+            Text(text)
+        }
     }
 
     private func runWatchOnce() {

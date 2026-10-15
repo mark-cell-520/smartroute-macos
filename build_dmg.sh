@@ -14,6 +14,7 @@ APP="SmartRoute.app"
 DMG="dist/SmartRoute-${VERSION}-macOS.dmg"
 STAGE=".dmgstage"
 BG=".dmgbg.png"                     # 生成在暂存目录外，避免被 rm -rf 清掉
+ICON=".build/AppIcon.icns"          # 卷图标（build_app.sh / build_release.sh 生成）
 MNT=""
 
 say() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
@@ -48,6 +49,11 @@ rm -rf "$STAGE"; mkdir -p "$STAGE/.background"
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
 cp "$BG" "$STAGE/.background/dmg_bg.png"   # Finder 背景图（相对卷根引用）
+# 卷图标：Finder 里这个磁盘映像显示成 App 的图标，而不是 generic disk
+if [ ! -f "$ICON" ] && [ -f "$APP/Contents/Resources/AppIcon.icns" ]; then
+    ICON="$APP/Contents/Resources/AppIcon.icns"   # 兜底：从已构建的 App 里取
+fi
+if [ -f "$ICON" ]; then cp "$ICON" "$STAGE/.VolumeIcon.icns"; fi
 if [ -f INSTALL.md ]; then cp INSTALL.md "$STAGE/安装说明.txt"; chmod 644 "$STAGE/安装说明.txt"; fi
 
 # ---------- 3. 先建"可写"映像 ----------
@@ -114,6 +120,10 @@ tell application "Finder"
             set position of item "SmartRoute.app" of container window to {300, 240}
             set position of item "Applications" of container window to {760, 240}
             set position of item "安装说明.txt" of container window to {530, 420}
+            try
+                -- 让卷用 .VolumeIcon.icns 而不是 generic disk 图标
+                do shell script "/usr/bin/SetFile -a C '$MNT' 2>/dev/null || true"
+            end try
         end try
         try
             close
@@ -140,6 +150,7 @@ say "校验映像内容"
 ok=1
 [ -d "$MNT/$APP" ]        || { echo "  ✗ 缺少 $APP"; ok=0; }
 [ -L "$MNT/Applications" ] || { echo "  ✗ 缺少 Applications 快捷方式"; ok=0; }
+[ -f "$MNT/.VolumeIcon.icns" ] && say "  ✓ 卷图标已内置（Finder 显示 App 图标）" || echo "  ⚠️ 无卷图标（不影响使用）"
 [ -f "$MNT/安装说明.txt" ]  || echo "  ⚠️ 缺少安装说明（不影响使用）"
 if [ -f "$MNT/.DS_Store" ]; then
     say "  ✓ .DS_Store 已写入（窗口布局会保留）"

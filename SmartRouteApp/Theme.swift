@@ -266,3 +266,94 @@ struct PageHeader: View {
         .padding(.bottom, Theme.gapXS)
     }
 }
+
+// MARK: - 首次启动引导
+
+/// 第一次打开 App 时显示的欢迎页：说清楚这个 App 干什么、要不要装守护进程。
+/// 用 UserDefaults 记住"已看过"，且守护进程已装时直接跳过，不打扰老用户。
+struct WelcomeView: View {
+    @ObservedObject var model: NetworkModel
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage("didSeeWelcome") private var didSee = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // 顶部品牌区
+            VStack(spacing: Theme.gapM) {
+                Image(nsImage: NSApp.applicationIconImage)
+                    .resizable()
+                    .frame(width: 96, height: 96)
+                Text("SmartRoute 智能选路")
+                    .font(.largeTitle.weight(.semibold))
+                Text("网线没外网时自动切 Wi-Fi，恢复后自动切回")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.top, Theme.gapXL)
+            .padding(.bottom, Theme.gapL)
+
+            Divider()
+
+            // 三步说明
+            VStack(alignment: .leading, spacing: Theme.gapM) {
+                welcomeStep(
+                    icon: "1.circle.fill", color: Theme.brand,
+                    title: "看一眼现在的状态",
+                    detail: "「状态」页显示谁在上网、网关通不通。一般插上网线就装好了，不用改任何设置。"
+                )
+                welcomeStep(
+                    icon: "2.circle.fill", color: Theme.brand,
+                    title: "装守护进程（推荐）",
+                    detail: "装了以后开机自启，每 20 秒自动检测：以太网断网自动切 Wi-Fi，恢复自动切回。只需要一次管理员密码。"
+                )
+                welcomeStep(
+                    icon: "3.circle.fill", color: Theme.brand,
+                    title: "需要时再开双网并发",
+                    detail: "「双网并发」页可以把流量按连接分摊到两条线路。这是实验特性，两条线走同一个网关时没有带宽收益。"
+                )
+            }
+            .padding(Theme.gapXL)
+
+            Spacer()
+
+            Divider()
+
+            HStack(spacing: Theme.gapM) {
+                Button("先看看，不装") {
+                    didSee = true
+                    dismiss()
+                }
+                .buttonStyle(.bordered)
+                Spacer()
+                Button {
+                    didSee = true
+                    dismiss()
+                    model.installDaemon()
+                } label: {
+                    Label("安装守护进程", systemImage: "checkmark.shield.fill")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(model.daemonInstalling)
+            }
+            .padding(Theme.gapL)
+        }
+        .frame(width: 620, height: 520)
+        .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private func welcomeStep(icon: String, color: Color, title: String, detail: String) -> some View {
+        HStack(alignment: .top, spacing: Theme.gapM) {
+            Image(systemName: icon)
+                .font(.title2)
+                .foregroundStyle(color)
+                .frame(width: 28)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.headline)
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+}

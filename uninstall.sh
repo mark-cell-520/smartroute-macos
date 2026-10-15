@@ -6,6 +6,8 @@
 #   sudo bash uninstall.sh --yes       # 全删，不提问
 #   sudo bash uninstall.sh --dry-run   # 只列出会删什么，不动手
 #   sudo bash uninstall.sh --keep-logs # 保留日志
+#   sudo bash uninstall.sh --keep-app  # 保留 App 本体（App 内调用卸载时必须加，
+#                                      # 否则会把正在运行的 App 一起删掉）
 #
 # 会清理：
 #   1. launchd 守护进程（停止 + 删 plist）
@@ -18,12 +20,13 @@
 #   7. App 本体 /Applications/SmartRoute.app（默认删，可保留）
 set -u
 
-YES=0; DRY=0; KEEP_LOGS=0
+YES=0; DRY=0; KEEP_LOGS=0; KEEP_APP=0
 for a in "$@"; do
     case "$a" in
         -y|--yes) YES=1 ;;
         -n|--dry-run) DRY=1 ;;
         --keep-logs) KEEP_LOGS=1 ;;
+        --keep-app) KEEP_APP=1 ;;
         -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
         *) echo "未知参数: $a（用 --help 看用法）" >&2; exit 1 ;;
     esac
@@ -49,7 +52,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 echo
-say "SmartRoute 卸载（dry-run=$DRY 保留日志=$KEEP_LOGS）"
+say "SmartRoute 卸载（dry-run=$DRY 保留日志=$KEEP_LOGS 保留App=$KEEP_APP）"
 echo
 
 # ---------- 0. 先停守护进程（否则它会把规则/路由又写回来） ----------
@@ -116,7 +119,9 @@ fi
 # ---------- 4. App 本体 ----------
 say "App 本体"
 APP="/Applications/SmartRoute.app"
-if [ -d "$APP" ]; then
+if [ "$KEEP_APP" = "1" ]; then
+    warn "保留 $APP（可随时自己拖进废纸篓）"
+elif [ -d "$APP" ]; then
     if [ "$DRY" = "1" ]; then
         printf '    %s·%s 将删除 %s\n' "$C_0" "$C_0" "$APP"
     elif [ "$YES" = "1" ]; then

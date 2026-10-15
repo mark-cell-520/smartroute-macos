@@ -125,30 +125,45 @@ smartroute fixconf                # App 提示"保存失败"时修配置属主�
 
 ---
 
-## 八、卸载
+## 八、卸载（零残留）
 
-**方式一：App 内卸载**（如有该按钮）
+卸载脚本会一次清掉**所有**东西，卸完不留任何痕迹。它会清理：
 
-**方式二：手动**
+| 类别 | 具体内容 |
+|---|---|
+| 守护进程 | 停止 launchd 服务 + 删 `/Library/LaunchDaemons/com.user.smartroute.plist` |
+| pf 规则 | 刷掉 `com.apple/smartroute` 锚点里的分流规则 + 删锚点文件；**如果是本工具打开的 pf，会连 pf 一起关掉** |
+| 路由 | 探测时添加的临时主机路由 |
+| 命令行 | `/usr/local/bin/smartroute` |
+| 配置 | `/etc/smartroute.conf`、`/Users/Shared/smartroute.conf`（含 `.tmp` 残留）、`/Users/Shared/smartroute.rules` |
+| 状态与日志 | `/var/db/smartroute`、`/var/log/smartroute.{log,out,err}`、`/var/run/smartroute.lock` |
+| 临时文件 | `/tmp/.smartroute.probe.*` |
+| App 本体 | `/Applications/SmartRoute.app` |
+
+**方式一：App 内卸载**（推荐）
+
+打开 App → 左侧「守护进程」页 → 底部「彻底卸载（零残留）」→ 点「彻底卸载…」，确认后会要一次管理员密码。
+> App 内卸载会**保留 App 自身**（正在运行没法删自己），卸完你只需要把 `/Applications/SmartRoute.app` 拖进废纸篓。
+
+**方式二：命令行卸载**
 
 ```bash
-# 1. 关掉双网并发并还原 pf（如果开着）
-sudo smartroute balance off
+# 先看看会删什么（不动手）
+sudo bash uninstall.sh --dry-run
 
-# 2. 卸载守护进程
-sudo launchctl bootout system/com.user.smartroute 2>/dev/null
-sudo rm -f /Library/LaunchDaemons/com.user.smartroute.plist
+# 正式卸载（会问你要不要删 App）
+sudo bash uninstall.sh
 
-# 3. 删程序与配置
-sudo rm -f /usr/local/bin/smartroute
-rm -rf /Applications/SmartRoute.app
-sudo rm -rf /etc/smartroute.conf /Users/Shared/smartroute.conf \
-          /Users/Shared/smartroute.rules /var/db/smartroute \
-          /var/log/smartroute.log /var/log/smartroute.out /var/log/smartroute.err \
-          /etc/pf.anchors/com.user.smartroute
+# 不提问，全删（含 App）
+sudo bash uninstall.sh --yes
+
+# 想留着日志排查问题
+sudo bash uninstall.sh --keep-logs
 ```
 
-卸载后网络完全恢复原状（不会留下任何路由或 pf 规则）。
+卸载完成后脚本会**自动校验**，输出「✅ 零残留」或列出遗漏项，确认文件、规则、路由、进程全都清干净了。
+
+> 卸载不会改动你现有的网络设置（当前路由、系统 pf 配置保持原样）。
 
 ---
 
