@@ -9,7 +9,9 @@ MC="$PWD/.build/module-cache"
 MIN_OS="13.0"
 
 echo "==> 清理"
-rm -rf "$APP" "$DIST"
+# 只清自己生产的 ZIP 和暂存目录；*.dmg 是 build_dmg.sh 的产物，要留着，
+# 否则跑一次 build_release.sh 就把用户辛苦打好的 DMG 删了
+rm -rf "$APP" "$DIST/SmartRoute" "$DIST/SmartRoute-2.1" "$DIST"/SmartRoute-*-macOS.zip
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$DIST" "$MC"
 
 # ---------- 1. 生成图标 ----------
@@ -107,40 +109,48 @@ codesign --force --deep --sign - "$APP" 2>&1 | head -3 || true
 codesign --verify --verbose "$APP" 2>&1 | head -3
 
 # ---------- 6. 打包 ----------
-STAGE="$DIST/SmartRoute"
-mkdir -p "$STAGE"
+STAGE="$DIST/SmartRoute"          # DMG 用：App + Applications 快捷方式 + 说明
+ZROOT="$DIST/SmartRoute-2.1"      # ZIP 用：统一放进版本文件夹，解压即得
+mkdir -p "$STAGE" "$ZROOT"
 cp -R "$APP" "$STAGE/"
+cp -R "$APP" "$ZROOT/"
 ln -s /Applications "$STAGE/Applications"
-cat > "$STAGE/安装说明.txt" <<'TXT'
+# 安装说明：优先用完整的 INSTALL.md（含 FAQ/卸载/排障），缺失才用简版
+if [ -f INSTALL.md ]; then
+    cp INSTALL.md "$STAGE/安装说明.txt"
+else
+    cat > "$STAGE/安装说明.txt" <<'TXT'
 SmartRoute for macOS —— 安装说明
 ================================
 
 1. 把 SmartRoute.app 拖到「应用程序」文件夹（或直接在本窗口双击运行）
 
-2. 首次打开：
-   如果提示"无法打开，因为无法验证开发者"，
-   请【右键 → 打开】，然后在弹出的对话框里再点「打开」。
-   （本地构建、ad-hoc 签名，未做 Apple 公证；只需操作一次，之后正常打开。）
+2. 首次打开如提示"无法打开，因为无法验证开发者"：
+   请【右键 → 打开】，再点一次「打开」。（ad-hoc 签名未做 Apple 公证，只需一次。）
 
-3. 打开后在「守护进程」页点击「安装 / 重装守护进程」，输入管理员密码。
-   之后每 20 秒自动检测：以太网没有外网时自动切到 Wi-Fi，恢复后自动切回。
+3. 打开后在「守护进程」页安装守护进程，之后每 20 秒自动检测并选路。
 
-4. 想两个接口同时上网？在「双网并发」页开启（会自动验证，失败自动还原）。
-
-5. 卸载：App 内「守护进程」页点卸载，然后把 App 拖进废纸篓即可。
-
-命令行用法（可选）：
-  sudo /usr/local/bin/smartroute status     # 查看状态
-  sudo smartroute balance on                # 开启双网并发
-  smartroute rule add 10.0.0.0/8 en0        # 内网段走有线
-
-系统要求：macOS 13.0 或更高（Apple Silicon / Intel 均可）
-源码与文档：见 GitHub 仓库
+4. 想两个接口同时上网？在「双网并发」页开启（自动验证，失败自动还原）。
 TXT
+fi
+chmod 644 "$STAGE/安装说明.txt"
 
-echo "==> 生成 ZIP"
-( cd "$STAGE" && zip -qry "../SmartRoute-2.1-macOS.zip" "SmartRoute.app" "安装说明.txt" )
+cp "$STAGE/安装说明.txt" "$ZROOT/"
+
+echo "==> 生成 ZIP（ditto：UTF-8 文件名 + 保留权限）"
+ditto -c -k --sequesterRsrc --keepParent "$ZROOT" "$DIST/SmartRoute-2.1-macOS.zip"
+# 去掉 ditto 产生的 __MACOSX 元数据条目，让压缩包更干净
+zip -q -d "$DIST/SmartRoute-2.1-macOS.zip" "__MACOSX/*" 2>/dev/null || true
 ls -la "$DIST/SmartRoute-2.1-macOS.zip"
+python3 - "$DIST/SmartRoute-2.1-macOS.zip" <<'PYEOF2'
+import sys, zipfile
+z = zipfile.ZipFile(sys.argv[1])
+names = z.namelist()
+assert not any("__MACOSX" in n for n in names), "仍有 __MACOSX 条目"
+assert any(n.endswith("SmartRoute.app/Contents/MacOS/SmartRoute") for n in names), "缺少可执行文件"
+assert any(n.endswith(".txt") for n in names), "缺少安装说明"
+print("    ZIP 校验通过：%d 个条目" % len(names))
+PYEOF2
 
 echo "==> 生成 DMG（需要磁盘镜像权限；被系统策略阻止时用 ZIP 代替）"
 if hdiutil create -volname "SmartRoute" -srcfolder "$STAGE" -ov -format UDZO \

@@ -83,6 +83,7 @@ struct NetworkSnapshot {
     var switchCount: String = "0"
     var mode: String = "auto"
     var daemonRunning: Bool = false
+    var daemonScriptOutdated: Bool = false
     var lastUpdated: String = ""
 }
 
@@ -134,6 +135,9 @@ final class NetworkModel: ObservableObject {
     // MARK: 双网并发
     @Published var balanceStatusText = "（读取中…）"
     @Published var balanceOn = false
+    @Published var balanceMode = "round-robin"   // round-robin | fastest
+    @Published var pendingBalanceMode = "round-robin"   // 用户在下拉里选的、尚未生效的策略
+    @Published var balanceLatency: [String: String] = [:]   // 设备名 -> "14.3 ms"
     @Published var balanceLoading = false
     @Published var balanceMessage = ""
 
@@ -143,9 +147,48 @@ final class NetworkModel: ObservableObject {
     @Published var newRuleCidr = ""
     @Published var newRuleDev = ""
 
+    // MARK: - 防重入守卫
+
+    /// 定时器/页面切换会反复触发采集，慢命令（balance status 4.7s、quality 最长 30s、
+    /// stats 每秒一次）一旦上次没跑完又触发一次，进程就会越积越多，界面越来越卡。
+    /// 用这个 Set 保证"同名操作同时只跑一个"，跑得慢就跳过本次，下次定时再来。
+    private let inFlightLock = NSLock()
+    private var inFlight = Set<String>()
+
+    private func beginOp(_ name: String) -> Bool {
+        inFlightLock.lock(); defer { inFlightLock.unlock() }
+        if inFlight.contains(name) { return false }
+        inFlight.insert(name)
+        return true
+    }
+    private func endOp(_ name: String) {
+        inFlightLock.lock(); defer { inFlightLock.unlock() }
+        inFlight.remove(name)
+    }
+
     // MARK: - 采集
 
+    /// 采集一次网络快照。
+    ///
+    /// 必须在后台线程跑：内部要串行执行十来个 shell 命令
+    /// （networksetup ×2、route、ifconfig ×N、networksetup -getinfo ×N、pgrep、ping），
+    /// 在主线程上跑会阻塞 UI 一两秒，表现为"界面卡住不动"。
+    /// 多个调用会合并成一次（onAppear / 切页面 / 点刷新 经常连着来）。
     func refresh() {
+        guard beginOp("refresh") else { return }   // 已有一次在跑就跳过，避免堆积
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let snap = self.collectSnapshot()
+            DispatchQueue.main.async {
+                self.snapshot = snap
+                self.endOp("refresh")
+            }
+        }
+    }
+
+    /// 实际采集逻辑（只在后台线程调用），返回完整快照
+    private func collectSnapshot() -> NetworkSnapshot {
+        var snapshot = NetworkSnapshot()
         let hw = parseHardwarePorts(Shell.run("networksetup -listallhardwareports", timeout: 5).out)
         let services = parseServiceOrder(Shell.run("networksetup -listnetworkserviceorder", timeout: 5).out)
 
@@ -169,13 +212,18 @@ final class NetworkModel: ObservableObject {
             gwReachable = (code == 0)
         }
 
+        // 一次性拿所有接口的 IP 和网关：比"每个接口各跑一次 ifconfig /
+        // networksetup -getinfo"少 2N-2 个进程。一次采集从十多个进程降到 5 个。
+        let ips = allIPAddresses()
+        let gateways = allGateways()
+
         var interfaces: [InterfaceInfo] = []
         for entry in hw {
             let r = role(of: entry.port)
             if r == "其他" { continue }
-            let ip = ipAddress(of: entry.device)
+            let ip = ips[entry.device] ?? ""
             let svc = serviceByDevice[entry.device]
-            let gw = router(of: svc?.name ?? "")
+            let gw = gateways[entry.device] ?? router(of: svc?.name ?? "")
             interfaces.append(InterfaceInfo(role: r,
                                             device: entry.device,
                                             service: svc?.name ?? "-",
@@ -203,7 +251,9 @@ final class NetworkModel: ObservableObject {
         snapshot.lastSwitch = humanize(state["last_switch"] ?? "")
         snapshot.mode = readMode()
         snapshot.daemonRunning = daemonIsRunning()
+        snapshot.daemonScriptOutdated = ScriptLocator.daemonScriptOutdated
         snapshot.lastUpdated = Self.timeString()
+        return snapshot
     }
 
     // MARK: - 配置
@@ -234,6 +284,26 @@ final class NetworkModel: ObservableObject {
             for (key, value) in items {
                 let (out, code) = Shell.run("'\(script)' set \(key)=\(value)", timeout: 10)
                 if code != 0 { failures.append("\(key): \(out)") }
+            }
+            // 普通权限写不进去（多半是用户级配置被 root 创建过，/Users/Shared 带 sticky 位），
+            // 用管理员权限重试一次——会弹系统密码框，成功后属主也会被修好
+            if !failures.isEmpty {
+                do {
+                    for (key, value) in items {
+                        _ = try Privileged.run("'\(script)' set \(key)=\(value)")
+                    }
+                    DispatchQueue.main.async { completion(true, "已用管理员权限保存") }
+                    return
+                } catch {
+                    DispatchQueue.main.async {
+                        var msg = failures.joined(separator: "; ")
+                        if msg.contains("root") || msg.contains("无法写入") {
+                            msg += "\n\n提示：用户配置被 root 占用过。已在 App 内用管理员权限重试仍未成功，可在终端执行：\nsudo smartroute fixconf"
+                        }
+                        completion(false, msg)
+                    }
+                    return
+                }
             }
             DispatchQueue.main.async {
                 completion(failures.isEmpty, failures.joined(separator: "; "))
@@ -307,13 +377,18 @@ final class NetworkModel: ObservableObject {
     }
 
     func loadLog() {
-        let out = Shell.run("tail -n 300 '\(ScriptLocator.logFile)' 2>/dev/null", timeout: 5).out
-        let out2 = Shell.run("tail -n 30 '\(ScriptLocator.daemonOut)' 2>/dev/null", timeout: 5).out
-        var combined = out
-        if !out2.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            combined += "\n\n===== 守护进程 stdout（最近 30 行）=====\n" + out2
+        // tail 也是外部进程，放后台跑，避免日志页打开时卡一下
+        guard beginOp("log") else { return }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            defer { self?.endOp("log") }
+            let out = Shell.run("tail -n 300 '\(ScriptLocator.logFile)' 2>/dev/null", timeout: 5).out
+            let out2 = Shell.run("tail -n 30 '\(ScriptLocator.daemonOut)' 2>/dev/null", timeout: 5).out
+            var combined = out
+            if !out2.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                combined += "\n\n===== 守护进程 stdout（最近 30 行）=====\n" + out2
+            }
+            DispatchQueue.main.async { self?.logText = combined }
         }
-        logText = combined
     }
 
     func clearLog() {
@@ -382,6 +457,10 @@ final class NetworkModel: ObservableObject {
     }
 
     private func tickSpeed() {
+        // 每秒触发一次，但 stats 偶尔会慢；上次没跑完就跳过本次，
+        // 否则慢命令会一个接一个堆积，把机器拖垮
+        guard beginOp("speed") else { return }
+        defer { endOp("speed") }
         let (out, code) = Shell.run("'\(ScriptLocator.scriptPath)' stats", timeout: 4)
         guard code == 0 else { return }
         let now = Date()
@@ -434,7 +513,10 @@ final class NetworkModel: ObservableObject {
     // MARK: - 延迟/丢包
 
     func loadQuality() {
+        // quality 最长可能跑 30 秒，切到"网速与延迟"页就会触发，同样要防重入
+        guard beginOp("quality") else { return }
         DispatchQueue.global().async {
+            defer { self.endOp("quality") }
             let (out, _) = Shell.run("'\(ScriptLocator.scriptPath)' quality", timeout: 30)
             var dict: [String: QualityInfo] = [:]
             for line in out.components(separatedBy: "\n") {
@@ -459,22 +541,42 @@ final class NetworkModel: ObservableObject {
     // MARK: - 双网并发
 
     func loadBalance() {
+        // balance status 要 4-5 秒（含两边延迟测量），切页面/开启后都会调它，
+        // 不防重入的话连点几下就堆积一堆探测进程
+        guard beginOp("balance") else { return }
         DispatchQueue.global().async {
-            let (out, _) = Shell.run("'\(ScriptLocator.scriptPath)' balance status", timeout: 8)
+            let (out, _) = Shell.run("'\(ScriptLocator.scriptPath)' balance status", timeout: 25)
             DispatchQueue.main.async {
+                self.endOp("balance")
                 self.balanceStatusText = out
                 self.balanceOn = out.contains("BALANCE=1")
+                if out.contains("分流策略       : 最快线路") { self.balanceMode = "fastest" }
+                else { self.balanceMode = "round-robin" }
+                // 解析 "实时延迟" 行：    en0      26.8 ms   en1      38.1 ms
+                var lat: [String: String] = [:]
+                for line in out.components(separatedBy: "\n") {
+                    if line.contains(" ms ") && !line.contains("测量中") {
+                        let parts = line.split(separator: " ", omittingEmptySubsequences: true)
+                        // parts: [en0, 26.8, ms, en1, 38.1, ms]
+                        if parts.count >= 6 {
+                            lat[String(parts[0])] = "\(parts[1]) \(parts[2])"
+                            lat[String(parts[3])] = "\(parts[4]) \(parts[5])"
+                        }
+                    }
+                }
+                self.balanceLatency = lat
             }
         }
     }
 
-    func setBalance(on: Bool) {
+    func setBalance(on: Bool, mode: String? = nil) {
         balanceLoading = true
         balanceMessage = ""
         let script = ScriptLocator.scriptPath
+        let modeArg = (on && mode != nil) ? " \(mode!)" : ""
         DispatchQueue.global().async {
             do {
-                let out = try Privileged.run("'\(script)' balance \(on ? "on" : "off")")
+                let out = try Privileged.run("'\(script)' balance \(on ? "on\(modeArg)" : "off")")
                 DispatchQueue.main.async {
                     self.balanceLoading = false
                     self.loadBalance()
@@ -484,7 +586,20 @@ final class NetworkModel: ObservableObject {
             } catch {
                 DispatchQueue.main.async {
                     self.balanceLoading = false
-                    self.balanceMessage = "操作失败: \(error.localizedDescription)"
+                    var msg = error.localizedDescription
+                    // 常见失败给一句可操作提示，避免只看到脚本原文
+                    if msg.contains("两个接口都有外网") {
+                        msg += "\n\n提示：双网并发要求以太网和 Wi-Fi 当前都能上网。可先在「状态」页点「立即检测」看哪个接口不通；"
+                        msg += "若只有一边能上，用「选路设置」切到能上网的那个即可。"
+                    } else if msg.contains("另一个 smartroute 正在运行") {
+                        msg += "\n\n提示：守护进程每 20 秒自动检测一次，稍等几秒再开启即可。"
+                    } else if msg.contains("流量没有走预期接口") {
+                        msg += "\n\n提示：本机 macOS 的 pf 可能没有对出站流量生效 route-to（Apple 对该特性支持不完整）。"
+                        msg += "\n双网并发是实验特性，遇到这种情况说明本机系统不支持，建议改用「智能选路」的单线路切换。"
+                    } else if msg.contains("VPN") {
+                        msg += "\n\n提示：VPN 会接管流量走向，与并发分流冲突，请先断开 VPN 再开启。"
+                    }
+                    self.balanceMessage = "操作失败: \(msg)"
                 }
             }
         }
@@ -493,7 +608,9 @@ final class NetworkModel: ObservableObject {
     // MARK: - 分流规则
 
     func loadRules() {
+        guard beginOp("rules") else { return }
         DispatchQueue.global().async {
+            defer { self.endOp("rules") }
             let (out, _) = Shell.run("'\(ScriptLocator.scriptPath)' rule list", timeout: 6)
             var items: [RouteRule] = []
             for line in out.components(separatedBy: "\n") {
@@ -601,17 +718,50 @@ private func role(of port: String) -> String {
     return "其他"
 }
 
-private func ipAddress(of device: String) -> String {
-    guard !device.isEmpty else { return "" }
-    let out = Shell.run("ifconfig \(device)", timeout: 5).out
+/// 一次 ifconfig 解析出所有接口的 IPv4 地址
+///
+/// ifconfig 输出形如：
+///   en0: flags=8863<UP,BROADCAST,...> mtu 1500
+///       inet 192.168.1.36 netmask 0xffffff00 broadcast 192.168.1.255
+///       inet6 fe80::...%en0 prefixlen 64 scopeid 0x4
+/// 接口头行以非空白字符开头（en0: / utun4: / ...），其下的 "inet " 行给出 IPv4。
+private func allIPAddresses() -> [String: String] {
+    let out = Shell.run("ifconfig", timeout: 5).out
+    var result: [String: String] = [:]
+    var curDev = ""
     for line in out.components(separatedBy: "\n") {
         let t = line.trimmingCharacters(in: .whitespaces)
-        if t.hasPrefix("inet ") {
-            let tokens = t.split(whereSeparator: { $0 == " " || $0 == "\t" })
-            if tokens.count >= 2 { return String(tokens[1]) }
+        if t.isEmpty { continue }
+        // 接口头行：行首不是空白 → 形如 "en0: flags=..."
+        if !line.hasPrefix(" ") && !line.hasPrefix("\t") {
+            let dev = String(t.prefix(while: { $0 != ":" }))
+            if !dev.isEmpty { curDev = dev }
+            continue
+        }
+        // 只取 IPv4（"inet " 不会匹配到 "inet6 "）
+        if t.hasPrefix("inet "), !curDev.isEmpty, result[curDev] == nil {
+            let toks = t.split(whereSeparator: { $0 == " " || $0 == "\t" })
+            if toks.count >= 2 { result[curDev] = String(toks[1]) }
         }
     }
-    return ""
+    return result
+}
+
+/// 一次 netstat -rn 拿到所有接口的默认网关
+///
+/// 原来对每个服务跑一次 `networksetup -getinfo <服务名>`（N 个进程），
+/// 现在一个进程就够：路由表里每个接口的 default 行就是它的实际出口网关。
+private func allGateways() -> [String: String] {
+    let out = Shell.run("netstat -rn", timeout: 5).out
+    var result: [String: String] = [:]
+    for line in out.components(separatedBy: "\n") {
+        let toks = line.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+        // default <gateway> <flags> <netif> ...
+        guard toks.count >= 4, toks[0] == "default" else { continue }
+        let gw = toks[1], netif = toks[3]
+        if gw != "link", !gw.isEmpty, result[netif] == nil { result[netif] = gw }
+    }
+    return result
 }
 
 private func router(of service: String) -> String {

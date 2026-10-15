@@ -50,6 +50,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = item
     }
 
+    /// 失去焦点时停掉每秒采样：用户切到别的 App 时，没人看曲线，
+    /// 没必要每秒还跑一个子进程（省电、也让前台 App 更流畅）。
+    func applicationDidResignActive(_ notification: Notification) {
+        NetworkModel.shared?.stopSpeedMonitor()
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        NetworkModel.shared?.startSpeedMonitor()
+        // 失焦期间没采集，切回前台立刻补一次，避免看到过期数据
+        NetworkModel.shared?.refresh()
+    }
+
     private var balanceItem: NSMenuItem?
 
     @objc private func toggleBalance() {

@@ -24,16 +24,22 @@ enum ScriptLocator {
         resourceDirectory + "/" + name
     }
 
-    /// 优先使用已安装的脚本（与守护进程版本一致），回退到 App 内置脚本
+    /// 特权命令（探测/并发/规则）一律使用 App 内置脚本：
+    /// 内置脚本与当前 App 一起构建发布，行为可预期；已安装的那份只归守护进程用。
     static var scriptPath: String {
-        if FileManager.default.isExecutableFile(atPath: installedScript) {
-            return installedScript
-        }
         let bundled = resource("smartroute.sh")
         if FileManager.default.isExecutableFile(atPath: bundled) {
             return bundled
         }
         return installedScript
+    }
+
+    /// 守护进程的脚本是否与 App 内置版本不一致（需要重装守护进程同步）
+    static var daemonScriptOutdated: Bool {
+        let bundled = resource("smartroute.sh")
+        guard FileManager.default.isExecutableFile(atPath: bundled),
+              FileManager.default.isExecutableFile(atPath: installedScript) else { return false }
+        return !FileManager.default.contentsEqual(atPath: bundled, andPath: installedScript)
     }
 
     /// 配置修改一律使用内置脚本（保证支持用户级配置等新特性）

@@ -14,3 +14,11 @@ smartroute.rules
 
 # 构建出的 App（通过 GitHub Release 分发）
 SmartRoute.app
+
+# 本地下载的工具（不随仓库分发）
+.tools/
+
+# 本地编译的 DMG 背景图生成器
+tools/make_dmg_bg
+.dmgstage/
+.dmgbg.png

@@ -52,11 +52,15 @@ struct MainView: View {
             model.startSpeedMonitor()
         }
         .onReceive(timer) { _ in
+            // 失焦时完全不采集：5 秒一次、每次五六个进程，后台白烧电。
+            // 切回前台时 applicationDidBecomeActive 会立刻补一次刷新，数据不会旧。
+            guard NSApp.isActive else { return }
             model.refresh()
             if model.page == .balance { model.loadBalance() }
             if model.page == .rules { model.loadRules() }
         }
         .onReceive(qualityTimer) { _ in
+            guard NSApp.isActive else { return }
             if model.page == .speed { model.loadQuality() }
         }
     }
@@ -75,6 +79,8 @@ struct StatusView: View {
             VStack(alignment: .leading, spacing: 14) {
                 if !ScriptLocator.daemonInstalled {
                     daemonBanner
+                } else if model.snapshot.daemonScriptOutdated {
+                    daemonOutdatedBanner
                 }
                 defaultRouteCard
                 HStack(alignment: .top, spacing: 14) {
@@ -109,6 +115,26 @@ struct StatusView: View {
                 }
                 Spacer()
                 Button("安装守护进程") { model.installDaemon() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(model.daemonInstalling)
+            }
+            .padding(4)
+        }
+    }
+
+    /// 守护进程的脚本比 App 旧：App 功能照常跑（用内置脚本），但自动选路还是旧逻辑
+    private var daemonOutdatedBanner: some View {
+        GroupBox {
+            HStack(spacing: 12) {
+                Image(systemName: "arrow.triangle.2.circlepath.circle.fill")
+                    .font(.title2).foregroundStyle(.blue)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("守护进程需要更新").font(.headline)
+                    Text("已安装的守护进程脚本比当前 App 旧，自动选路/探测判定可能不准确。点右侧同步（会要一次管理员密码）。")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("更新守护进程") { model.installDaemon() }
                     .buttonStyle(.borderedProminent)
                     .disabled(model.daemonInstalling)
             }
@@ -205,7 +231,7 @@ struct InterfaceCard: View {
                     Image(systemName: icon).font(.title2)
                     Text(role).font(.headline)
                     Spacer()
-                    ProbePill(value: probe)
+                    ProbePill(value: probe, streak: streak)
                 }
                 if let iface, iface.active {
                     LabeledContent("设备", value: iface.device)
@@ -225,18 +251,26 @@ struct InterfaceCard: View {
 
 struct ProbePill: View {
     let value: String
+    var streak: String = ""
+
+    /// 连续探测计数为 0 表示判定尚未确立（探测被中断/结果异常/接口未激活），
+    /// 此时沿用的旧判定不可信，应显示"未知"而不是"有/无外网"。
+    private var effective: String {
+        if streak == "0" { return "-" }
+        return value
+    }
 
     private var text: String {
-        switch value {
+        switch effective {
         case "1": return "有外网"
         case "0": return "无外网"
         case "-": return "未知"
-        default: return value
+        default: return effective
         }
     }
 
     private var color: Color {
-        switch value {
+        switch effective {
         case "1": return .green
         case "0": return .red
         default: return .secondary
@@ -436,6 +470,7 @@ struct BalanceView: View {
                     if model.balanceLoading { ProgressView().controlSize(.small) }
                 }
                 LabeledContent("配置开关", value: "BALANCE=\(model.balanceOn ? 1 : 0)")
+                LabeledContent("分流策略", value: model.balanceMode == "fastest" ? "最快线路" : "轮询两条")
                 LabeledContent("系统 pf", value: pfLine)
                 LabeledContent("分流规则", value: ruleLine)
             }
@@ -473,11 +508,36 @@ struct BalanceView: View {
     private var controlCard: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 10) {
-                Text(model.balanceOn ? "正在把新连接轮询分发到两个接口。" : "开启后，不同的网络连接会分别走以太网和 Wi-Fi。")
+                Text(model.balanceOn
+                     ? (model.balanceMode == "fastest" ? "正在把新连接全部送到延迟更低的那条线路。" : "正在把新连接轮询分发到两个接口。")
+                     : "开启后，不同的网络连接会分别走以太网和 Wi-Fi。")
                     .font(.callout)
+
+                // 策略选择：轮询分摊 vs 只走最快
+                if !model.balanceOn {
+                    Picker("分流策略", selection: $model.pendingBalanceMode) {
+                        Text("轮询两条线路").tag("round-robin")
+                        Text("只走最快线路").tag("fastest")
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                }
+
+                // 各接口实时延迟（选"最快"时就是靠它决定走哪条）
+                if !model.balanceLatency.isEmpty {
+                    HStack(spacing: 16) {
+                        ForEach(model.monitoredDevices, id: \.self) { dev in
+                            Label("\(roleName(dev)) \(model.balanceLatency[dev] ?? "—")",
+                                  systemImage: "timer")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
                 HStack {
                     Button(model.balanceOn ? "关闭双网并发" : "开启双网并发") {
-                        model.setBalance(on: !model.balanceOn)
+                        model.setBalance(on: !model.balanceOn, mode: model.balanceOn ? nil : model.pendingBalanceMode)
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(model.balanceOn ? .red : .green)
@@ -490,7 +550,12 @@ struct BalanceView: View {
                     }
                 }
                 if model.balanceOn {
-                    Text("撤销会清空分流规则；如果 pf 是由本工具开启的，撤销时也会把系统 pf 关回去。")
+                    Text(model.balanceMode == "fastest"
+                         ? "守护进程会定期重测两边延迟，某条线路变慢就自动改走另一条。"
+                         : "撤销会清空分流规则；如果 pf 是由本工具开启的，撤销时也会把系统 pf 关回去。")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else {
+                    Text("轮询：多连接/多下载分摊到两个接口，带宽可叠加。\n最快：所有新连接走延迟低的那条，适合一条稳一条快的场景。")
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
@@ -499,7 +564,9 @@ struct BalanceView: View {
     }
 
     private var liveCard: some View {
-        GroupBox("实时流量（两个接口一起动 = 分流生效）") {
+        GroupBox(model.balanceMode == "fastest"
+                 ? "实时流量（只有一条在动 = 正在走最快线路）"
+                 : "实时流量（两个接口一起动 = 分流生效）") {
             VStack(alignment: .leading, spacing: 8) {
                 ForEach(model.monitoredDevices, id: \.self) { dev in
                     HStack {

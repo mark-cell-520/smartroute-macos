@@ -41,9 +41,13 @@ TLS_PROBE=1                 # ping/TCP 都失败时用 TLS 握手做最后确认
 NOTIFY=0                    # 发生切换时弹系统通知（1 开启）
 AUTO_WIFI_POWER=0           # 以太网无外网且 Wi-Fi 被关闭时，自动打开 Wi-Fi（1 开启）
 BALANCE=0                   # 双网并发分流开关（1 开启，pf 轮询；需 sudo smartroute balance on）
+BALANCE_MODE="round-robin"  # 并发分流策略: round-robin=两个接口轮询 | fastest=只走延迟最低的接口
+FASTEST_SWITCH_RATIO=20     # 判定"明显更快"的延迟差阈值（百分比）。低于这个差距就继续轮询，
+                            # 避免在两条差不多的线路间来回切
+FASTEST_RECHECK=12          # fastest 模式下守护进程重新测延迟的轮询次数（每轮约 20 秒）
 
 # 可用 set 命令修改的配置项
-VALID_KEYS="MODE OK_N FAIL_N COOLDOWN PROBE_TARGETS PING_TIMEOUT NC_TIMEOUT TLS_PROBE NOTIFY AUTO_WIFI_POWER BALANCE"
+VALID_KEYS="MODE OK_N FAIL_N COOLDOWN PROBE_TARGETS PING_TIMEOUT NC_TIMEOUT TLS_PROBE NOTIFY AUTO_WIFI_POWER BALANCE BALANCE_MODE FASTEST_SWITCH_RATIO"
 
 CONF="/etc/smartroute.conf"                     # 系统级配置（root 维护，install.sh 生成）
 USER_CONF="/Users/Shared/smartroute.conf"       # 用户级配置（App/普通用户可写，优先级更高）
@@ -51,9 +55,10 @@ RULES_FILE="/Users/Shared/smartroute.rules"     # 分流规则（每行: CIDR �
 STATE_FILE="/var/db/smartroute/state"
 LOG_FILE="/var/log/smartroute.log"
 LOCK_DIR="/var/run/smartroute.lock"
-PROBE_DETAIL_FILE="/tmp/.smartroute.probe.$$"   # 探测明细（跨命令替换子 shell 传递）
-PF_ANCHOR="com.user.smartroute"                 # pf 锚点名（双网并发分流用）
-PF_ANCHOR_FILE="/etc/pf.anchors/$PF_ANCHOR"     # pf 规则文件
+PF_ANCHOR="com.apple/smartroute"              # pf 锚点名：挂在系统 pf.conf 已有的
+                                              # anchor "com.apple/*" 通配锚点下，
+                                              # 无需改动 /etc/pf.conf 即可生效
+PF_ANCHOR_FILE="/etc/pf.anchors/com.user.smartroute"   # 规则文件（路径与锚点名无关）
 PF_STATE_FILE="/var/db/smartroute/pf.state"     # 记录我们是否开启了系统 pf（用于还原）
 
 [ -r "$CONF" ] && . "$CONF"
@@ -88,9 +93,13 @@ usage() {
   log          查看最近日志（默认 50 行）
 
 双网并发 / 分流:
-  balance on    开启双网并发分流（需 sudo；两个接口都要有外网，自动验证，失败自动还原）
+  balance on [round-robin|fastest]
+                开启双网并发分流（需 sudo；两个接口都要有外网，自动验证，失败自动还原）
+                  round-robin  新连接在两个接口间轮询，带宽可叠加（默认）
+                  fastest      先测两边延迟，只走更快的那条；守护进程定期重测，变慢自动改道
   balance off   关闭并发分流并恢复原状（需 sudo）
   balance status 查看并发分流状态
+  fixconf      修复用户配置属主（App 提示"保存失败"时用，需 sudo）
   rule add <CIDR> <接口>   添加静态分流规则，如 rule add 10.0.0.0/8 en0（普通用户可写，守护进程应用）
   rule del <CIDR>          删除规则
   rule list                查看规则及生效情况
@@ -261,9 +270,14 @@ find_active() {
 
 # ---------------- 路由操作（兼容不同参数顺序） ----------------
 route_add_host() {   # $1=目标IP $2=设备 $3=网关
-    route add -host "$1" -interface "$2" "$3" 2>/dev/null && return 0
-    route add -host "$1" "$3" -interface "$2" 2>/dev/null && return 0
-    route add -host "$1" "$3" 2>/dev/null && return 0
+    route add -host "$1" -interface "$2" "$3" >/dev/null 2>&1 && return 0
+    route add -host "$1" "$3" -interface "$2" >/dev/null 2>&1 && return 0
+    route add -host "$1" "$3" >/dev/null 2>&1 && return 0
+    # 目标路由已存在（同网段双宿主、残留路由，或与守护进程的探测并发时会出现）：
+    # 已有路由的网关与本次一致，说明就是同一条上网路径，复用即可
+    local cur
+    cur="$(route -n get "$1" 2>/dev/null | sed -n 's/^[[:space:]]*gateway:[[:space:]]*//p' | head -1)"
+    [ -n "$cur" ] && [ "$cur" = "$3" ] && return 0
     return 1
 }
 
@@ -283,42 +297,109 @@ cleanup_probe_routes() {
 }
 
 # ---------------- 连通性探测 ----------------
-# 输出: ok / fail / na（接口未激活）；明细写入 PROBE_DETAIL_FILE 文件
-# （probe_dev 常在 $(...) 子 shell 中被调用，全局变量传不出来，故用文件传递）
+# 输出两行：第 1 行 ok / fail / na（接口未激活），第 2 行人类可读明细。
+# probe_dev 常在 $(...) 子 shell 里被调用，全局变量传不出来，所以两行都走 stdout。
 # 原理：root 下给探测目标加临时主机路由强制走指定接口，从而可以探测
 # “当前不是默认路由”的接口；探测完立即删除，不影响正常流量。
 # 三层探测：
 #   1) ping        —— 快，但可能被防火墙禁 ICMP
 #   2) TCP 53/443  —— 穿透大部分禁 ping 的网络
 #   3) TLS 握手    —— 识别“TCP 通但没有真正互联网”的场景（门户劫持/假链）
-set_probe_detail() {   # $1=明细内容（同时写全局变量和文件）
+set_probe_detail() {   # $1=明细内容（只写全局变量）
     PROBE_DETAIL="$1"
-    printf '%s' "$1" > "$PROBE_DETAIL_FILE" 2>/dev/null
+}
+
+# 输出探测结果：第 1 行判定（ok/fail/na），第 2 行明细。
+# 不用临时文件传递——App 超时会 SIGKILL，trap 捕获不到，文件就漏在 /tmp 里
+# （历史上因此积了几十个 /tmp/.smartroute.probe.* 残留）。
+probe_out() {   # $1=判定 $2=明细
+    printf '%s\n%s\n' "$1" "${2:-}"
+}
+
+# ---------------- 延迟测量 ----------------
+# 测量某个接口到外网的平均 RTT（毫秒）。root 下给探测目标加临时主机路由强制走指定
+# 接口，因此可以测"当前不是默认路由"的接口；测完立即删除，不影响正常流量。
+# 输出: 平均 RTT（如 "14.3"）；测不到返回空。多个目标取平均，避免单点抖动。
+measure_latency() {   # $1=设备 $2=网关 -> stdout: 平均 RTT 毫秒（如 14.3）；测不到返回空
+    local dev="$1" gw="$2" t out r vals="" seen="" n=0 max=4
+    [ -n "$dev" ] || return 1
+    dev_active "$dev" || return 1
+    # 目标去重后最多取 max 个。这个函数会被 balance status 频繁调用，
+    # 目标太多命令会变慢（每个目标最坏 2×PING_TIMEOUT），把 App 拖到超时。
+    for t in $PROBE_TARGETS 1.1.1.1 8.8.8.8; do
+        case " $seen " in
+            *" $t "*) ;;
+            *) [ "$n" -ge "$max" ] && break; seen="$seen $t"; n=$((n+1)) ;;
+        esac
+    done
+    if [ "$(id -u)" -eq 0 ] && [ -n "$gw" ]; then
+        cleanup_probe_routes
+        for t in $seen; do
+            route_add_host "$t" "$dev" "$gw" >/dev/null 2>&1
+        done
+    fi
+    n=0
+    for t in $seen; do
+        # -i 0.2 缩短包间隔：ping -c 2 默认间隔 1 秒，4 个目标要 4 秒+
+        out="$(ping -c 2 -i 0.2 -W "$PING_TIMEOUT" "$t" 2>/dev/null | tail -n 1)"
+        case "$out" in
+            *round-trip*)
+                r="$(printf '%s' "$out" | sed -n 's|.*= *[0-9.]*/\([0-9.]*\)/.*|\1|p')"
+                if [ -n "$r" ]; then vals="$vals $r"; n=$((n+1)); fi
+                ;;
+        esac
+    done
+    [ "$(id -u)" -eq 0 ] && cleanup_probe_routes >/dev/null 2>&1
+    [ "$n" -gt 0 ] || return 1
+    printf '%s' "$vals" | awk '{s+=$1; n++} END{ printf "%.1f", s/n }'
+    return 0
+}
+
+# 比较两个接口的延迟，选出更快的一方。
+# 输出: 设备名；差距小于阈值时输出 tie（表示差距不明显，应继续轮询而不是单选）
+pick_fastest() {   # $1=设备A $2=延迟A $3=设备B $4=延迟B
+    local d1="$1" l1="$2" d2="$3" l2="$4"
+    if [ -z "$l1" ] && [ -z "$l2" ]; then echo ""; return 1; fi
+    [ -z "$l1" ] && { echo "$d2"; return 0; }     # 只有 B 测得出来
+    [ -z "$l2" ] && { echo "$d1"; return 0; }
+    awk -v a="$l1" -v b="$l2" -v r="$FASTEST_SWITCH_RATIO" -v d1="$d1" -v d2="$d2" 'BEGIN{
+        lo = (a < b ? a : b); hi = (a < b ? b : a)
+        if (hi <= lo * (100 + r) / 100) { print "tie"; exit }   # 差距不够大
+        print (a < b ? d1 : d2)
+    }'
+    return 0
 }
 
 probe_dev() {   # $1=设备 $2=网关
     local dev="$1" gw="$2" t ok=1 added=0
     local ping_ok=0 tcp_ok=0 tls_ok=0 targets
     set_probe_detail ""
-    [ -n "$dev" ] || { set_probe_detail "接口未指定"; echo na; return; }
-    dev_active "$dev" || { set_probe_detail "接口未激活/无 IP"; echo na; return; }
+    [ -n "$dev" ] || { set_probe_detail "接口未指定"; probe_out na "接口未指定"; return; }
+    dev_active "$dev" || { set_probe_detail "接口未激活/无 IP"; probe_out na "接口未激活/无 IP"; return; }
 
-    targets="$PROBE_TARGETS"
-    [ "$TLS_PROBE" = "1" ] && targets="$targets 1.1.1.1 8.8.8.8"
+    # 探测目标去重（TLS 目标可能已在 PROBE_TARGETS 里，避免重复加同一条路由）
+    targets=""
+    for t in $PROBE_TARGETS 1.1.1.1 8.8.8.8; do
+        case " $targets " in *" $t "*) ;; *) targets="$targets $t" ;; esac
+    done
+    targets="${targets# }"
+    [ "$TLS_PROBE" = "1" ] || targets="$PROBE_TARGETS"
 
     if [ "$(id -u)" -eq 0 ] && [ -n "$gw" ]; then
+        # 先清理上次被中断时残留的探测路由，保证每次探测环境干净、可重复
+        cleanup_probe_routes
         for t in $targets; do
             route_add_host "$t" "$dev" "$gw" && added=$((added+1))
         done
         if [ "$added" -eq 0 ]; then
             # 网关不在线/不可达，该接口不可能有外网
             set_probe_detail "网关 $gw 不可达（无法添加主机路由）"
-            echo fail; return
+            probe_out fail "网关 $gw 不可达（无法添加主机路由）"; return
         fi
     elif [ -z "$gw" ]; then
         # 有 IP 但没有网关（例如 169.254 自分配地址），不可能有外网
         set_probe_detail "有 IP 但无网关（可能是 169.254 自分配地址）"
-        echo fail; return
+        probe_out fail "有 IP 但无网关（可能是 169.254 自分配地址）"; return
     else
         set_probe_detail "非 root：按当前默认路由探测"
     fi
@@ -339,13 +420,13 @@ probe_dev() {   # $1=设备 $2=网关
     if [ "$ok" -ne 0 ] && [ "$TLS_PROBE" = "1" ] && command -v curl >/dev/null 2>&1; then
         for t in 1.1.1.1 8.8.8.8; do
             case " $targets " in *" $t "*) ;; *) continue ;; esac
-            if curl -s -m 4 -o /dev/null "https://$t/"; then tls_ok=1; ok=0; break; fi
+            if curl -s -m 4 -o /dev/null "https://$t/" 2>/dev/null; then tls_ok=1; ok=0; break; fi
         done
     fi
 
     [ "$added" -gt 0 ] && cleanup_probe_routes
     set_probe_detail "${PROBE_DETAIL}${PROBE_DETAIL:+；}ping=$ping_ok tcp=$tcp_ok tls=$tls_ok"
-    [ "$ok" -eq 0 ] && echo ok || echo fail
+    probe_out "$([ "$ok" -eq 0 ] && echo ok || echo fail)" "$PROBE_DETAIL"
 }
 
 # ---------------- 状态持久化（跨 launchd 调用） ----------------
@@ -372,6 +453,7 @@ update_streak() {   # $1=eth|wifi  $2=ok|fail|na -> 输出新连续值
         ok)   if [ "$s" -gt 0 ]; then s=$((s+1)); else s=1; fi ;;
         fail) if [ "$s" -lt 0 ]; then s=$((s-1)); else s=-1; fi ;;
         na)   s=0 ;;
+        *)    s=0 ;;   # 无法识别的结果（异常输出）按未知处理，不用脏值做判定
     esac
     state_set "streak_$n" "$s"
     echo "$s"
@@ -439,8 +521,13 @@ do_switch() {   # $1=目标设备 $2=原默认设备 $3=eth探测 $4=wifi探测 
 cmd_watch() {
     find_active
     local eth_res="na" wifi_res="na"
-    [ -n "$ACTIVE_ETH_DEV" ]  && eth_res="$(probe_dev "$ACTIVE_ETH_DEV" "$(svc_router "$ACTIVE_ETH_SVC")")"
-    [ -n "$ACTIVE_WIFI_DEV" ] && wifi_res="$(probe_dev "$ACTIVE_WIFI_DEV" "$(svc_router "$ACTIVE_WIFI_SVC")")"
+    # probe_dev 输出两行：第 1 行判定，第 2 行明细。这里只取判定行。
+    if [ -n "$ACTIVE_ETH_DEV" ]; then
+        eth_res="$(probe_dev "$ACTIVE_ETH_DEV" "$(svc_router "$ACTIVE_ETH_SVC")" | sed -n 1p)"
+    fi
+    if [ -n "$ACTIVE_WIFI_DEV" ]; then
+        wifi_res="$(probe_dev "$ACTIVE_WIFI_DEV" "$(svc_router "$ACTIVE_WIFI_SVC")" | sed -n 1p)"
+    fi
 
     local se sw eth_ok wifi_ok cur want
     se="$(update_streak eth "$eth_res")"
@@ -471,7 +558,7 @@ cmd_watch() {
     # 【并发分流安全阀】任一口没有外网时自动关闭双网并发，避免把流量送进死口
     if [ "$BALANCE" = "1" ] && [ "$(id -u)" -eq 0 ]; then
         if [ "$eth_ok" -ne 1 ] || [ "$wifi_ok" -ne 1 ]; then
-            log "并发分流安全阀: 以太网 ok=$eth_ok Wi-Fi ok=$wifi_ok，自动关闭双网并发"
+            log "并发分流安全阀: 以太网 ok=$eth_ok Wi-Fi ok=${wifi_ok}，自动关闭双网并发"
             balance_off quiet
             notify "smartroute" "双网并发已自动关闭（接口状态变化）"
         elif ! pfctl -a "$PF_ANCHOR" -s rules 2>/dev/null | grep -q .; then
@@ -483,6 +570,15 @@ cmd_watch() {
             else
                 log "并发分流: 规则文件不存在，关闭并发开关"
                 balance_off quiet
+            fi
+        elif [ "$(state_get balance_mode)" = "fastest" ]; then
+            # 最快线路模式：周期性重测延迟，线路变慢自动改道
+            local bcyc
+            bcyc=$(( $(state_get balance_cycle) + 1 ))
+            state_set balance_cycle "$bcyc"
+            if [ "$bcyc" -ge "$FASTEST_RECHECK" ]; then
+                state_set balance_cycle 0
+                balance_reevaluate
             fi
         fi
     fi
@@ -563,7 +659,7 @@ cmd_status() {
         fi
     fi
     if [ -n "$ACTIVE_ETH_SVC" ] && ! svc_enabled "$ACTIVE_ETH_SVC"; then
-        echo "${C_WARN}⚠️  以太网服务“$ACTIVE_ETH_SVC”已被禁用，插网线也不会启用。${C_RST}"
+        echo "${C_WARN}⚠️  以太网服务“${ACTIVE_ETH_SVC}”已被禁用，插网线也不会启用。${C_RST}"
     fi
 }
 
@@ -575,8 +671,16 @@ cmd_test() {
     fi
     find_active
     local eth_res="na" wifi_res="na" eth_detail="" wifi_detail=""
-    [ -n "$ACTIVE_ETH_DEV" ]  && { eth_res="$(probe_dev "$ACTIVE_ETH_DEV" "$(svc_router "$ACTIVE_ETH_SVC")")"; eth_detail="$(cat "$PROBE_DETAIL_FILE" 2>/dev/null)"; }
-    [ -n "$ACTIVE_WIFI_DEV" ] && { wifi_res="$(probe_dev "$ACTIVE_WIFI_DEV" "$(svc_router "$ACTIVE_WIFI_SVC")")"; wifi_detail="$(cat "$PROBE_DETAIL_FILE" 2>/dev/null)"; }
+    if [ -n "$ACTIVE_ETH_DEV" ]; then
+        _p="$(probe_dev "$ACTIVE_ETH_DEV" "$(svc_router "$ACTIVE_ETH_SVC")")"
+        eth_res="$(printf '%s\n' "$_p" | sed -n 1p)"
+        eth_detail="$(printf '%s\n' "$_p" | sed -n 2p)"
+    fi
+    if [ -n "$ACTIVE_WIFI_DEV" ]; then
+        _p="$(probe_dev "$ACTIVE_WIFI_DEV" "$(svc_router "$ACTIVE_WIFI_SVC")")"
+        wifi_res="$(printf '%s\n' "$_p" | sed -n 1p)"
+        wifi_detail="$(printf '%s\n' "$_p" | sed -n 2p)"
+    fi
     echo "以太网 (${ACTIVE_ETH_DEV:-无})   : $eth_res"
     if [ "$verbose" = "1" ] && [ -n "$eth_detail" ]; then echo "    └─ $eth_detail"; fi
     echo "Wi-Fi  (${ACTIVE_WIFI_DEV:-无})   : $wifi_res"
@@ -619,32 +723,70 @@ cmd_set() {
     elif [ "$(id -u)" -eq 0 ]; then
         target="$CONF"
     else
-        die "无法写入 $USER_CONF，请用 sudo: sudo smartroute set $kv"
+        die "无法写入 ${USER_CONF}（可能属于 root）。请在 App 里重试保存并输入管理员密码，或执行: sudo chown \$(id -u) $USER_CONF"
     fi
 
-    conf_set "$key" "$val" "$target" || die "写入 $target 失败"
-    echo "已设置 $key=$val（写入 $target）"
+    if ! conf_set "$key" "$val" "$target"; then
+        if [ "$target" = "$USER_CONF" ] && [ "$(stat -f '%u' "$target" 2>/dev/null)" = "0" ]; then
+            die "写入 $target 失败：该文件属于 root（/Users/Shared 带 sticky 位，普通用户无法替换）。请执行: sudo chown \$(id -u) $target"
+        fi
+        die "写入 $target 失败"
+    fi
+    echo "已设置 $key=${val}（写入 ${target}）"
     echo "守护进程将在下个周期（≤20 秒）生效；可 sudo smartroute watch 立即生效"
 }
 
 # 写入配置到指定文件（内部使用）
 conf_set() {   # $1=KEY $2=VALUE $3=目标文件
-    local key="$1" val="$2" target="$3"
+    local key="$1" val="$2" target="$3" cu tmp
     if [ -f "$target" ]; then
-        grep -v "^$key=" "$target" > "$target.tmp" 2>/dev/null && mv "$target.tmp" "$target"
+        # 路径一：同目录临时文件 + 原子替换（最稳，但 /Users/Shared 带 sticky 位时
+        # 非属主 mv 会 EPERM）
+        tmp="$3.tmp.$$"
+        if { grep -v "^$key=" "$target" > "$tmp"; } 2>/dev/null && \
+           printf '%s=%s\n' "$key" "$val" >> "$tmp" 2>/dev/null && \
+           mv "$tmp" "$target" 2>/dev/null; then
+            :
+        else
+            rm -f "$tmp" 2>/dev/null
+            # 路径二：退化成原地覆写（目录不可写但文件本身可写时用）
+            tmp="${TMPDIR:-/tmp}/smartroute.conf.$$"
+            if grep -v "^$key=" "$target" > "$tmp" 2>/dev/null && \
+               printf '%s=%s\n' "$key" "$val" >> "$tmp" 2>/dev/null && \
+               cat "$tmp" > "$target" 2>/dev/null; then
+                rm -f "$tmp" 2>/dev/null
+            else
+                rm -f "$tmp" 2>/dev/null; return 1
+            fi
+        fi
     else
         printf '# smartroute 用户配置（优先级高于 /etc/smartroute.conf）\n' > "$target" 2>/dev/null || return 1
+        printf '%s=%s\n' "$key" "$val" >> "$target" 2>/dev/null || return 1
     fi
-    printf '%s=%s\n' "$key" "$val" >> "$target" 2>/dev/null || return 1
+    # root 若写了用户级配置，把属主还给控制台用户，避免以后普通用户存不进去
+    if [ "$(id -u)" -eq 0 ] && [ "$target" = "$USER_CONF" ]; then
+        cu="$(stat -f '%u' /dev/console 2>/dev/null)"
+        if [ -n "$cu" ] && [ "$cu" != "0" ]; then
+            chown "$cu" "$target" 2>/dev/null
+            chmod 644 "$target" 2>/dev/null
+        fi
+    fi
     return 0
 }
 
 # 内部快捷写配置（自动选择用户级/系统级）
 conf_set_auto() {   # $1=KEY $2=VALUE
-    if [ -w "$USER_CONF" ] || [ -w "$(dirname "$USER_CONF")" ]; then
-        conf_set "$1" "$2" "$USER_CONF"
-    elif [ "$(id -u)" -eq 0 ]; then
+    # root 优先写系统级配置：用户级配置若被 root 创建会变成 root 所有，
+    # 而 /Users/Shared 带 sticky 位，普通用户之后再也改不动它（App 保存会失败）。
+    # 但用户级优先级更高，所以若用户级里已有同一项，必须一并更新，
+    # 否则用户级里的旧值会盖掉 root 的改动（例如安全阀置 0 被用户级的 1 抵掉）。
+    if [ "$(id -u)" -eq 0 ]; then
         conf_set "$1" "$2" "$CONF"
+        if [ -f "$USER_CONF" ] && grep -q "^$1=" "$USER_CONF" 2>/dev/null; then
+            conf_set "$1" "$2" "$USER_CONF"
+        fi
+    elif [ -w "$USER_CONF" ] || [ -w "$(dirname "$USER_CONF")" ]; then
+        conf_set "$1" "$2" "$USER_CONF"
     else
         return 1
     fi
@@ -660,7 +802,7 @@ cmd_log() {
 }
 
 cmd_config() {
-    echo "当前生效配置（默认值 < $CONF < $USER_CONF，后者优先）"
+    echo "当前生效配置（默认值 < $CONF < ${USER_CONF}，后者优先）"
     local k v
     for k in $VALID_KEYS; do
         eval "v=\$$k"
@@ -711,7 +853,7 @@ cmd_doctor() {
             fi
         fi
         if [ "$cur" != "$ACTIVE_ETH_DEV" ] && [ "$cur" != "$ACTIVE_WIFI_DEV" ]; then
-            echo "    ${C_WARN}注意：默认路由由 $cur（VPN/拨号等其他接口）持有，smartroute 不会干预${C_RST}"
+            echo "    ${C_WARN}注意：默认路由由 ${cur}（VPN/拨号等其他接口）持有，smartroute 不会干预${C_RST}"
         fi
     fi
 
@@ -760,10 +902,10 @@ cmd_doctor() {
         echo "    只有一个接口活跃，无网段冲突"
     fi
     if [ -n "$ACTIVE_ETH_SVC" ] && ! svc_enabled "$ACTIVE_ETH_SVC"; then
-        echo "    ${C_WARN}⚠️  以太网服务“$ACTIVE_ETH_SVC”被禁用，插网线也不会生效${C_RST}"
-        advice+=("以太网服务被禁用：系统设置→网络 里启用“$ACTIVE_ETH_SVC”（确认要用有线时）")
+        echo "    ${C_WARN}⚠️  以太网服务“${ACTIVE_ETH_SVC}”被禁用，插网线也不会生效${C_RST}"
+        advice+=("以太网服务被禁用：系统设置→网络 里启用“${ACTIVE_ETH_SVC}”（确认要用有线时）")
     fi
-    echo "    选路模式: $MODE（auto=谁有外网走谁 / ethernet=强制有线 / wifi=强制无线）"
+    echo "    选路模式: ${MODE}（auto=谁有外网走谁 / ethernet=强制有线 / wifi=强制无线）"
 
     echo
     echo "[7] smartroute 运行状态"
@@ -908,11 +1050,11 @@ cmd_rule() {
             [ -n "$cidr" ] && [ -n "$dev" ] || die "用法: smartroute rule add <CIDR> <接口>
 例: smartroute rule add 10.0.0.0/8 en0   （公司内网段走有线）"
             printf '%s' "$cidr" | grep -qE '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$' \
-                || die "CIDR 格式不正确: $cidr（例 10.0.0.0/8）"
+                || die "CIDR 格式不正确: ${cidr}（例 10.0.0.0/8）"
             local pfx="${cidr#*/}"
             [ "$pfx" -ge 1 ] && [ "$pfx" -le 32 ] || die "前缀长度必须在 1..32"
             hardware_ports | awk -F'\t' -v d="$dev" '$2==d{f=1} END{exit f?0:1}' \
-                || die "没有这个接口: $dev（用 smartroute status 查看可用接口）"
+                || die "没有这个接口: ${dev}（用 smartroute status 查看可用接口）"
             mkdir -p "$(dirname "$RULES_FILE")" 2>/dev/null
             if [ ! -f "$RULES_FILE" ]; then
                 printf '# smartroute 分流规则：每行 "CIDR 接口"，守护进程（root）自动应用\n' > "$RULES_FILE" 2>/dev/null \
@@ -926,13 +1068,13 @@ cmd_rule() {
         del|rm)
             local cidr="$2"
             [ -n "$cidr" ] || die "用法: smartroute rule del <CIDR>"
-            [ -f "$RULES_FILE" ] || die "规则文件不存在（$RULES_FILE）"
+            [ -f "$RULES_FILE" ] || die "规则文件不存在（${RULES_FILE}）"
             grep -v "^$cidr[[:space:]]" "$RULES_FILE" > "$RULES_FILE.tmp" 2>/dev/null && mv "$RULES_FILE.tmp" "$RULES_FILE"
             echo "已删除规则: $cidr"
             echo "守护进程将在 ≤20 秒内移除对应路由；可 sudo smartroute watch 立即生效"
             ;;
         list|"")
-            echo "分流规则（$RULES_FILE）："
+            echo "分流规则（${RULES_FILE}）："
             local applied entry cidr dev mark any=0
             applied="$(state_get applied_routes)"
             if [ -f "$RULES_FILE" ]; then
@@ -952,7 +1094,7 @@ cmd_rule() {
             echo
             echo "提示: 例 smartroute rule add 10.0.0.0/8 en0 让公司内网段固定走有线"
             ;;
-        *) die "未知子命令: $sub（可用 add/del/list）" ;;
+        *) die "未知子命令: ${sub}（可用 add/del/list）" ;;
     esac
 }
 
@@ -1051,34 +1193,55 @@ other_nets() {
         }' | sort -u
 }
 
-write_pf_rules() {   # $1=设备A $2=网关A $3=设备B $4=网关B $5=额外排除网段（空格分隔，可空）
-    local d1="$1" gw1="$2" d2="$3" gw2="$4" excl="$5"
-    local lan1 lan2 same=0
+write_pf_rules() {   # $1=设备A $2=网关A $3=设备B $4=网关B $5=额外排除网段 $6=只走的设备(fastest)
+    local d1="$1" gw1="$2" d2="$3" gw2="$4" excl="${5:-}" only="${6:-}"
+    local lan1 lan2 same=0 list
     lan1="$(dev_subnet "$d1")"; lan2="$(dev_subnet "$d2")"
     if [ -n "$lan1" ] && [ "$lan1" = "$lan2" ]; then same=1; fi
+    # fastest 模式：只把更快的那一个网关放进 route-to，其余流量不受影响
+    if [ "$only" = "$d1" ]; then d2="$d1"; gw2="$gw1"; fi
+    if [ "$only" = "$d2" ]; then d1="$d2"; gw1="$gw2"; fi
     mkdir -p "$(dirname "$PF_ANCHOR_FILE")" 2>/dev/null || return 1
+    # 排除清单：局域网网段 + VPN/拨号网段 + 链路本地/组播/环回
+    # 用 table 而非列表字面量：macOS 的 pf 不允许对 { a b c } 这样的列表取反
+    list="$lan1"
+    [ "$same" = "1" ] || list="$list $lan2"
+    [ -n "$excl" ] && list="$list $excl"
+    list="$list 169.254.0.0/16 224.0.0.0/4 127.0.0.0/8"
+    list="$(printf '%s' "$list" | tr -s ' ' | sed 's/^ //;s/ $//')"
     {
         echo "# smartroute 双网并发分流规则 —— 由 'smartroute balance on' 自动生成"
         echo "# 撤销: sudo smartroute balance off"
+        if [ -n "$only" ]; then
+            echo "# 策略: fastest —— 只走延迟更低的 $only"
+        else
+            echo "# 策略: round-robin —— 新连接在两个接口间轮询"
+        fi
         echo "ext1 = \"$d1\""
         echo "gw1  = \"$gw1\""
         echo "ext2 = \"$d2\""
         echo "gw2  = \"$gw2\""
+        echo "table <lan_all> { $list }"
         if [ "$same" = "1" ]; then
-            echo "# 两个接口在同一网段（$lan1），源地址天然合法，不需要 NAT"
-            echo "lan_all = \"{ $lan1 $excl 169.254.0.0/16 224.0.0.0/4 127.0.0.0/8 ff02::/16 }\""
-            echo "pass out inet proto { tcp udp } from any to ! \$lan_all route-to { (\$ext1 \$gw1) (\$ext2 \$gw2) } round-robin"
+            echo "# 两个接口在同一网段（${lan1}），源地址天然合法，不需要 NAT"
         else
             echo "# 两个接口在不同网段，按出口接口修正源地址，否则对端网关会丢弃"
-            echo "lan_all = \"{ $lan1 $lan2 $excl 169.254.0.0/16 224.0.0.0/4 127.0.0.0/8 ff02::/16 }\""
-            echo "match out on \$ext1 inet from ! \$lan_all to ! \$lan_all nat-to (\$ext1)"
-            echo "match out on \$ext2 inet from ! \$lan_all to ! \$lan_all nat-to (\$ext2)"
-            echo "pass out inet proto { tcp udp } from any to ! \$lan_all route-to { (\$ext1 \$gw1) (\$ext2 \$gw2) } round-robin"
+            echo "# （macOS 的 pf 不支持 match...nat-to，用经典 nat 规则；nat-anchor \"com.apple/*\" 覆盖本锚点）"
+            echo "nat on \$ext1 from ! <lan_all> to any -> (\$ext1)"
+            [ "$d1" = "$d2" ] || echo "nat on \$ext2 from ! <lan_all> to any -> (\$ext2)"
+        fi
+        # 分流规则：fastest 模式收敛成单网关（round-robin 对单网关无意义）
+        if [ "$d1" = "$d2" ]; then
+            echo "pass out route-to { (\$ext1 \$gw1) } inet proto { tcp udp } from any to ! <lan_all>"
+        else
+            echo "pass out route-to { (\$ext1 \$gw1) (\$ext2 \$gw2) } round-robin inet proto { tcp udp } from any to ! <lan_all>"
         fi
         if [ -n "$excl" ]; then
             echo "# 已排除 VPN/拨号网段: $excl"
         fi
     } > "$PF_ANCHOR_FILE" || return 1
+    # 自校验语法：pfctl 加载失败只报 "syntax error" 不给原因，先在这里挡一道
+    pfctl -n -f "$PF_ANCHOR_FILE" >/dev/null 2>&1 || return 1
     return 0
 }
 
@@ -1098,72 +1261,98 @@ balance_off() {   # $1=quiet 时不输出（安全阀内部调用）
     return 0
 }
 
-balance_validate() {   # $1=设备A $2=IP-A $3=设备B $4=IP-B -> 0 验证通过
-    local d1="$1" i1="$2" d2="$3" i2="$4" i ip ok=0 need=10
-    local b1a b2a b1b b2b c1 c2
-    # 记录测试前的计数器
-    b1a="$(netstat -I "$d1" -b 2>/dev/null | sed -n '2p' | awk '{print $7}')"
-    b2a="$(netstat -I "$d2" -b 2>/dev/null | sed -n '2p' | awk '{print $7}')"
-    # 10 个不同目标，要求全部连通
+balance_validate() {   # $1=设备A $2=IP-A $3=设备B $4=IP-B $5=只走的设备(fastest，空=轮询) -> 0 验证通过
+    local d1="$1" i1="$2" d2="$3" i2="$4" only="${5:-}" i t ok=0
+    local o1a o2a o1b o2b g1 g2
+    # 记录测试前的出站字节数（netstat -I <dev> -b 的第 10 列是 Obytes）
+    o1a="$(netstat -I "$d1" -b 2>/dev/null | sed -n '2p' | awk '{print $10}')"
+    o2a="$(netstat -I "$d2" -b 2>/dev/null | sed -n '2p' | awk '{print $10}')"
+    # 10 次连通性验证。必须用 TCP 目标：pf 分流规则只作用于 proto { tcp udp }，
+    # 用 ping（ICMP）验证的话流量根本不经过规则，分布检查必然误判。
+    # 也不能用随机公网 IP——绝大多数不提供 HTTP(S) 服务，必然 0 成功。
     for i in 1 2 3 4 5 6 7 8 9 10; do
-        ip="$((i*11%250+1)).$((i*29%250+1)).$((i*37%250+1)).$((i*53%250+1))"
-        curl -s -m 6 -o /dev/null "https://$ip/" 2>/dev/null && ok=$((ok+1))
+        case $((i % 5)) in
+            0) t=223.5.5.5 ;;
+            1) t=119.29.29.29 ;;
+            2) t=114.114.114.114 ;;
+            3) t=1.1.1.1 ;;
+            *) t=8.8.8.8 ;;
+        esac
+        if nc -z -w "$NC_TIMEOUT" "$t" 53 >/dev/null 2>&1; then ok=$((ok+1)); continue; fi
+        if nc -z -w "$NC_TIMEOUT" "$t" 443 >/dev/null 2>&1; then ok=$((ok+1)); continue; fi
+        if curl -s -m 4 -o /dev/null "http://$t/" 2>/dev/null; then ok=$((ok+1)); fi
     done
-    if [ "$ok" -lt "$need" ]; then
-        log "并发分流验证失败: 连通性 $ok/$need"
-        echo "验证失败：10 个测试连接只有 $ok 个成功，已自动还原" >&2
+    # 连通性：至少 8/10。pf 规则真有问题时会全灭（0/10），
+    # 8 分的门槛足以区分"规则坏了"和"网络偶发丢包"。
+    if [ "$ok" -lt 8 ]; then
+        log "并发分流验证失败: 连通性 $ok/10"
+        echo "验证失败：10 次 TCP 测试连接只有 $ok 次成功，已自动还原" >&2
         return 1
     fi
-    # 分布检查：先看 NAT 计数器（按接口 IP 匹配），没有 NAT 规则时退化为字节增量
-    c1="$(pfctl -s nat 2>/dev/null | awk -v a="$i1" '
-        /nat-to|rdr-to/ { f = (index($0, a) > 0) }
-        /Packets:/ { if (f) { if (match($0, /Packets: [0-9]+/)) s += substr($0, RSTART+9, RLENGTH-9) + 0; f = 0 } }
-        END { print s + 0 }')"
-    c2="$(pfctl -s nat 2>/dev/null | awk -v a="$i2" '
-        /nat-to|rdr-to/ { f = (index($0, a) > 0) }
-        /Packets:/ { if (f) { if (match($0, /Packets: [0-9]+/)) s += substr($0, RSTART+9, RLENGTH-9) + 0; f = 0 } }
-        END { print s + 0 }')"
-    if [ "$c1" = "0" ] && [ "$c2" = "0" ]; then
-        # 没有 NAT 规则（同网段场景），退化为字节增量检查
-        b1b="$(netstat -I "$d1" -b 2>/dev/null | sed -n '2p' | awk '{print $7}')"
-        b2b="$(netstat -I "$d2" -b 2>/dev/null | sed -n '2p' | awk '{print $7}')"
-        if [ -n "$b1b" ] && [ -n "$b2b" ] && [ -n "$b1a" ] && [ -n "$b2a" ]; then
-            if [ $((b2b - b2a)) -le 0 ]; then
-                log "并发分流验证失败: $d2 字节数无增长，分流可能未生效"
-                echo "验证失败：$d2 没有产生流量，已自动还原" >&2
-                return 1
-            fi
+    # 分布检查：round-robin 应把新连接分摊到两个接口，两边的出站字节都应增长；
+    # fastest 模式只走一个接口，检查那个接口有流量即可（另一个不动才对）。
+    o1b="$(netstat -I "$d1" -b 2>/dev/null | sed -n '2p' | awk '{print $10}')"
+    o2b="$(netstat -I "$d2" -b 2>/dev/null | sed -n '2p' | awk '{print $10}')"
+    if [ -n "$o1a" ] && [ -n "$o1b" ] && [ -n "$o2a" ] && [ -n "$o2b" ]; then
+        g1=$((o1b - o1a)); g2=$((o2b - o2a))
+        local bad_if="" bad_g=0
+        if [ "$only" = "$d1" ]; then
+            [ "$g1" -le 0 ] && { bad_if="$d1"; bad_g="$g1"; }
+        elif [ "$only" = "$d2" ]; then
+            [ "$g2" -le 0 ] && { bad_if="$d2"; bad_g="$g2"; }
+        else
+            if   [ "$g1" -le 0 ] && [ "$g2" -le 0 ]; then bad_if="$d1/$d2"; bad_g="0/0"
+            elif [ "$g1" -le 0 ]; then bad_if="$d1"; bad_g="$g1"
+            elif [ "$g2" -le 0 ]; then bad_if="$d2"; bad_g="$g2"; fi
         fi
-    elif [ "$c1" = "0" ] || [ "$c2" = "0" ]; then
-        log "并发分流验证失败: NAT 分布不均 ($d1=$c1 $d2=$c2)"
-        echo "验证失败：流量没有分布到两个接口（$d1=$c1, $d2=$c2），已自动还原" >&2
-        return 1
+        if [ -n "$bad_if" ]; then
+            log "并发分流验证失败: 流量未走预期接口 ($bad_if +$bad_g 字节, $d1 +$g1 / $d2 +$g2)"
+            echo "验证失败：流量没有走预期接口（$d1 +$g1 字节，$d2 +$g2 字节），已自动还原" >&2
+            echo "提示：本机 macOS 的 pf 可能未对出站流量生效 route-to。" >&2
+            return 1
+        fi
+        log "并发分流验证通过: 连通性 $ok/10, 出站字节 $d1 +$g1 / $d2 +$g2${only:+ (只走 $only)}"
+    else
+        log "并发分流验证通过: 连通性 $ok/10（未能读取接口字节计数器，跳过分布检查）"
     fi
-    log "并发分流验证通过: 连通性 $ok/$need, NAT 分布 $d1=$c1 $d2=$c2"
     return 0
 }
 
 balance_on() {
     [ "$(id -u)" -eq 0 ] || die "双网并发需要 root: sudo smartroute balance on"
     command -v pfctl >/dev/null 2>&1 || die "系统缺少 pfctl"
+    # 与守护进程的 watch 抢同一把锁，避免两边同时加/删探测路由互相打架
+    acquire_lock_strict
     vpn_holds_default && die "检测到 VPN/拨号接口持有默认路由，暂不支持并发分流（会穿透 VPN）"
     if vpn_full_tunnel; then
         die "检测到全流量 VPN（默认路由或 0/1+128/1 由 VPN 持有），无法安全分流，请先断开 VPN"
     fi
 
+    # 模式: balance on [round-robin|fastest]
+    local mode="${1:-$BALANCE_MODE}"
+    case "$mode" in
+        round-robin|rr|轮询) mode="round-robin" ;;
+        fastest|fast|最快)   mode="fastest" ;;
+        *) die "用法: smartroute balance on [round-robin|fastest]" ;;
+    esac
+
     find_active
     [ -n "$ACTIVE_ETH_DEV" ]  || die "没有检测到活跃的以太网接口"
     [ -n "$ACTIVE_WIFI_DEV" ] || die "没有检测到活跃的 Wi-Fi 接口"
-    local eth_gw wifi_gw eth_res wifi_res
+    local eth_gw wifi_gw eth_res wifi_res eth_detail wifi_detail
     eth_gw="$(svc_router "$ACTIVE_ETH_SVC")"; wifi_gw="$(svc_router "$ACTIVE_WIFI_SVC")"
     [ -n "$eth_gw" ]  || die "取不到以太网网关（服务: ${ACTIVE_ETH_SVC:-?}）"
     [ -n "$wifi_gw" ] || die "取不到 Wi-Fi 网关（服务: ${ACTIVE_WIFI_SVC:-?}）"
 
     echo "正在检测两个接口的外网连通性…"
-    eth_res="$(probe_dev "$ACTIVE_ETH_DEV" "$eth_gw")"
-    wifi_res="$(probe_dev "$ACTIVE_WIFI_DEV" "$wifi_gw")"
+    _p="$(probe_dev "$ACTIVE_ETH_DEV" "$eth_gw")"
+    eth_res="$(printf '%s\n' "$_p" | sed -n 1p)"
+    eth_detail="$(printf '%s\n' "$_p" | sed -n 2p)"
+    _p="$(probe_dev "$ACTIVE_WIFI_DEV" "$wifi_gw")"
+    wifi_res="$(printf '%s\n' "$_p" | sed -n 1p)"
+    wifi_detail="$(printf '%s\n' "$_p" | sed -n 2p)"
     if [ "$eth_res" != "ok" ] || [ "$wifi_res" != "ok" ]; then
-        die "双网并发要求两个接口都有外网（当前 以太网=$eth_res Wi-Fi=$wifi_res）"
+        die "双网并发要求两个接口都有外网（当前 以太网=$eth_res${eth_detail:+：$eth_detail} Wi-Fi=$wifi_res${wifi_detail:+：$wifi_detail}）"
     fi
 
     # 必须能确定两个接口的网段，否则生成的排除规则不完整（会误伤局域网），宁可不开
@@ -1180,8 +1369,35 @@ balance_on() {
         echo "检测到 VPN/拨号网段，将排除: $excl"
     fi
 
-    echo "生成分流规则: $ACTIVE_ETH_DEV($lan1, gw $eth_gw) <-> $ACTIVE_WIFI_DEV($lan2, gw $wifi_gw)"
-    write_pf_rules "$ACTIVE_ETH_DEV" "$eth_gw" "$ACTIVE_WIFI_DEV" "$wifi_gw" "$excl" \
+    # 两个接口走同一个网关 = 同一条上网路径，分流不会带来带宽提升（但也不会冲突）
+    if [ "$eth_gw" = "$wifi_gw" ]; then
+        echo "⚠️  注意：两个接口的网关相同（${eth_gw}），属于同一条上网路径，"
+        echo "    并发分流不会提升带宽；只有两个接口通往不同网关/不同外网时才有叠加效果。"
+    fi
+
+    # fastest 模式：测量两边延迟，只让更快的那个出口承载新连接
+    local only="" eth_lat="" wifi_lat="" winner=""
+    if [ "$mode" = "fastest" ]; then
+        echo "正在测量两个接口的延迟…"
+        eth_lat="$(measure_latency "$ACTIVE_ETH_DEV" "$eth_gw" | tail -n 1)"
+        wifi_lat="$(measure_latency "$ACTIVE_WIFI_DEV" "$wifi_gw" | tail -n 1)"
+        printf "    %s: %s ms    %s: %s ms\n" "$ACTIVE_ETH_DEV" "${eth_lat:-测不到}" \
+                                            "$ACTIVE_WIFI_DEV" "${wifi_lat:-测不到}"
+        winner="$(pick_fastest "$ACTIVE_ETH_DEV" "$eth_lat" "$ACTIVE_WIFI_DEV" "$wifi_lat" | tail -n 1)"
+        if [ -z "$winner" ]; then
+            echo "⚠️  两个接口都测不到延迟，回退为 round-robin 轮询"
+            mode="round-robin"
+        elif [ "$winner" = "tie" ]; then
+            echo "    两个接口延迟差距不足 ${FASTEST_SWITCH_RATIO}%，按轮询分摊（避免无谓切换）"
+            mode="round-robin"
+        else
+            only="$winner"
+            echo "    → 新连接将全部走 ${winner}（更快）"
+        fi
+    fi
+
+    echo "生成分流规则: $ACTIVE_ETH_DEV($lan1, gw $eth_gw) <-> $ACTIVE_WIFI_DEV($lan2, gw $wifi_gw) [$mode]"
+    write_pf_rules "$ACTIVE_ETH_DEV" "$eth_gw" "$ACTIVE_WIFI_DEV" "$wifi_gw" "$excl" "$only" \
         || die "无法写入 $PF_ANCHOR_FILE"
 
     # 记录系统 pf 原状态，便于撤销时还原
@@ -1194,32 +1410,73 @@ balance_on() {
     fi
     pfctl -a "$PF_ANCHOR" -f "$PF_ANCHOR_FILE" 2>/dev/null \
         || { balance_off quiet; die "加载 pf 规则失败，已还原"; }
+    # 关键校验：规则"加载成功"不等于"生效"。锚点若没被主规则集引用，
+    # pfctl 照样返回 0，但流量永远不会匹配。这里必须回读确认规则真的在规则集里。
+    if ! pfctl -a "$PF_ANCHOR" -s rules 2>/dev/null | grep -q "route-to"; then
+        balance_off quiet
+        die "pf 锚点 $PF_ANCHOR 未生效（未被主规则集引用），已还原；请检查 /etc/pf.conf 是否包含 anchor \"com.apple/*\""
+    fi
 
     echo "正在验证分流效果（10 个测试连接）…"
     if ! balance_validate "$ACTIVE_ETH_DEV" "$(dev_ipv4 "$ACTIVE_ETH_DEV")" \
-                         "$ACTIVE_WIFI_DEV" "$(dev_ipv4 "$ACTIVE_WIFI_DEV")"; then
+                         "$ACTIVE_WIFI_DEV" "$(dev_ipv4 "$ACTIVE_WIFI_DEV")" "$only"; then
         balance_off quiet
         die "并发分流未通过验证，已自动还原（详见 sudo smartroute log）"
     fi
 
     conf_set_auto BALANCE 1
-    log "双网并发分流已开启: $ACTIVE_ETH_DEV <-> $ACTIVE_WIFI_DEV"
+    conf_set_auto BALANCE_MODE "$mode"
+    state_set balance_mode "$mode"
+    state_set balance_winner "$only"
+    log "双网并发分流已开启: $ACTIVE_ETH_DEV <-> $ACTIVE_WIFI_DEV 模式=$mode${only:+ 最快=$only}"
     echo
-    echo "✅ 双网并发已开启：新连接会在两个接口间轮询分流"
-    echo "   • 多连接/多应用（浏览、下载、云同步）会分摊到两个接口"
-    echo "   • 单线程下载不会翻倍（单个连接固定走一个接口）"
+    if [ "$mode" = "fastest" ]; then
+        echo "✅ 双网并发已开启（最快线路模式）：新连接全部走 $only"
+        echo "   • 守护进程每隔约 $((FASTEST_RECHECK * 20 / 60)) 分钟重测延迟，线路变慢会自动改走另一条"
+    else
+        echo "✅ 双网并发已开启：新连接会在两个接口间轮询分流"
+        echo "   • 多连接/多应用（浏览、下载、云同步）会分摊到两个接口"
+        echo "   • 单线程下载不会翻倍（单个连接固定走一个接口）"
+    fi
     echo "   • 任一口失去外网会自动关闭并发并还原（见守护进程安全阀）"
     echo "   • 撤销: sudo smartroute balance off"
     return 0
 }
 
 cmd_balance() {
-    case "${1:-status}" in
-        on|enable|start)  balance_on ;;
+    local arg="${1:-status}"
+    case "$arg" in
+        on|enable|start)  shift; balance_on "$@" ;;
         off|disable|stop) balance_off ;;
         status|st)        balance_status ;;
-        *) die "用法: smartroute balance on|off|status" ;;
+        *) die "用法: smartroute balance on [round-robin|fastest] | off | status" ;;
     esac
+}
+
+# 【最快线路模式】定期重测两边延迟，某条线路变慢就把新连接改走另一条
+# （macOS 的 pf 没有加权 pool，只能靠"只放一个网关进 route-to"来实现选快）
+balance_reevaluate() {
+    local eth_gw wifi_gw el wl winner cur want excl
+    eth_gw="$(svc_router "$ACTIVE_ETH_SVC")"; wifi_gw="$(svc_router "$ACTIVE_WIFI_SVC")"
+    [ -n "$eth_gw" ] && [ -n "$wifi_gw" ] || return 0
+    el="$(measure_latency "$ACTIVE_ETH_DEV" "$eth_gw" | tail -n 1)"
+    wl="$(measure_latency "$ACTIVE_WIFI_DEV" "$wifi_gw" | tail -n 1)"
+    winner="$(pick_fastest "$ACTIVE_ETH_DEV" "$el" "$ACTIVE_WIFI_DEV" "$wl" | tail -n 1)"
+    cur="$(state_get balance_winner)"
+    want=""
+    case "$winner" in
+        "$ACTIVE_ETH_DEV"|"$ACTIVE_WIFI_DEV") want="$winner" ;;
+        *) want="" ;;          # tie 或两边都测不到 → 回退成两条轮询
+    esac
+    [ "$want" = "$cur" ] && return 0
+    log "最快线路重测: $ACTIVE_ETH_DEV=${el:-测不到}ms / $ACTIVE_WIFI_DEV=${wl:-测不到}ms → ${want:-两条轮询}（原 ${cur:-两条轮询}）"
+    excl="$(other_nets | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+    write_pf_rules "$ACTIVE_ETH_DEV" "$eth_gw" "$ACTIVE_WIFI_DEV" "$wifi_gw" "$excl" "$want" || return 1
+    pfctl -e 2>/dev/null
+    pfctl -a "$PF_ANCHOR" -f "$PF_ANCHOR_FILE" 2>/dev/null || return 1
+    state_set balance_winner "$want"
+    notify "smartroute" "已切换到更快的线路: ${want:-两条轮询}"
+    return 0
 }
 
 balance_status() {
@@ -1230,8 +1487,12 @@ balance_status() {
         1) echo "  系统 pf        : 关闭" ;;
         *) echo "  系统 pf        : 未知（无权限读取，请用 sudo smartroute balance status）" ;;
     esac
-    if pf_anchor_loaded; then
-        echo "  分流规则       : 已加载（$PF_ANCHOR_FILE）"
+    # 非 root 读不了 /dev/pf（Permission denied），此时无法判断是否已加载，
+    # 不能显示成"未加载"——那会让人以为规则丢了
+    if pfctl -a "$PF_ANCHOR" -s rules 2>&1 | grep -q "Permission denied"; then
+        echo "  分流规则       : 无法读取（需 sudo smartroute balance status）"
+    elif pf_anchor_loaded; then
+        echo "  分流规则       : 已加载（${PF_ANCHOR_FILE}）"
     elif [ -f "$PF_ANCHOR_FILE" ]; then
         echo "  分流规则       : 文件存在但未加载"
     else
@@ -1243,20 +1504,43 @@ balance_status() {
         echo "  pf 来源        : 系统原有（撤销时不动系统 pf）"
     fi
     echo "  配置开关       : BALANCE=$BALANCE"
+    local bmode bwinner
+    bmode="$(state_get balance_mode)"; bwinner="$(state_get balance_winner)"
+    [ -n "$bmode" ] || bmode="$BALANCE_MODE"
+    if [ "$bmode" = "fastest" ]; then
+        echo "  分流策略       : 最快线路（只走 ${bwinner:-未定}）"
+    else
+        echo "  分流策略       : 轮询（两个接口交替）"
+    fi
+    # 实时测一次两边延迟，方便判断"哪条更快"
+    if [ -n "$ACTIVE_ETH_DEV" ] || true; then :; fi
+    find_active >/dev/null 2>&1
+    if [ -n "$ACTIVE_ETH_DEV" ] && [ -n "$ACTIVE_WIFI_DEV" ]; then
+        local eg wg el wl
+        eg="$(svc_router "$ACTIVE_ETH_SVC")"; wg="$(svc_router "$ACTIVE_WIFI_SVC")"
+        echo "  实时延迟       : 测量中…"
+        el="$(measure_latency "$ACTIVE_ETH_DEV" "$eg" | tail -n 1)"
+        wl="$(measure_latency "$ACTIVE_WIFI_DEV" "$wg" | tail -n 1)"
+        printf "    %-8s %s ms   %-8s %s ms\n" "$ACTIVE_ETH_DEV" "${el:-测不到}" \
+                                            "$ACTIVE_WIFI_DEV" "${wl:-测不到}"
+    fi
     if [ -f "$PF_ANCHOR_FILE" ]; then
         echo "  规则内容       :"
         sed 's/^/    /' "$PF_ANCHOR_FILE" | grep -v '^    #' | sed '/^    $/d'
     fi
     echo
-    echo "  原理: 新连接按轮询在两个网关间分流（不同连接走不同接口）"
+    if [ "$bmode" = "fastest" ]; then
+        echo "  原理: 新连接固定走延迟更低的接口；守护进程定期重测，变慢会自动改走另一条"
+    else
+        echo "  原理: 新连接按轮询在两个网关间分流（不同连接走不同接口）"
+    fi
     echo "  限制: 单线程传输不会加速；IPv6 流量不受影响；VPN 默认路由下不可用"
     return 0
 }
 
-# ---------------- 入口 ----------------
 [ "$(uname -s)" = "Darwin" ] || die "本工具仅支持 macOS"
 
-trap 'cleanup_probe_routes >/dev/null 2>&1; rm -rf "$LOCK_DIR" 2>/dev/null; rm -f "$PROBE_DETAIL_FILE" 2>/dev/null' EXIT INT TERM
+trap 'cleanup_probe_routes >/dev/null 2>&1; rm -rf "$LOCK_DIR" 2>/dev/null' EXIT INT TERM HUP
 
 acquire_lock() {
     if ! mkdir "$LOCK_DIR" 2>/dev/null; then
@@ -1271,6 +1555,41 @@ acquire_lock() {
     echo $$ > "$LOCK_DIR/pid"
 }
 
+# 严格版抢锁：被其他实例占用时不静默退出，而是报错（供 balance 这类交互命令用）
+acquire_lock_strict() {
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+        local pid
+        pid="$(cat "$LOCK_DIR/pid" 2>/dev/null)"
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            die "另一个 smartroute 正在运行（pid ${pid}），请等它结束再试"
+        fi
+        rm -rf "$LOCK_DIR" 2>/dev/null
+        mkdir "$LOCK_DIR" 2>/dev/null || die "无法创建锁目录 $LOCK_DIR"
+    fi
+    echo $$ > "$LOCK_DIR/pid"
+}
+
+# 修复用户级配置属主：早期版本守护进程以 root 写过 /Users/Shared/smartroute.conf，
+# 该目录带 sticky 位，普通用户之后无法替换它，App 的"保存"就会失败。
+cmd_fixconf() {
+    local f="$USER_CONF" cu
+    if [ ! -e "$f" ]; then echo "用户级配置不存在（${f}），无需修复"; return 0; fi
+    cu="$(stat -f '%u' "$f" 2>/dev/null)"
+    echo "文件: $f  属主 uid=$cu  权限: $(stat -f '%Sp' "$f" 2>/dev/null)"
+    if [ "$(id -u)" -ne 0 ]; then
+        [ "$cu" = "$(id -u)" ] && { echo "属主就是当前用户，无需修复"; return 0; }
+        die "需要 root 修复属主: sudo smartroute fixconf"
+    fi
+    local owner; owner="$(stat -f '%u' /dev/console 2>/dev/null)"
+    [ -n "$owner" ] && [ "$owner" != "0" ] || owner="$(id -un)"
+    chown "$owner" "$f" && chmod 644 "$f" \
+        && echo "✅ 已把 $f 归还给 ${owner}，App 保存恢复正常" \
+        || die "修复失败"
+    return 0
+}
+
+# ---------------- 入口 ----------------
+
 main() {
     local cmd="${1:-watch}"
     [ $# -gt 0 ] && shift
@@ -1283,6 +1602,7 @@ main() {
         set)            cmd_set "$@" ;;
         log)            cmd_log "$@" ;;
         balance|bal)    cmd_balance "$@" ;;
+        fixconf)        cmd_fixconf ;;
         rule)           cmd_rule "$@" ;;
         stats)          cmd_stats ;;
         quality|q)      cmd_quality ;;

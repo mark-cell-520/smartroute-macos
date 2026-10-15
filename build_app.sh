@@ -95,3 +95,10 @@ echo
 echo "构建完成: $PWD/$APP"
 echo "运行: open \"$PWD/$APP\""
 echo "建议移动到 /Applications 或 ~/Applications"
+
+# ⚠️ 本脚本是"快速本地构建"：只编译当前主机的架构（Apple Silicon 上就是 arm64）。
+# 要分发给别人（或装进 /Applications 长期用），必须用 build_release.sh，
+# 它才会同时编 arm64 + x86_64 并 lipo 成通用二进制。
+echo
+echo "⚠️  注意：本次构建只含本机架构（$(lipo -info "$APP/Contents/MacOS/SmartRoute" 2>/dev/null | sed 's/.*: //')）。"
+echo "    分发或安装到 /Applications 请改用: bash build_release.sh"

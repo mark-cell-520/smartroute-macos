@@ -1,6 +1,11 @@
 import Foundation
 
 /// 同步执行 shell 命令，带超时保护
+///
+/// 超时处理必须"先杀、再等到真正退出"：Process 析构时如果子进程还活着，
+/// Foundation 会在 -[NSConcreteTask dealloc] 里抛异常，直接让 App 崩掉
+/// （objc_exception_throw → SIGABRT）。历史上这里只 terminate 后睡 300ms，
+/// 遇到慢命令（如 balance status 里的延迟测量）就会崩。
 enum Shell {
     /// - Returns: (输出(stdout+stderr), 退出码)
     static func run(_ command: String, timeout: TimeInterval = 20) -> (out: String, code: Int32) {
@@ -19,19 +24,40 @@ enum Shell {
             return ("启动失败: \(error.localizedDescription)", -1)
         }
 
-        let deadline = Date().addingTimeInterval(timeout)
-        while task.isRunning && Date() < deadline {
-            usleep(100_000)
+        // 并发读管道：输出超过管道缓冲区（64KB）时子进程会写阻塞，
+        // 必须一边等一边读，否则双方互相等、死锁。
+        var outData = Data()
+        var errData = Data()
+        let readGroup = DispatchGroup()
+        readGroup.enter()
+        readGroup.enter()
+        DispatchQueue.global().async {
+            outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+            readGroup.leave()
         }
-        var timedOut = false
-        if task.isRunning {
-            timedOut = true
-            task.terminate()
-            usleep(300_000)
+        DispatchQueue.global().async {
+            errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+            readGroup.leave()
         }
 
-        let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
-        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+        // 等进程退出（带超时）。超时：terminate → 等 2 秒 → SIGKILL → 再等。
+        // 无论如何都要等到它真正退出，否则析构即崩溃。
+        let exited = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            task.waitUntilExit()
+            exited.signal()
+        }
+        var timedOut = false
+        if exited.wait(timeout: .now() + timeout) == .timedOut {
+            timedOut = true
+            task.terminate()
+            if exited.wait(timeout: .now() + 2) == .timedOut {
+                kill(task.processIdentifier, SIGKILL)
+                _ = exited.wait(timeout: .now() + 2)
+            }
+        }
+        _ = readGroup.wait(timeout: .now() + 2)
+
         var out = String(decoding: outData, as: UTF8.self)
         let err = String(decoding: errData, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
         if !err.isEmpty {

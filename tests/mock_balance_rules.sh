@@ -21,7 +21,7 @@ echo "pfctl $*" >> "$MOCK_LOG"
 # -s info 返回 pf 状态；-s rules 返回规则；-s nat 返回 NAT 计数
 case "$*" in
   *"-s info"*) echo "Status: ${MOCK_PF_STATUS:-Disabled}" ;;
-  *"-s rules"*) [ "${MOCK_ANCHOR_LOADED:-0}" = "1" ] && echo "pass out all" ;;
+  *"-s rules"*) [ "${MOCK_ANCHOR_LOADED:-0}" = "1" ] && echo "pass out route-to { (en0 192.168.1.1) (en1 192.168.1.1) } round-robin" ;;
   *"-s nat"*)
       if [ "${MOCK_NAT:-0}" = "1" ]; then
         echo "nat-to 192.168.2.36 -> 192.168.2.36"
@@ -37,25 +37,51 @@ cat > "$T/bin/netstat" <<'EOF'
 if [ "${1:-}" = "-rn" ]; then
   cat "$MOCK_ROUTES" 2>/dev/null
 elif [ "${1:-}" = "-I" ]; then
-  # 计数器文件每次 +1000，模拟流量增长
+  # 计数器每次 +1000 模拟流量增长；MOCK_FROZEN 指定的接口不增长
   f="$MOCK_BYTES_DIR/$2"
   b=$(cat "$f" 2>/dev/null || echo 0)
-  b=$((b + 1000)); echo "$b" > "$f"
+  if [ "${MOCK_FROZEN:-}" != "$2" ]; then b=$((b + 1000)); echo "$b" > "$f"; fi
   printf 'Name  Mtu  Network  Address  Ipkts Ierrs  Ibytes  Opkts Oerrs  Obytes  Coll\n'
-  printf '%-6s 1500  <Link>  aa:bb   100  0  %s  50  0  500  0\n' "$2" "$b"
+  printf '%-6s 1500  <Link>  aa:bb   100  0  %s  50  0  %s  0\n' "$2" "$((b*2))" "$b"
 fi
 exit 0
 EOF
 cat > "$T/bin/curl" <<'EOF'
 #!/bin/bash
 echo "curl $*" >> "$MOCK_LOG"
-[ "${MOCK_CURL_OK:-1}" = "1" ] && exit 0 || exit 7
+[ "${MOCK_NET_OK:-1}" = "1" ] && exit 0 || exit 7
+EOF
+cat > "$T/bin/nc" <<'EOF'
+#!/bin/bash
+echo "nc $*" >> "$MOCK_LOG"
+[ "${MOCK_NET_OK:-1}" = "1" ] && exit 0 || exit 1
+EOF
+cat > "$T/bin/ping" <<'EOF'
+#!/bin/bash
+echo "ping $*" >> "$MOCK_LOG"
+# 按目标 IP 最后一段决定返回的 RTT，用来模拟"某条线路更快"
+# MOCK_RTT_en0 / MOCK_RTT_en1 可覆盖默认值
+t="${!#}"
+case "$t" in
+  *.1) r="${MOCK_RTT_A:-14.0}" ;;
+  *)   r="${MOCK_RTT_B:-14.0}" ;;
+esac
+if [ "${MOCK_PING_OK:-1}" != "1" ]; then echo "ping: sendto: No route to host" >&2; exit 1; fi
+echo "PING $t: 56 data bytes"
+echo "64 bytes from $t: icmp_seq=0 ttl=53 time=$r ms"
+echo "64 bytes from $t: icmp_seq=1 ttl=53 time=$r ms"
+echo ""
+echo "--- $t ping statistics ---"
+echo "2 packets transmitted, 2 packets received, 0.0% packet loss"
+echo "round-trip min/avg/max/std-dev = $r/$r/$r/0.1 ms"
+exit 0
 EOF
 cat > "$T/bin/ifconfig" <<'EOF'
 #!/bin/bash
 d="$1"
 case "$d" in
   en1) echo "        inet 192.168.1.5 netmask 0xffffff00 broadcast 192.168.1.255" ;;
+  en6) echo "        inet 192.168.1.6 netmask 0xffffff00 broadcast 192.168.1.255" ;;
   en0) echo "        inet 192.168.2.36 netmask 0xffffff00 broadcast 192.168.2.255" ;;
   en5) echo "        inet 192.168.3.7 netmask 0xffffff00 broadcast 192.168.3.255" ;;
   *) exit 1 ;;
@@ -136,9 +162,12 @@ grep -q "route delete -net 10.0.0.0/8" "$MOCK_LOG" && ok "规则删除后移除�
 
 echo "== 3. write_pf_rules =="
 : > "$MOCK_LOG"
-run "write_pf_rules en1 192.168.1.1 en0 192.168.1.1 ''" >/dev/null
+run "write_pf_rules en1 192.168.1.1 en6 192.168.1.1 ''" >/dev/null
 grep -q "round-robin" "$T/etc/pf.anchor" && ok "生成轮询规则" || bad "生成轮询规则"
-grep -q "nat-to" "$T/etc/pf.anchor" && ok "同网段仍写 NAT（保守）" || echo "  ℹ️ 同网段未写 NAT"
+grep -q "nat on" "$T/etc/pf.anchor" && bad "同网段不应写 NAT" || ok "同网段不写 NAT（源地址天然合法）"
+grep -q "192.168.1.0/24" "$T/etc/pf.anchor" && ok "同网段只排除一个网段" || bad "同网段排除项"
+run "write_pf_rules en1 192.168.1.1 en0 192.168.1.1 ''" >/dev/null
+grep -q "nat on" "$T/etc/pf.anchor" && ok "不同网段写 NAT" || bad "不同网段写 NAT"
 run "write_pf_rules en1 192.168.1.1 en5 192.168.2.1 100.64.0.0/16" >/dev/null
 grep -q "100.64.0.0/16" "$T/etc/pf.anchor" && ok "VPN 网段被排除" || bad "VPN 网段被排除"
 grep -q "已排除 VPN/拨号网段" "$T/etc/pf.anchor" && ok "规则文件记录排除项" || bad "规则文件记录排除项"
@@ -147,32 +176,23 @@ grep -q 'route-to { ($ext1 $gw1) ($ext2 $gw2) }' "$T/etc/pf.anchor" && ok "route
 grep -q "192.168.3.0/24" "$T/etc/pf.anchor" && ok "两个网段都排除" || bad "两个网段都排除"
 
 echo "== 4. balance_validate =="
-export MOCK_NAT=1 MOCK_BYTES_en0=5000 MOCK_BYTES_en1=6000
+export MOCK_NET_OK=1 MOCK_FROZEN=""
 : > "$MOCK_LOG"
-run "balance_validate en0 192.168.2.36 en1 192.168.1.5" >/dev/null && ok "验证通过（NAT 双接口有流量）" || bad "验证通过（NAT）"
-export MOCK_NAT=1
-MOCK_NAT_PARTIAL=1
-cat > "$T/bin/pfctl" <<EOF
-#!/bin/bash
-echo "pfctl \$*" >> "\$MOCK_LOG"
-case "\$*" in
-  *"-s info"*) echo "Status: Disabled" ;;
-  *"-s rules"*) [ "\${MOCK_ANCHOR_LOADED:-0}" = "1" ] && echo "pass out all" ;;
-  *"-s nat"*)
-      echo "nat-to 192.168.2.36 -> 192.168.2.36"
-      echo "  [ Evaluations: 20  Packets: 12  Bytes: 1200 ]"
-      echo "nat-to 192.168.1.5 -> 192.168.1.5"
-      echo "  [ Evaluations: 20  Packets: 0  Bytes: 0 ]" ;;
-esac
-exit 0
-EOF
-chmod +x "$T/bin/pfctl"
+run "balance_validate en0 192.168.2.36 en1 192.168.1.5" >/dev/null && ok "两接口都有流量时验证通过" || bad "两接口都有流量时应通过"
+
+echo "== 4b. 单接口无流量 → 应失败 =="
+export MOCK_FROZEN="en1"
 : > "$MOCK_LOG"
-run "balance_validate en0 192.168.2.36 en1 192.168.1.5" >/dev/null 2>&1 && bad "单接口无流量应验证失败" || ok "单接口无流量应验证失败"
-export MOCK_CURL_OK=0
+out="$(run 'balance_validate en0 192.168.2.36 en1 192.168.1.5' 2>&1)"
+echo "$out" | grep -q "流量没有走预期接口" && ok "单接口无流量时明确报错" || bad "单接口无流量未报错: $out"
+export MOCK_FROZEN=""
+
+echo "== 4c. 网络不通 → 应失败 =="
+export MOCK_NET_OK=0
 : > "$MOCK_LOG"
-run "balance_validate en0 192.168.2.36 en1 192.168.1.5" >/dev/null 2>&1 && bad "连通失败应验证失败" || ok "连通失败应验证失败"
-export MOCK_CURL_OK=1 MOCK_NAT=1
+out="$(run 'balance_validate en0 192.168.2.36 en1 192.168.1.5' 2>&1)"
+echo "$out" | grep -q "TCP 测试连接只有" && ok "网络不通时明确报错（含成功数）" || bad "网络不通未报错: $out"
+export MOCK_NET_OK=1
 
 echo "== 5. balance_status 不炸 =="
 run "balance_status" | grep -q "系统 pf" && ok "balance_status 可读" || bad "balance_status"
@@ -182,10 +202,48 @@ export MOCK_PF_STATUS=Enabled
 printf 'pf_enabled_by_us=1\n' > "$T/state/pf.state"
 : > "$MOCK_LOG"
 run "balance_off quiet" >/dev/null
-grep -q "pfctl -a com.user.smartroute -F all" "$MOCK_LOG" && ok "撤销时清空 anchor" || bad "撤销时清空 anchor"
+grep -q "pfctl -a com.apple/smartroute -F all" "$MOCK_LOG" && ok "撤销时清空 anchor" || bad "撤销时清空 anchor"
 grep -q "pfctl -d" "$MOCK_LOG" && ok "我们开启的 pf 会被关闭" || bad "关闭我们开启的 pf"
 [ -f "$T/state/pf.state" ] && bad "pf 状态文件已清理" || ok "pf 状态文件已清理"
-grep -q "BALANCE=0" "$T/etc/user.conf" && ok "BALANCE 开关已置 0" || bad "BALANCE 开关置 0"
+grep -q "BALANCE=0" "$T/etc/user.conf" || grep -q "BALANCE=0" "$T/etc/smartroute.conf" \
+    && ok "BALANCE 开关已置 0" || bad "BALANCE 开关置 0"
+
+echo "== 7. 延迟测量与最快线路选速 =="
+export MOCK_PING_OK=1 MOCK_RTT_A=14.0 MOCK_RTT_B=14.0
+: > "$MOCK_LOG"
+r="$(run 'measure_latency en1 192.168.1.1' 2>/dev/null | tail -n 1)"
+case "$r" in
+  14.0|14) ok "measure_latency 返回平均 RTT ($r ms)" ;;
+  *) bad "measure_latency 返回值异常: [$r]" ;;
+esac
+
+export MOCK_RTT_A=10.0 MOCK_RTT_B=40.0
+w="$(run 'pick_fastest en0 10.0 en1 40.0' 2>/dev/null | tail -n 1)"
+[ "$w" = "en0" ] && ok "延迟差大时选出更快的 en0" || bad "选速失败: $w"
+w="$(run 'pick_fastest en0 14.0 en1 12.0' 2>/dev/null | tail -n 1)"
+[ "$w" = "tie" ] && ok "差距小于阈值时判为 tie（继续轮询）" || bad "tie 判定失败: $w"
+w="$(run 'pick_fastest en0 "" en1 12.0' 2>/dev/null | tail -n 1)"
+[ "$w" = "en1" ] && ok "一边测不到时选另一边" || bad "单边测量失败处理: $w"
+w="$(run 'pick_fastest en0 "" en1 ""' 2>/dev/null | tail -n 1)"
+[ -z "$w" ] && ok "两边都测不到时返回空（回退轮询）" || bad "双边失败处理: $w"
+
+echo "== 8. fastest 模式生成的 pf 规则 =="
+export MOCK_RTT_A=14.0 MOCK_RTT_B=14.0
+: > "$MOCK_LOG"
+run "write_pf_rules en1 192.168.1.1 en6 192.168.1.1 '' en1" >/dev/null
+grep -q 'route-to { (\$ext1 \$gw1) }' "$T/etc/pf.anchor" && ok "fastest 只放一个网关进 route-to" || bad "fastest 规则未收敛成单网关"
+grep -q "round-robin" "$T/etc/pf.anchor" && bad "fastest 不应出现 round-robin" || ok "fastest 不写 round-robin"
+grep -q "策略: fastest" "$T/etc/pf.anchor" && ok "规则文件标注 fastest 策略" || bad "未标注策略"
+
+echo "== 9. balance_validate 在 fastest 下只要求赢家有流量 =="
+export MOCK_NET_OK=1 MOCK_FROZEN="en6"
+: > "$MOCK_LOG"
+run "balance_validate en1 192.168.1.5 en6 192.168.1.6 en1" >/dev/null && ok "赢家接口有流量即通过" || bad "fastest 验证误判"
+export MOCK_FROZEN="en1"
+: > "$MOCK_LOG"
+out="$(run 'balance_validate en1 192.168.1.5 en6 192.168.1.6 en1' 2>&1)"
+echo "$out" | grep -q "流量没有走预期接口" && ok "赢家没流量时明确报错" || bad "赢家无流量未报错: $out"
+export MOCK_FROZEN=""
 
 echo
 echo "结果: $PASS 通过, $FAIL 失败"

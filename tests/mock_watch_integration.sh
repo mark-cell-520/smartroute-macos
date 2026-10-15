@@ -18,7 +18,7 @@ cat > "$T/bin/pfctl" <<'EOF'
 echo "pfctl $*" >> "$MOCK_LOG"
 case "$*" in
   *"-s info"*) echo "Status: ${MOCK_PF_STATUS:-Disabled}" ;;
-  *"-s rules"*) [ "${MOCK_ANCHOR_LOADED:-0}" = "1" ] && echo "pass out all" ;;
+  *"-s rules"*) [ "${MOCK_ANCHOR_LOADED:-0}" = "1" ] && echo "pass out route-to { (en0 192.168.1.1) (en1 192.168.1.1) } round-robin" ;;
 esac
 exit 0
 EOF
@@ -75,7 +75,7 @@ grep -q "route add -net\|route delete -net" "$MOCK_LOG" && bad "BALANCE=0 不应
 echo "== 2. BALANCE=1 + 两接口判定都 ok → 不动 pf =="
 : > "$MOCK_LOG"
 out="$(runwatch 1)"
-grep -q "pfctl -a com.user.smartroute -F all" "$MOCK_LOG" && bad "健康时不应关闭并发" || ok "健康时不关闭并发"
+grep -q "pfctl -a com.apple/smartroute -F all" "$MOCK_LOG" && bad "健康时不应关闭并发" || ok "健康时不关闭并发"
 grep -q "route add -net\|route delete -net" "$MOCK_LOG" && bad "无规则时不应动静态路由" || ok "无规则不动静态路由"
 
 echo "== 3. BALANCE=1 + 以太网判定失败 → 安全阀关闭并发 =="
@@ -83,9 +83,10 @@ echo "== 3. BALANCE=1 + 以太网判定失败 → 安全阀关闭并发 =="
 printf 'streak_eth=-5\nstreak_wifi=2\neth_ok=1\nwifi_ok=1\n' > "$T/state/state"
 : > "$MOCK_LOG"
 out="$(runwatch 1)"
-grep -q "pfctl -a com.user.smartroute -F all" "$MOCK_LOG" && ok "安全阀清空 pf anchor" || { bad "安全阀清空 anchor"; echo "$out"; }
+grep -q "pfctl -a com.apple/smartroute -F all" "$MOCK_LOG" && ok "安全阀清空 pf anchor" || { bad "安全阀清空 anchor"; echo "$out"; }
 grep -q "pfctl -d" "$MOCK_LOG" && ok "安全阀关闭我们开启的 pf" || echo "  ℹ️ pf 非本工具开启，未关闭（符合预期）"
-grep -q "BALANCE=0" "$T/etc/user.conf" && ok "安全阀把 BALANCE 置 0" || bad "安全阀置 BALANCE=0"
+(grep -q "BALANCE=0" "$T/etc/user.conf" 2>/dev/null || grep -q "BALANCE=0" "$T/etc/smartroute.conf" 2>/dev/null) \
+    && ok "安全阀把 BALANCE 置 0" || bad "安全阀置 BALANCE=0"
 grep -q "并发分流安全阀" "$T/log/smartroute.log" && ok "安全阀写日志" || bad "安全阀写日志"
 
 echo "== 4. 规则文件有内容时 watch 应用静态路由 =="
@@ -111,7 +112,7 @@ export MOCK_ANCHOR_LOADED=0
 printf 'ext1 = "en0"\npass out all\n' > "$T/etc/pf.anchor"
 : > "$MOCK_LOG"
 out="$(runwatch 1)"
-grep -q "pfctl -a com.user.smartroute -f" "$MOCK_LOG" && ok "规则丢失时重新加载" || { bad "规则丢失重新加载"; cat "$MOCK_LOG"; }
+grep -q "pfctl -a com.apple/smartroute -f" "$MOCK_LOG" && ok "规则丢失时重新加载" || { bad "规则丢失重新加载"; cat "$MOCK_LOG"; }
 grep -q "pfctl -e" "$MOCK_LOG" && ok "重新加载前确保 pf 开启" || bad "重新加载前开启 pf"
 
 echo
