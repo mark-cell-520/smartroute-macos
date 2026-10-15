@@ -1964,7 +1964,16 @@ cmd_wifi() {
     local arg="${1:-status}"
     case "$arg" in
         list|ls)
+            shift
             find_active
+            # --raw 给 App 用：一行一个 SSID，不带序号。
+            # 带序号的格式（"  1. CZ-305"）人看着舒服，但机器解析有歧义——
+            # SSID 本身完全可以叫 "1. CZ-305"，那样按 "数字. " 去剥前缀就会剥错。
+            # 所以人看的格式和机器读的格式分开，别让 App 去猜。
+            if [ "${1:-}" = "--raw" ] || [ "${1:-}" = "-r" ]; then
+                wifi_saved_list
+                return 0
+            fi
             echo "已保存的 Wi-Fi（靠前优先）："
             local n=0 ssid
             while IFS= read -r ssid; do

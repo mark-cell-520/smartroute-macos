@@ -850,36 +850,20 @@ final class NetworkModel: ObservableObject {
     func loadWifi() {
         let script = ScriptLocator.scriptPath
         DispatchQueue.global().async {
-            var saved: [String] = []
-            var signal = "", channel = "", bars = "0"
-            let listOut = Shell.run("'\(script)' wifi list", timeout: 8).out
-            if !listOut.isEmpty {
-                saved = listOut.components(separatedBy: "\n")
-                    .compactMap { line -> String? in
-                        let t = line.trimmingCharacters(in: .whitespaces)
-                        // 形如 "  1. CZ-305"，去掉序号前缀
-                        guard let r = t.range(of: "^\\s*[0-9]+\\.\\s*(.+)$", options: .regularExpression) else { return nil }
-                        return String(t[r]).trimmingCharacters(in: .whitespaces)
-                    }
-            }
-            let curOut = Shell.run("'\(script)' wifi current", timeout: 8).out
-            if !curOut.isEmpty {
-                // 形如 "Wi-Fi en1  信号 -70 dBm（2/4 格）  信道 44"
-                if let r = curOut.range(of: "信号\\s+(-?[0-9]+)\\s+dBm", options: .regularExpression) {
-                    signal = String(curOut[r])
-                }
-                if let r = curOut.range(of: "信道\\s+([0-9]+)", options: .regularExpression) {
-                    channel = String(curOut[r])
-                }
-                if let r = curOut.range(of: "（([0-9]+)/4 格）", options: .regularExpression) {
-                    bars = String(curOut[r])
-                }
+            // 用 --raw：一行一个 SSID，不带序号。带序号的格式人看着舒服，
+            // 但 SSID 本身可以叫 "1. CZ-305"，按 "数字. " 剥前缀会剥错。
+            let saved = WifiParsing.savedNetworks(
+                Shell.run("'\(script)' wifi list --raw", timeout: 8).out)
+            var signal = "", channel = "", bars = 0
+            if let cur = WifiParsing.currentSignal(
+                Shell.run("'\(script)' wifi current", timeout: 8).out) {
+                signal = cur.rssi; channel = cur.channel; bars = cur.bars
             }
             DispatchQueue.main.async {
                 self.wifiSaved = saved
                 self.wifiSignal = signal
                 self.wifiChannel = channel
-                self.wifiBars = Int(bars) ?? 0
+                self.wifiBars = bars
             }
         }
     }

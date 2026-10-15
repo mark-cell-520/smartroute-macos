@@ -38,17 +38,14 @@ else
 fi
 
 echo "==> 编译 Swift 源码（SwiftUI + AppKit）"
+# 源码用 glob，不手写清单：手写过两份（本文件和 build_release.sh 各一份），
+# 两次新增 .swift 都只改了一处，另一处漏掉直接编译失败。glob 从根上消除这个问题。
+# make_icon.swift 排除掉——它是生成图标的独立命令行工具，自带 main，不能编进 App。
+SRCS="$(ls SmartRouteApp/*.swift | grep -v 'make_icon.swift' | tr '\n' ' ')"
 swiftc -O -swift-version 5 \
     -module-cache-path "$PWD/.build/module-cache" \
     -o "$APP/Contents/MacOS/SmartRoute" \
-    SmartRouteApp/Theme.swift \
-    SmartRouteApp/Shell.swift \
-    SmartRouteApp/Privileged.swift \
-    SmartRouteApp/ScriptLocator.swift \
-    SmartRouteApp/NetworkModel.swift \
-    SmartRouteApp/WifiView.swift \
-    SmartRouteApp/Views.swift \
-    SmartRouteApp/SmartRouteApp.swift \
+    $SRCS \
     -framework SwiftUI -framework AppKit -framework Combine
 
 echo "==> 拷贝资源（脚本 + 安装卸载器 + plist）"

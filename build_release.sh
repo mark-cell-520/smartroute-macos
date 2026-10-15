@@ -37,10 +37,11 @@ PYEOF
 cp "$PWD/.build/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 
 # ---------- 2. 编译两个架构 ----------
-# 新增 .swift 文件时这里必须同步，否则 release 编译找不到类型
-# （build_app.sh 里是逐行列出的，两份清单容易漏，改完记得两边都加）
-SRCS="SmartRouteApp/Theme.swift SmartRouteApp/Shell.swift SmartRouteApp/Privileged.swift SmartRouteApp/ScriptLocator.swift \
-      SmartRouteApp/NetworkModel.swift SmartRouteApp/WifiView.swift SmartRouteApp/Views.swift SmartRouteApp/SmartRouteApp.swift"
+# 源码用 glob，和 build_app.sh 用同一套规则。
+# 曾经这里是手写清单，和 build_app.sh 各一份，两次新增 .swift 都只改了一处，
+# 另一处漏掉直接编译报 "cannot find 'X' in scope"。glob 从根上消除这个问题。
+# make_icon.swift 排除掉——它是生成图标的独立命令行工具，自带 main，不能编进 App。
+SRCS="$(ls SmartRouteApp/*.swift | grep -v 'make_icon.swift' | tr '\n' ' ')"
 
 echo "==> 编译 Apple Silicon 切片 (arm64, macOS $MIN_OS+)"
 swiftc -O -swift-version 5 -module-cache-path "$MC" \
