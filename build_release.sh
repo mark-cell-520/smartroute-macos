@@ -37,8 +37,10 @@ PYEOF
 cp "$PWD/.build/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 
 # ---------- 2. 编译两个架构 ----------
+# 新增 .swift 文件时这里必须同步，否则 release 编译找不到类型
+# （build_app.sh 里是逐行列出的，两份清单容易漏，改完记得两边都加）
 SRCS="SmartRouteApp/Theme.swift SmartRouteApp/Shell.swift SmartRouteApp/Privileged.swift SmartRouteApp/ScriptLocator.swift \
-      SmartRouteApp/NetworkModel.swift SmartRouteApp/Views.swift SmartRouteApp/SmartRouteApp.swift"
+      SmartRouteApp/NetworkModel.swift SmartRouteApp/WifiView.swift SmartRouteApp/Views.swift SmartRouteApp/SmartRouteApp.swift"
 
 echo "==> 编译 Apple Silicon 切片 (arm64, macOS $MIN_OS+)"
 swiftc -O -swift-version 5 -module-cache-path "$MC" \
