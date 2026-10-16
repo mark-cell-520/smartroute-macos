@@ -94,14 +94,6 @@ struct StatusView: View {
     private var ethInterface: InterfaceInfo? { model.snapshot.interfaces.first { $0.role == "以太网" } }
     private var wifiInterface: InterfaceInfo? { model.snapshot.interfaces.first { $0.role == "Wi-Fi" } }
 
-    private var daemonStateText: String {
-        switch model.snapshot.daemonState {
-        case .running: return "运行中"
-        case .waiting: return "等待下次检测"
-        case .stopped: return "未在运行"
-        }
-    }
-
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.gapM) {
@@ -1042,7 +1034,7 @@ struct DaemonView: View {
                         Circle()
                             .fill(model.snapshot.daemonState == .stopped ? Theme.bad : Theme.ok)
                             .frame(width: 8, height: 8)
-                        Text(daemonStateText)
+                        Text(model.snapshot.daemonStateText)
                     }
                 }
                 LabeledContent("检测频率") { Text("每 20 秒（开机自启）") }

@@ -64,7 +64,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 定时刷新勾选状态。没有这一步，用户在 App 里改了模式，
         // 菜单栏还勾着旧的那个——又是一个"界面说的和实际不一样"。
         Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
-            self?.refreshMenuState()
+            // AppKit 只能在主线程碰。Timer 的闭包不在主线程上跑，
+            // 直接调会告 actor-isolation——顺手修掉，别留警告。
+            DispatchQueue.main.async { self?.refreshMenuState() }
         }
     }
 
@@ -80,13 +82,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// 按当前模式打勾。当前模式从 Model 读（它每次 refresh 都会更新），
     /// 读不到就全不打勾——不打勾比打错勾好，打错会让人以为选错了东西。
-    func refreshMenuState() {
+    @MainActor func refreshMenuState() {
         guard let menu = modeMenu, let model = NetworkModel.shared else { return }
-        let cur = model.mode
+        // mode 在 snapshot 上，不在 Model 上（Model 是 ObservableObject，
+        // 采集结果都放 snapshot）。写错地方编译器会告诉我们要用 model.mode，
+        // 但那个属性并不存在——按提示猜最容易踩这个坑。
+        let cur = model.snapshot.mode
         let curTitle = Self.modeNames[cur] ?? "自动模式"
         for item in menu.items {
-            guard let tag = Self.modeList.firstIndex(of: item.title) else { continue }
-            _ = tag
+            guard Self.modeList.contains(item.title) else { continue }
             item.state = (item.title == curTitle) ? .on : .off
         }
         balanceItem?.state = model.balanceOn ? .on : .off

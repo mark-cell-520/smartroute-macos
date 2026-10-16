@@ -86,6 +86,18 @@ struct RouteRule: Identifiable, Equatable {
     var status: String
 }
 
+extension NetworkSnapshot {
+    /// 守护进程运行态的人话。三个状态都要说清楚——
+    /// "等待下次检测"不能显示成"未在运行"，那会让人以为自动选路没在工作。
+    var daemonStateText: String {
+        switch daemonState {
+        case .running: return "运行中"
+        case .waiting: return "等待下次检测"
+        case .stopped: return "未在运行"
+        }
+    }
+}
+
 struct NetworkSnapshot {
     var interfaces: [InterfaceInfo] = []
     var services: [ServiceEntry] = []
