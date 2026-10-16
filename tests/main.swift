@@ -387,6 +387,37 @@ viewsSrc.contains("/^Active:/")
     ? print("  OK 链路速率取 Active 行（不混入 Current: autoselect）")
     : { failures += 1; print("  XX 链路速率解析不对") }()
 
+print("== 14. flap 证据必须出现在默认落地页 ==")
+// 一开始把 flap 提示放在了 DaemonView（守护进程页），而默认落地页是 StatusView。
+// 用户反馈"以太网卡主"时看的是状态页——证据放在另一个标签页等于没说。
+// 同网关横幅当初也是放错了地方才改过来的，同一个错误不该犯第二次。
+// 用源码顺序断言：flap 的 Text/Banner 必须出现在 StatusView 结构体内。
+let uiSrc2 = readSrc("SmartRouteApp/Views.swift")
+func structBody(_ name: String) -> String {
+    guard let r = uiSrc2.range(of: "struct \(name): View {") else { return "" }
+    let rest = String(uiSrc2[r.lowerBound...])
+    // 到下一个顶层 struct 之前
+    if let e = rest.range(of: "\nstruct ", options: .literal, range: rest.index(rest.startIndex, offsetBy: 20)..<rest.endIndex) {
+        return String(rest[..<e.lowerBound])
+    }
+    return rest
+}
+let statusBody = structBody("StatusView")
+let daemonBody = structBody("DaemonView")
+checks += 1
+statusBody.contains("flapCount")
+    ? print("  OK flap 提示在 StatusView（默认落地页）")
+    : { failures += 1; print("  XX flap 提示不在状态页，用户看不到") }()
+checks += 1
+!daemonBody.contains("flapCount")
+    ? print("  OK DaemonView 里没有重复的 flap 提示（不放两处）")
+    : { failures += 1; print("  XX flap 提示重复出现在两个视图") }()
+// 两条提示要在一起：同网关横幅解释原因，flap 给出证据
+checks += 1
+statusBody.contains("sameGateway") && statusBody.contains("flapCount")
+    ? print("  OK 状态页同时有原因（同网关）和证据（flap）")
+    : { failures += 1; print("  XX 状态页缺其中一项") }()
+
 print("")
 print("结果: \(checks - failures) 通过, \(failures) 失败")
 exit(failures == 0 ? 0 : 1)

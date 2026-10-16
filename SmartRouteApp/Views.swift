@@ -163,6 +163,24 @@ struct StatusView: View {
                         }
                     }
                 }
+                // 系统反复推翻我们的选择时，把这个数字亮出来。
+                // 它必须放在**状态页**（默认落地页）而不是守护进程页——
+                // 用户反馈"以太网卡主"时看的就是状态页，把证据放在另一个
+                // 标签页里等于没说（同网关横幅当初就是放错了地方才改过来的）。
+                // 这台机器实测 51 次 en0 -> en1：不是工具在抖，是 macOS
+                // 每次都判回以太网。上面的横幅解释原因，这里给出证据。
+                if model.snapshot.flapCount >= 3 {
+                    Banner(icon: "arrow.triangle.2.circlepath", color: .orange,
+                           title: "macOS 已 \(model.snapshot.flapCount) 次把默认路由改回 \(deviceDisplayName(model.snapshot.flapTarget, from: model.snapshot.interfaces))",
+                           message: """
+这不是工具在抖动，是系统反复把默认路由判回另一个接口。
+
+常见原因是两个接口同网段或同网关（见上方提示）。工具每次都会把它改回来，
+所以你可能感觉到"网莫名其妙断一下"——那正是切换的瞬间。
+
+要减少这种反复：调整局域网网段，让两个接口走不同网段。
+""")
+                }
                 defaultRouteCard
                 HStack(alignment: .top, spacing: Theme.gapM) {
                     InterfaceCard(iface: ethInterface, role: "以太网", icon: "cable.connector",
@@ -1141,18 +1159,6 @@ struct DaemonView: View {
                             .fill(model.snapshot.daemonState == .stopped ? Theme.bad : Theme.ok)
                             .frame(width: 8, height: 8)
                         Text(model.snapshot.daemonStateText)
-                    }
-                }
-                // 系统反复推翻我们的选择时，把这个数字亮出来。
-                // 用户本来只会觉得"以太网卡主"，既不知道发生了什么、也不知道能做什么。
-                // 这台机器实测 51 次 en0 -> en1——不是工具在抖，是 macOS
-                // 每次都判回以太网。同网关横幅解释原因，这里给出证据。
-                if model.snapshot.flapCount >= 3 {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("默认路由已被系统改回 \(deviceDisplayName(model.snapshot.flapTarget, from: model.snapshot.interfaces)) 累计 \(model.snapshot.flapCount) 次")
-                            .font(.caption).foregroundStyle(.orange)
-                        Text("这不是工具在抖动，是 macOS 反复把默认路由判回另一个接口。两个接口同网段或同网关时最常见。")
-                            .font(.caption2).foregroundStyle(.secondary)
                     }
                 }
                 LabeledContent("检测频率") { Text("每 20 秒（开机自启）") }
