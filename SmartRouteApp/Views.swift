@@ -88,6 +88,20 @@ struct MainView: View {
 
 // MARK: - 状态页
 
+/// 把设备名翻成人话（en0 -> 以太网）。
+/// 原来是 StatusView 的私有方法，DaemonView 的 flap 提示也要用——
+/// 提成文件级函数，避免在第二个视图里再抄一遍（抄的那份还会漏掉 VPN 分支）。
+func deviceDisplayName(_ device: String, from interfaces: [InterfaceInfo]) -> String {
+    guard !device.isEmpty else { return "无" }
+    if let iface = interfaces.first(where: { $0.device == device }) {
+        return "\(iface.role)（\(device)）"
+    }
+    if device.hasPrefix("utun") || device.hasPrefix("ppp") || device.hasPrefix("ipsec") {
+        return "\(device)（VPN/拨号）"
+    }
+    return device
+}
+
 struct StatusView: View {
     @ObservedObject var model: NetworkModel
 
@@ -236,7 +250,7 @@ struct StatusView: View {
                     // 主标题说人话。"当前默认路由"是术语，普通用户看到不知道
                     // 这跟自己有什么关系。他真正想知道的是"我现在走的哪条线"。
                     // via <网关IP> 那行留给需要的人，放在副标题位置。
-                    Text("正在通过：\(deviceDisplayName(model.snapshot.defaultDevice))").font(.headline)
+                    Text("正在通过：\(deviceDisplayName(model.snapshot.defaultDevice, from: model.snapshot.interfaces))").font(.headline)
                     Text("默认路由  \(model.snapshot.defaultDevice.isEmpty ? "?" : model.snapshot.defaultDevice)   via   \(model.snapshot.defaultGateway.isEmpty ? "?" : model.snapshot.defaultGateway)")
                         .font(.caption).foregroundStyle(.secondary)
                     HStack(spacing: Theme.gapXS) {
@@ -288,16 +302,6 @@ struct StatusView: View {
         }
     }
 
-    private func deviceDisplayName(_ device: String) -> String {
-        guard !device.isEmpty else { return "无" }
-        if let iface = model.snapshot.interfaces.first(where: { $0.device == device }) {
-            return "\(iface.role)（\(device)）"
-        }
-        if device.hasPrefix("utun") || device.hasPrefix("ppp") || device.hasPrefix("ipsec") {
-            return "\(device)（VPN/拨号）"
-        }
-        return device
-    }
 
     private func runWatch() {
         model.watchRunning = true
@@ -1139,6 +1143,18 @@ struct DaemonView: View {
                         Text(model.snapshot.daemonStateText)
                     }
                 }
+                // 系统反复推翻我们的选择时，把这个数字亮出来。
+                // 用户本来只会觉得"以太网卡主"，既不知道发生了什么、也不知道能做什么。
+                // 这台机器实测 51 次 en0 -> en1——不是工具在抖，是 macOS
+                // 每次都判回以太网。同网关横幅解释原因，这里给出证据。
+                if model.snapshot.flapCount >= 3 {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("默认路由已被系统改回 \(deviceDisplayName(model.snapshot.flapTarget, from: model.snapshot.interfaces)) 累计 \(model.snapshot.flapCount) 次")
+                            .font(.caption).foregroundStyle(.orange)
+                        Text("这不是工具在抖动，是 macOS 反复把默认路由判回另一个接口。两个接口同网段或同网关时最常见。")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
                 LabeledContent("检测频率") { Text("每 20 秒（开机自启）") }
                 if model.snapshot.daemonState == .waiting {
                     // 刚唤醒或刚装完时日志会短暂过期。说明白是在等，
@@ -1275,10 +1291,17 @@ struct DaemonView: View {
             // （正在运行的 App 删不掉自己）——用户点完看到输出里"保留 App"，
             // "说好的全删呢？"卸载是信任最脆弱的时刻，这种对不上的承诺伤害尤其大。
             // 网络那句也要改：服务顺序会被改，但卸载时会按备份还原。
-            Text("将停止并删除守护进程、命令行工具、pf 分流规则、全部配置与日志，"
-                 + "并还原网络服务顺序。\n\n"
-                 + "App 本体将保留（正在运行，删不掉自己）——卸完请自己拖进废纸篓。\n\n"
-                 + "这个操作不可撤销，建议先导出配置。")
+            // 拆成多行字符串字面量。原来几段用 + 连，编译器要反复推断拼接
+            // 结果的类型，直接"无法在合理时间内完成类型检查"而构建失败。
+            Text("""
+                 将停止并删除守护进程、命令行工具、pf 分流规则、全部配置与日志，并还原网络服务顺序。
+
+                 App 本体将保留（正在运行，删不掉自己）——卸完请自己拖进废纸篓。
+
+                 已保存的 Wi-Fi 不会被删除。
+
+                 这个操作不可撤销，建议先导出配置。
+                 """)
         }
     }
 

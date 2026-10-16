@@ -125,6 +125,11 @@ struct NetworkSnapshot {
     var streakWifi: String = "-"
     var lastSwitch: String = "从未"
     var switchCount: String = "0"
+    /// 默认路由被系统改回同一接口的次数（flap_target/flap_count）。
+    /// ≥3 说明 macOS 在反复推翻我们的选择——最常见原因是两个接口
+    /// 同网段/同网关。这个数字要让用户看见，他本来只会觉得「以太网卡主」。
+    var flapCount: Int = 0
+    var flapTarget: String = ""
     var mode: String = "auto"
     var daemonState: DaemonState = .stopped
     var daemonScriptOutdated: Bool = false
@@ -459,6 +464,10 @@ final class NetworkModel: ObservableObject {
         snapshot.streakWifi = state["streak_wifi"] ?? "-"
         snapshot.switchCount = state["switch_count"] ?? "0"
         snapshot.lastSwitch = humanize(state["last_switch"] ?? "")
+        if let fc = state["flap_count"], let n = Int(fc.trimmingCharacters(in: .whitespaces)), n > 0 {
+            snapshot.flapCount = n
+            snapshot.flapTarget = state["flap_target"] ?? ""
+        }
         snapshot.mode = readMode()
         snapshot.daemonState = daemonState()
         snapshot.daemonScriptOutdated = ScriptLocator.daemonScriptOutdated

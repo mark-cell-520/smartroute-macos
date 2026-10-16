@@ -264,6 +264,51 @@ grep -q "失败：目标接口没有网关信息" "$T/sr.log" \
     && ok "找不到服务时明确失败（不瞎动路由表）" || bad "找不到服务时行为不对: $(tail -2 "$T/sr.log")"
 grep -q "ROUTE delete default" "$T/calls" && bad "没网关还去删默认路由，会断网" || ok "没网关时不碰路由表"
 
+echo "== 9. 系统反复推翻选择时要检测并说明（flap）=="
+# 实测这台机器：51 次 en0 -> en1，只有 7 次反向。这不是抖动，是 macOS
+# 每次都把默认路由重新判回以太网、工具再改回来。用户感受就是"以太网卡主"，
+# 而工具一声不响地反复改了几十次。检测到就该说清楚，而不是继续沉默地改。
+awk '/^do_switch\(\)/,/^}/' smartroute.sh | grep -q 'flap_count' \
+    && ok "do_switch 统计被系统改回的次数" || bad "没有 flap 检测"
+awk '/^do_switch\(\)/,/^}/' smartroute.sh | grep -q 'flap_n.*-eq 3' \
+    && ok "第 3 次才告警（不冤枉偶发波动）" || bad "告警时机不对"
+awk '/^do_switch\(\)/,/^}/' smartroute.sh | grep -q 'flap_n % 10' \
+    && ok "之后每 10 次提一次（不刷屏）" || bad "会重复刷屏"
+awk '/^do_switch\(\)/,/^}/' smartroute.sh | grep -q 'flap_n=1' \
+    && ok "切换目标变化时重置计数" || bad "计数不重置，会误报"
+awk '/^do_switch\(\)/,/^}/' smartroute.sh | grep -q 'last_ts=' \
+    && ok "last_switch 取到变量里后再进算术" || bad "直接把 state_get 塞进 \$((  ))"
+
+echo "== 9b. 实测 flap 计数真的在动（首次 last_switch 为空）=="
+# 静态检查全绿但一执行就红的例子：last_switch 首次为空时
+# flap_gap=$(( now - $(state_get last_switch) )) 算术报错，整个函数中断，
+# 第一次切换静默失败。必须真的跑一遍才发现。
+T="$(mktemp -d /tmp/sr_flap.XXXXXX)"; mkdir -p "$T/state" "$T/bin" "$T/lock"
+: > "$T/state/st"; : > "$T/sr.log"; : > "$T/calls"
+awk '/^# ---------------- 入口 ----------------/{exit} {print}' smartroute.sh > "$T/sr.sh"
+printf '#!/bin/bash\n[ -f "$MOCK_ORDER" ] && cat "$MOCK_ORDER"; exit 0\n' > "$T/bin/networksetup"
+printf '#!/bin/bash\nprintf "ROUTE %%s\\n" "$*" >> "$MOCK_CALLS"\ncase "${1:-}" in -n) [ -f "$MOCK_DEFAULT" ] && cat "$MOCK_DEFAULT"; exit 0 ;; esac\nexit 0\n' > "$T/bin/route"
+printf '#!/bin/bash\nprintf "NOTIFY %%s\\n" "$*" >> "$MOCK_CALLS"; exit 0\n' > "$T/bin/osascript"
+chmod +x "$T/bin"/*
+printf '   route to: default\n  interface: en0\n  gateway: 192.168.1.1\n' > "$T/def_en0"
+printf '(1) Wi-Fi\n(2) Ethernet\n' > "$T/order"; printf 'en0\nen1\n' > "$T/hw"
+_rf() {
+    bash -c ". '$T/sr.sh'; trap - EXIT INT TERM HUP
+        export PATH='$T/bin:/usr/bin:/bin:/usr/sbin:/sbin'
+        export MOCK_ORDER='$T/order' MOCK_HW='$T/hw' MOCK_CALLS='$T/calls' MOCK_DEFAULT='$T/def_en0'
+        export LOG_FILE='$T/sr.log' STATE_FILE='$T/state/st' STATE_WRITABLE=1
+        export LOCK_DIR='$T/lock' NOTIFY=1; $1" >/dev/null 2>&1
+}
+for _i in 1 2 3; do _rf 'do_switch en1 en0 ok ok 2 2'; done
+_fc="$(awk -F= '$1=="flap_count"{print $2}' "$T/state/st")"
+[ "$_fc" = "3" ] && ok "连续 3 次切到同一目标，flap_count=$_fc" || bad "flap_count 应为 3，实际 ${_fc:-空}"
+grep -q "第 3 次" "$T/sr.log" && ok "第 3 次写了日志" || bad "第 3 次没写日志"
+[ "$(grep -c '^NOTIFY' "$T/calls")" = "1" ] && ok "第 3 次发了 1 条通知（不刷屏）" || bad "通知条数不对"
+_rf 'do_switch en0 en1 ok ok 2 2'
+_fc2="$(awk -F= '$1=="flap_count"{print $2}' "$T/state/st")"
+[ "$_fc2" = "1" ] && ok "目标改变后重置为 1" || bad "目标改变后应重置为 1，实际 ${_fc2:-空}"
+rm -rf "$T"
+
 echo
 echo "结果: $PASS 通过, $FAIL 失败"
 [ "$FAIL" -eq 0 ]

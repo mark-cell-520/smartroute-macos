@@ -673,6 +673,43 @@ do_switch() {   # $1=目标设备 $2=原默认设备 $3=eth探测 $4=wifi探测 
     svc="$(svc_of_dev "$want")"
     log "切换默认路由: ${cur:-无} -> $want (服务:${svc:-无}) [eth=$3/$5 wifi=$4/$6 mode=$MODE]"
 
+    # 检测"系统反复把默认路由判回同一个接口"。
+    #
+    # 实测这台机器：51 次 en0 -> en1，只有 7 次反向。这不是抖动，是 macOS
+    # 每次都把默认路由重新判回以太网、工具再改回来。用户感受就是
+    # "以太网卡主"，而工具一声不响地反复改了几十次——他既不知道发生了什么，
+    # 也不知道能做什么。
+    #
+    # 两个接口同网段/同网关时，configd 的默认路由裁决会倾向于同一个接口，
+    # 于是这个循环会一直转。说清楚，比继续沉默地改有用。
+    local flap_last flap_n flap_gap last_ts
+    flap_last="$(state_get flap_target)"
+    flap_n="$(state_get flap_count)"
+    [[ "$flap_n" =~ ^[0-9]+$ ]] || flap_n=0
+    # last_switch 首次运行是空的。直接塞进 $(( now - )) 会算术报错，
+    # 把整个函数中断——于是第一次切换静默失败。冷却期那段早就这么防了。
+    last_ts="$(state_get last_switch)"
+    [[ "$last_ts" =~ ^[0-9]+$ ]] || last_ts=0
+    flap_gap=$(( $(date +%s) - last_ts ))
+    # 半小时内连续切到同一个目标才算"反复"；间隔久了只是偶发，别冤枉用户
+    if [ "$flap_last" = "$want" ] && [ "$flap_gap" -le 1800 ]; then
+        flap_n=$((flap_n+1))
+    else
+        flap_n=1
+    fi
+    state_set flap_target "$want"
+    state_set flap_count "$flap_n"
+    if [ "$flap_n" -eq 3 ]; then
+        # 第 3 次才说——前两次可能真是网络波动，别急着下结论
+        log "注意：默认路由第 3 次被系统判回 ${cur}，已再次切到 $want"
+        log "  若两个接口同网段或同网关，系统会反复这样裁决；可按状态页提示调整网络"
+        notify "SmartRoute 选路不稳定" "macOS 已第 3 次把默认路由改回 $(dev_cn "${cur:-}")。若网线和 Wi-Fi 接同一台路由器，系统会反复这样判——请看状态页的提示。"
+    elif [ "$flap_n" -gt 3 ] && [ $((flap_n % 10)) -eq 0 ]; then
+        # 之后每 10 次提一次，不刷屏
+        log "注意：默认路由已被系统改回 ${cur} 累计 $flap_n 次"
+        notify "SmartRoute 选路不稳定" "macOS 已累计 $flap_n 次把默认路由改回 $(dev_cn "${cur:-}")。若网线和 Wi-Fi 接同一台路由器，系统会反复这样判——请看状态页的提示。"
+    fi
+
     # 一进来就记尝试时间。原来只在两条成功路径的末尾才写 last_switch，
     # 失败的尝试不落时间——于是冷却期形同虚设：目标接口持续不可用时，
     # 每 20 秒就重试一次，每次都走一遍"删默认路由再添加"。
