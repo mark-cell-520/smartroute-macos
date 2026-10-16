@@ -108,6 +108,7 @@ struct StatusView: View {
                 } else if model.snapshot.daemonScriptOutdated {
                     daemonOutdatedBanner
                 }
+                positioningLine
                 defaultRouteCard
                 HStack(alignment: .top, spacing: Theme.gapM) {
                     InterfaceCard(iface: ethInterface, role: "以太网", icon: "cable.connector",
@@ -127,6 +128,23 @@ struct StatusView: View {
             }
             .padding(Theme.gapL)
         }
+    }
+
+    /// 工具定位的一句话。
+    ///
+    /// 这句大白话原来只在欢迎页和 README 里。而从命令行装守护进程的用户
+    /// **永远看不到欢迎页**（sheet 条件是 !daemonInstalled && !didSeeWelcome），
+    /// 直接面对满屏"默认路由/服务顺序"黑话——产品最好的解释恰好被跳过了。
+    /// 所以在这里也放一份。
+    private var positioningLine: some View {
+        HStack(spacing: Theme.gapXS) {
+            Image(systemName: "cable.connector")
+                .font(.caption)
+            Text("插上网线自动走网线，网线没外网自动切 Wi-Fi，恢复后自动切回。")
+                .font(.caption)
+        }
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, Theme.gapXS)
     }
 
     private var daemonBanner: some View {
@@ -175,9 +193,12 @@ struct StatusView: View {
                     .animation(.easeInOut(duration: 0.35), value: model.snapshot.defaultReachable)
                 }
                 VStack(alignment: .leading, spacing: Theme.gapXS) {
-                    Text("当前默认路由").font(.headline)
-                    Text("\(deviceDisplayName(model.snapshot.defaultDevice))   via   \(model.snapshot.defaultGateway.isEmpty ? "?" : model.snapshot.defaultGateway)")
-                        .font(.title3.monospaced())
+                    // 主标题说人话。"当前默认路由"是术语，普通用户看到不知道
+                    // 这跟自己有什么关系。他真正想知道的是"我现在走的哪条线"。
+                    // via <网关IP> 那行留给需要的人，放在副标题位置。
+                    Text("正在通过：\(deviceDisplayName(model.snapshot.defaultDevice))").font(.headline)
+                    Text("默认路由  \(model.snapshot.defaultDevice.isEmpty ? "?" : model.snapshot.defaultDevice)   via   \(model.snapshot.defaultGateway.isEmpty ? "?" : model.snapshot.defaultGateway)")
+                        .font(.caption).foregroundStyle(.secondary)
                     HStack(spacing: Theme.gapXS) {
                         Pill(text: model.snapshot.gatewayUnknown
                              ? "网关状态未知"
@@ -350,11 +371,37 @@ struct SpeedView: View {
                     SpeedCard(model: model, dev: dev)
                 }
                 qualityCard
+                // 用户装完最想知道的是"网变快了吗"。原来这页只有实时曲线，
+                // 没有基线也没有对比——没下载时曲线贴近 0，用户反而觉得没变快。
+                // 这里直接给出结论，并说清曲线为什么有时是平的。
+                answerCard
                 hintCard
             }
             .padding()
         }
         .onAppear { model.loadQuality() }
+    }
+
+    /// 直接回答"网变快了吗"。
+    ///
+    /// 这一页原来只有实时曲线，而曲线的语义普通人读不出来：没下载的时候
+    /// 贴近 0 是正常的，用户却以为"没变快/变慢了"。而且这工具**不会**
+    /// 让宽带本身变快——它只是在两条线路里挑一条。这个预期必须在这里说清，
+    /// 否则用户会一直等一个不会发生的结果。
+    private var answerCard: some View {
+        Card(title: "网变快了吗？") {
+            VStack(alignment: .leading, spacing: Theme.gapS) {
+                Text("这个工具不会让你的宽带本身变快——它只是在以太网和 Wi-Fi 两条线路里，挑一条更快/更稳的来走。")
+                    .font(.callout)
+                Text("所以「变快」只发生在这种情况：你原来走的那条更慢，切换后走上了更快的那条。")
+                    .font(.caption).foregroundStyle(.secondary)
+                Divider()
+                Text("曲线为什么有时是平的？")
+                    .font(.caption).foregroundStyle(.secondary)
+                Text("曲线是实时网速，没有下载任务时接近 0 是正常的——不代表网变慢了。想看峰值，随便下载个文件就能看到起伏。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
     }
 
     private var qualityCard: some View {
@@ -837,9 +884,13 @@ struct RoutingView: View {
                     Text(model.measurementsNote)
                         .font(.caption2).foregroundStyle(.orange)
                 }
-                Button(model.remeasuring ? "测量中…" : "立即重新测量") { model.remeasureNow() }
+                // 说清要点密码。用户点下去突然弹出管理员密码框会很意外，
+                // 甚至以为软件在要不该要的权限。
+                Button(model.remeasuring ? "测量中…" : "立即重新测量（需要管理员密码）") { model.remeasureNow() }
                     .controlSize(.small)
                     .disabled(model.remeasuring)
+                Text("要真下载一点数据才能测，所以走提权执行；每 \(model.speedRecheck) 秒才会自动重测一次。")
+                    .font(.caption2).foregroundStyle(.secondary)
             }
             Section("探测与通知") {
                 Toggle("TLS 层探测（识别“假互联网”）", isOn: $model.routeTLS)
