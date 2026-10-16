@@ -32,6 +32,22 @@ case "$*" in
 esac
 exit 0
 EOF
+cat > "$T/bin/networksetup" <<'EOF'
+#!/bin/bash
+# 只拦 -getinfo（svc_router 只认 "Router: <ip>" 这一行）。
+# 其余子命令放行给真实命令——find_active 要用 -listnetworkserviceorder，
+# 全拦了会让它取不到接口，前面一大堆测试跟着挂。
+if [ "${1:-}" = "-getinfo" ]; then
+  case "$2" in
+    # "none" 是哨兵：表示"这个接口取不到网关"。
+    # 不能直接传空串——run() 那边有 :-默认值，空串会被填回默认网关。
+    Ethernet) echo "IP address: 192.168.1.36"; [ "${MOCK_ETH_GW:-}" = none ] || echo "Router: ${MOCK_ETH_GW:-192.168.1.1}" ;;
+    Wi-Fi)    echo "IP address: 192.168.1.5";  [ "${MOCK_WIFI_GW:-}" = none ] || echo "Router: ${MOCK_WIFI_GW:-192.168.1.1}" ;;
+  esac
+  exit 0
+fi
+exec /usr/sbin/networksetup "$@"
+EOF
 cat > "$T/bin/netstat" <<'EOF'
 #!/bin/bash
 if [ "${1:-}" = "-rn" ]; then
@@ -130,6 +146,7 @@ run() {   # 在隔离环境里 source 并执行函数
         export MOCK_BYTES_DIR='$T/bytes'
         export MOCK_PF_STATUS='${MOCK_PF_STATUS:-Disabled}' MOCK_ANCHOR_LOADED='${MOCK_ANCHOR_LOADED:-0}'
         export MOCK_NAT='${MOCK_NAT:-0}' MOCK_CURL_OK='${MOCK_CURL_OK:-1}'
+        export MOCK_ETH_GW='${MOCK_ETH_GW:-192.168.1.1}' MOCK_WIFI_GW='${MOCK_WIFI_GW:-192.168.1.1}'
         . '$T/sr.sh'
         $1
     "
@@ -244,6 +261,49 @@ export MOCK_FROZEN="en1"
 out="$(run 'balance_validate en1 192.168.1.5 en6 192.168.1.6 en1' 2>&1)"
 echo "$out" | grep -q "流量没有走预期接口" && ok "赢家没流量时明确报错" || bad "赢家无流量未报错: $out"
 export MOCK_FROZEN=""
+
+echo
+echo "== 12. 同网关（一条 WAN 的两个入口）不该开双网并发 =="
+# 这是实测发现的：本机网线和 Wi-Fi 的网关都是 192.168.1.1，
+# 同一台路由器出来的。此时 pf 轮询分流不会变快——瓶颈在路由器
+# 后面那一条上游，不在入口；反而一半连接被赶到更慢的接口。
+# 默认拒绝，--force 才放行（给想验证 pf 规则的人留口子）。
+_g() {   # 在隔离环境里判断同网关，$1/$2 为两个网关
+    run "
+        ACTIVE_ETH_DEV=en0; ACTIVE_ETH_SVC=Ethernet
+        ACTIVE_WIFI_DEV=en1; ACTIVE_WIFI_SVC=Wi-Fi
+        export MOCK_ETH_GW='$1' MOCK_WIFI_GW='$2'
+        eth_wifi_same_gateway && echo SAME || echo DIFF
+    "
+}
+[ "$(_g 192.168.1.1 192.168.1.1)" = "SAME" ] && ok "网关相同能被判出来" || bad "网关相同能被判出来"
+[ "$(_g 192.168.1.1 10.0.0.1)" = "DIFF" ] && ok "网关不同不会被误判" || bad "网关不同不会被误判"
+# 判断不了时不能当成"相同"，否则会误拒合法的双 WAN
+[ "$(_g none none)" = "DIFF" ] && ok "取不到网关时不当成相同（不误拒）" || bad "取不到网关时当成相同了"
+# 只一边取不到同样不能开（规则会不完整）
+[ "$(_g none 10.0.0.1)" = "DIFF" ] && ok "只一边有网关时判 DIFF" || bad "只一边有网关时误判 SAME"
+# 少一个接口也要判不了，而不是崩
+run '
+    ACTIVE_ETH_DEV=en0; ACTIVE_ETH_SVC=Ethernet; ACTIVE_WIFI_DEV=
+    eth_wifi_same_gateway && echo SAME || echo DIFF
+' | grep -q "^DIFF$" && ok "没有 Wi-Fi 时判 DIFF（不误拒）" || bad "没有 Wi-Fi 时误判"
+
+_st() {   # balance_status 在给定网关下的输出
+    # 2>/dev/null：grep -q 一命中就关掉管道，脚本里的 echo 会报
+    # "Broken pipe"——那是测试管道的正常现象，不是错误，别让它污染输出。
+    run "
+        ACTIVE_ETH_DEV=en0; ACTIVE_ETH_SVC=Ethernet
+        ACTIVE_WIFI_DEV=en1; ACTIVE_WIFI_SVC=Wi-Fi
+        export MOCK_ETH_GW='$1' MOCK_WIFI_GW='$2'
+        balance_status
+    " 2>/dev/null
+}
+_st 192.168.1.1 192.168.1.1 | grep -q "两个接口网关相同（192.168.1.1）" \
+    && ok "同网关时 status 警告并带上网关" || bad "同网关时 status 未警告"
+_st 192.168.1.1 192.168.1.1 | grep -q "建议 BALANCE=0" \
+    && ok "警告里给出关闭建议" || bad "警告里没有关闭建议"
+_st 192.168.1.1 10.0.0.1 | grep -q "两个接口网关相同" \
+    && bad "不同网关时乱警告（狼来了）" || ok "不同网关时不警告"
 
 echo
 echo "结果: $PASS 通过, $FAIL 失败"

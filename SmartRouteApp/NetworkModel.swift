@@ -208,6 +208,9 @@ final class NetworkModel: ObservableObject {
     @Published var balanceStatusText = "（读取中…）"
     @Published var balanceOn = false
     @Published var balanceMode = "round-robin"   // round-robin | fastest
+    /// 两个接口网关相同（同一台路由器）——不是两条 WAN，分流没有带宽收益。
+    /// 从 balance status 的警告行解析出来，让 App 在用户最常看的地方提示。
+    @Published var balanceSameGateway = ""
     @Published var pendingBalanceMode = "round-robin"   // 用户在下拉里选的、尚未生效的策略
     @Published var balanceLatency: [String: String] = [:]   // 设备名 -> "14.3 ms"
     @Published var balanceLoading = false
@@ -798,6 +801,17 @@ final class NetworkModel: ObservableObject {
                 self.endOp("balance")
                 self.balanceStatusText = out
                 self.balanceOn = out.contains("BALANCE=1")
+                // "两个接口网关相同（192.168.1.1）" -> 取出网关
+                self.balanceSameGateway = ""
+                for line in out.components(separatedBy: "\n") {
+                    if line.contains("两个接口网关相同") {
+                        let t = line.replacingOccurrences(of: "两个接口网关相同", with: "")
+                        if let l = t.firstIndex(of: "("), let r = t.firstIndex(of: ")") {
+                            self.balanceSameGateway = String(t[t.index(after: l)..<r])
+                        }
+                        break
+                    }
+                }
                 if out.contains("分流策略       : 最快线路") { self.balanceMode = "fastest" }
                 else { self.balanceMode = "round-robin" }
                 // 解析 "实时延迟" 行：    en0      26.8 ms   en1      38.1 ms

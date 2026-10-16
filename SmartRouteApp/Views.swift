@@ -489,6 +489,9 @@ struct BalanceView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.gapM) {
+                if !model.balanceSameGateway.isEmpty {
+                    Banner(icon: "exclamationmark.triangle.fill", color: .orange, title: "双网并发在此网络下没有收益", message: "网线和 Wi-Fi 的网关都是 \(model.balanceSameGateway)，是同一台路由器出来的——这不是两条 WAN，而是一条 WAN 的两个入口。\n\n分流不会变快（瓶颈在路由器后面那条上游），反而会把一半连接赶到更慢的接口。建议关闭并发分流，改用「选路模式」挑一个更快的接口。")
+                }
                 statusCard
                 controlCard
                 liveCard
@@ -756,9 +759,11 @@ struct RoutingView: View {
                     .font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
-                // 网速/延时模式下，把上次实测结果摆出来——用户最想看的就是"凭什么走这条"
+                // 把上次实测结果摆出来——用户最想看的就是"凭什么走这条"。
+                // 固定/自动模式下原来什么都不显示，用户根本没法验证自己选的那个
+                // 接口是不是真的更快（实测中就有人执着于 Wi-Fi，而有线快 49%）。
+                Divider()
                 if model.routeMode == "speed" || model.routeMode == "latency" {
-                    Divider()
                     if model.routeMode == "speed" {
                         KeyValueRow(key: "实测吞吐", value: "eth \(model.ethSpeed)   Wi-Fi \(model.wifiSpeed)")
                         Text("实测要真下载一点数据，费流量，所以每 \(model.speedRecheck) 秒才重测一次。")
@@ -768,9 +773,20 @@ struct RoutingView: View {
                         Text("延迟每 \(model.latencyRecheck) 秒重测一次。")
                             .font(.caption2).foregroundStyle(.secondary)
                     }
-                    Button("立即重新测量") { model.remeasureNow() }
-                        .controlSize(.small)
+                } else {
+                    KeyValueRow(key: "实测吞吐", value: "eth \(model.ethSpeed)   Wi-Fi \(model.wifiSpeed)")
+                    KeyValueRow(key: "实测延迟", value: "eth \(model.ethLatency)   Wi-Fi \(model.wifiLatency)")
+                    if model.ethSpeed == "未测" && model.wifiSpeed == "未测" {
+                        Text("固定/自动模式下不会自动测量（省流量和省电），点下面的按钮测一次，\n就能看到当前选的接口是不是真的更快。")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    } else {
+                        Text("固定/自动模式下不会自动测量，这里是上次的结果。")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
                 }
+                Button(model.remeasuring ? "测量中…" : "立即重新测量") { model.remeasureNow() }
+                    .controlSize(.small)
+                    .disabled(model.remeasuring)
             }
             Section("探测与通知") {
                 Toggle("TLS 层探测（识别“假互联网”）", isOn: $model.routeTLS)

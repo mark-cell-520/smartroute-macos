@@ -66,6 +66,25 @@ printf '%s' "$OUT" | grep -q "优先列表=" && ok "显示优先列表" || bad "
 echo "=== 9. usage 里登记了这个命令 ==="
 bash smartroute.sh --help 2>&1 | grep -q "report" && ok "--help 里有 report" || bad "--help 缺 report"
 
+echo "=== 11. doctor：同网关要给出可操作的建议 ==="
+# 实测发现本机网线和 Wi-Fi 网关都是 192.168.1.1（同一台路由器）。
+# 原来 doctor 只提示"同网段"，建议是"修改路由器 LAN 网段"——大多数人
+# 根本改不了路由器，等于没建议。同网关真正该做的是关掉双网并发。
+DOC="$(bash smartroute.sh doctor 2>&1)"
+printf '%s' "$DOC" | grep -q "同网段" && ok "仍提示同网段" || bad "丢了同网段提示"
+if printf '%s' "$DOC" | grep -q "网关相同"; then
+    ok "同网关时明确说出来"
+    printf '%s' "$DOC" | grep -q "BALANCE=1）不会有任何带宽收益" \
+        && ok "说明为什么没收益（一条 WAN 两个入口）" || bad "没说清为什么"
+    printf '%s' "$DOC" | grep -q "建议关闭双网并发" \
+        && ok "给出可操作建议（关并发）" || bad "没有可操作建议"
+    printf '%s' "$DOC" | grep -q "balance off" \
+        && ok "建议里带具体命令" || bad "建议里没有命令"
+else
+    echo "  （本机不同网关，跳过同网关相关断言）"
+fi
+printf '%s' "$DOC" | grep -q "建议：" && ok "有建议区" || bad "没有建议区"
+
 echo
 echo "结果: $PASS 通过, $FAIL 失败"
 [ "$FAIL" -eq 0 ]

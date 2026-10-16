@@ -205,6 +205,24 @@ svc_router() {   # $1=服务名 -> 网关
     networksetup -getinfo "$1" 2>/dev/null | awk -F': *' '/^Router:/{print $2; exit}'
 }
 
+# 以太网和 Wi-Fi 是否经同一台路由器上网（网关相同）。
+# -> 0 表示相同，1 表示不同或判断不了。
+#
+# 为什么要单独判这个：两个接口网关相同，说明它们不是"两条 WAN"，
+# 而是"一条 WAN 的两个入口"。此时双网并发（pf 轮询分流）：
+#   · 不会变快：瓶颈在路由器后面那一条上游，不在入口
+#   · 反而更慢：一半连接被赶到更慢的接口（本机 100M 有线 vs Wi-Fi）
+#   · 还可能引入非对称路由/ARP flux 的问题
+# 所以 balance_on 默认拒绝、balance_status 醒目警告。
+eth_wifi_same_gateway() {
+    local eg wg
+    [ -n "${ACTIVE_ETH_DEV:-}" ] && [ -n "${ACTIVE_WIFI_DEV:-}" ] || return 1
+    eg="$(svc_router "${ACTIVE_ETH_SVC:-}" 2>/dev/null)"
+    wg="$(svc_router "${ACTIVE_WIFI_SVC:-}" 2>/dev/null)"
+    [ -n "$eg" ] && [ -n "$wg" ] || return 1
+    [ "$eg" = "$wg" ]
+}
+
 default_dev() {
     route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}'
 }
@@ -1018,6 +1036,15 @@ cmd_doctor() {
         if [ "$a" = "$b" ]; then
             echo "    ${C_WARN}⚠️  以太网与 Wi-Fi 同网段（$a.x），路由会互相干扰${C_RST}"
             advice+=("两个接口同一网段：修改路由器 LAN 网段（如改成 192.168.2.x），或只用一个接口")
+            # 同网段通常意味着同一个网关、同一台路由器——那"双网并发"就没有
+            # 第二条 WAN 可分。这条建议是可操作的（关掉开关就行），
+            # 而"改路由器网段"对大多数人做不到，所以必须补上。
+            if eth_wifi_same_gateway; then
+                echo "    ${C_WARN}⚠️  而且两者网关相同（$(svc_router "${ACTIVE_ETH_SVC:-}" 2>/dev/null)），是同一台路由器${C_RST}"
+                echo "        → 双网并发（BALANCE=1）不会有任何带宽收益，反而会把一半连接赶到更慢的接口"
+                advice+=("建议关闭双网并发：smartroute balance off（或 App 里的并发分流开关）")
+                advice+=("想更快就改用「网速优先/延时优先」模式挑一个更快的接口，而不是两个都用")
+            fi
         else
             echo "    网段无冲突（eth=$a.x wifi=$b.x）${C_OK}✓${C_RST}"
         fi
@@ -1467,6 +1494,30 @@ balance_on() {
     [ -n "$eth_gw" ]  || die "取不到以太网网关（服务: ${ACTIVE_ETH_SVC:-?}）"
     [ -n "$wifi_gw" ] || die "取不到 Wi-Fi 网关（服务: ${ACTIVE_WIFI_SVC:-?}）"
 
+    # 【同网关】两个接口的网关相同，说明它们经同一台路由器上网——
+    # 那不是"两条 WAN"，而是"一条 WAN 的两个入口"。此时轮询分流：
+    #   · 不会变快：瓶颈在路由器后面的那一条上游，不在入口
+    #   · 反而更慢：一半的连接被赶到更慢的那个接口（本机 100M 有线 vs Wi-Fi）
+    #   · 还可能引入非对称路由的问题
+    # 所以默认拒绝。确实想试（比如验证 pf 规则）可以用 --force。
+    local force=0
+    case "${1:-}" in --force|-f) force=1 ;; esac
+    if [ "$eth_gw" = "$wifi_gw" ] && [ "$force" != "1" ]; then   # 与 eth_wifi_same_gateway 同一判据
+        cat >&2 <<MSG
+两个接口的网关相同（都是 $eth_gw），它们经同一台路由器上网——
+这不是两条 WAN，而是一条 WAN 的两个入口。此时双网并发：
+  · 不会变快：瓶颈在路由器后面的上游链路，不在入口
+  · 反而更慢：一半连接会被赶到更慢的那个接口
+  · 可能引入非对称路由问题
+真要试试（例如验证 pf 规则）请加 --force：
+  sudo smartroute balance on --force
+MSG
+        exit 1
+    fi
+    if [ "$eth_gw" = "$wifi_gw" ]; then
+        echo "⚠️  两个接口网关相同（$eth_gw），分流不会有带宽收益，仅按 --force 要求开启"
+    fi
+
     echo "正在检测两个接口的外网连通性…"
     _p="$(probe_dev "$ACTIVE_ETH_DEV" "$eth_gw")"
     eth_res="$(printf '%s\n' "$_p" | sed -n 1p)"
@@ -1604,6 +1655,20 @@ balance_reevaluate() {
 
 balance_status() {
     echo "=== 双网并发（pf 分流）状态  $(ts) ==="
+    find_active 2>/dev/null   # 为了判断两个接口的网关是否相同
+    # 同网关要一上来就醒目地说：这不是两条 WAN，分流没有带宽收益。
+    # 用户很容易以为"插了网线又连着 Wi-Fi"就是双 WAN，其实同一个路由器
+    # 出来的还是同一条上游链路——瓶颈不在入口。
+    if eth_wifi_same_gateway; then
+        local _sgw=""
+        _sgw="$(svc_router "${ACTIVE_ETH_SVC:-}" 2>/dev/null)"
+        echo
+        echo "  ⚠️  两个接口网关相同（${_sgw:-同一路由器}），经同一台路由器上网。"
+        echo "     这不是两条 WAN，而是一条 WAN 的两个入口——双网并发不会变快，"
+        echo "     反而会把一半连接赶到更慢的接口。建议 BALANCE=0。"
+        echo "     （确实想验证 pf 规则可 sudo smartroute balance on --force）"
+        echo
+    fi
     pf_enabled
     case $? in
         0) echo "  系统 pf        : 开启" ;;
