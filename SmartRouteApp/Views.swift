@@ -109,6 +109,46 @@ struct StatusView: View {
                     daemonOutdatedBanner
                 }
                 positioningLine
+                // 同网关警告放在状态页最前面。用户抱怨"故障转移没效果、
+                // 双网并发也没效果"时，他正在看的就是这一页——结论必须出现在
+                // 他眼前，不能只放在双网并发页等人翻到（原来就是那样，
+                // 等于没说）。同时给出**唯一还有意义的动作**：同网关时两个接口
+                // 仍可能有速率差，网速优先挑快的那条是实实在在的提升。
+                if !model.snapshot.sameGateway.isEmpty {
+                    Banner(icon: "exclamationmark.triangle.fill", color: .orange,
+                           title: "两个接口走同一台路由器，故障转移在此网络下无效",
+                           message: """
+网线和 Wi-Fi 的网关都是 \(model.snapshot.sameGateway)，是同一台路由器出来的。
+
+这意味着：
+· 路由器出故障时两个接口一起断——自动选路没有可切换的目标
+· 双网并发也不会变快（瓶颈在路由器后面那条上游）
+
+还能做的：两个接口仍有速率差异时，用「选路模式 → 网速优先」挑更快的那条。
+""")
+                }
+                // 链路速率对比。只在同网关时显示——这正是它唯一有意义的场合，
+                // 也与 NetworkModel 里的取值条件一致（不同网关时不取，省 1.7 秒）。
+                if !model.snapshot.sameGateway.isEmpty,
+                   !model.snapshot.linkSpeedEth.isEmpty || !model.snapshot.linkSpeedWifi.isEmpty {
+                    Card {
+                        VStack(alignment: .leading, spacing: Theme.gapXS) {
+                            Text("链路速率").font(.headline)
+                            HStack(spacing: Theme.gapM) {
+                                LabeledContent("以太网") {
+                                    Text(model.snapshot.linkSpeedEth.isEmpty ? "未连接" : model.snapshot.linkSpeedEth)
+                                        .monospaced()
+                                }
+                                LabeledContent("Wi-Fi") {
+                                    Text(model.snapshot.linkSpeedWifi.isEmpty ? "未连接" : model.snapshot.linkSpeedWifi)
+                                        .monospaced()
+                                }
+                            }
+                            Text("协商速率是理论上限，实际速度还取决于对端设备与信号质量。")
+                                .font(.caption2).foregroundStyle(.tertiary)
+                        }
+                    }
+                }
                 defaultRouteCard
                 HStack(alignment: .top, spacing: Theme.gapM) {
                     InterfaceCard(iface: ethInterface, role: "以太网", icon: "cable.connector",

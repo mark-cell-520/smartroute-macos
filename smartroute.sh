@@ -900,6 +900,13 @@ cmd_status() {
     echo
     echo "当前默认路由 : ${cur:-未知} via $(default_gw)"
     echo "选路模式     : $MODE"
+    # 机器可读的关键事实。App 需要据此在**状态页**就给出警告，而不只是
+    # 在双网并发页（原先后者才会解析 balance status 才知道同网关）。
+    # 用户抱怨"故障转移没效果、双网并发也没效果"时，他正在看的是状态页——
+    # 结论必须出现在他眼前那一页，否则等于没说。
+    if [ -n "$eth_gw" ] && [ "$eth_gw" = "$wifi_gw" ]; then
+        echo "same_gateway  : $eth_gw"
+    fi
     echo "判定结果     : eth_ok=$(state_get eth_ok) wifi_ok=$(state_get wifi_ok) streak_eth=$(state_get streak_eth) streak_wifi=$(state_get streak_wifi)"
     echo "最近切换     : $(human_ts "$(state_get last_switch)")（累计 $(state_get switch_count) 次）"
     # 链路与实测：解释"为什么走了这条"。

@@ -100,6 +100,18 @@ extension NetworkSnapshot {
 
 struct NetworkSnapshot {
     var interfaces: [InterfaceInfo] = []
+    /// 两个接口网关相同（同一台路由器）。非空时值为那个网关。
+    ///
+    /// 这个字段决定了工具的两个招牌功能在此网络下**能不能**工作：
+    /// 故障转移和双网并发都要求两条独立的上游。同一个网关 = 同一台路由器，
+    /// 路由器宕了两边一起宕，分流也没有第二条 WAN 可分。
+    /// 所以它必须在状态页就提示，不能只放在双网并发页等人翻到。
+    var sameGateway: String = ""
+    /// 链路协商速率，如 "100baseTX" / "432 Mbps"。
+    /// 同网关时这往往是唯一还有意义的差异——100M 的网线配 432M 的 Wi-Fi，
+    /// 「网速优先」挑 Wi-Fi 就是实实在在的提升。
+    var linkSpeedEth: String = ""
+    var linkSpeedWifi: String = ""
     var services: [ServiceEntry] = []
     var defaultDevice: String = ""
     var defaultGateway: String = ""
@@ -408,6 +420,38 @@ final class NetworkModel: ObservableObject {
         snapshot.services = services
         snapshot.defaultDevice = defDev
         snapshot.defaultGateway = defGw
+
+        // 同网关判定。用接口自己的网关比，而不是拿"当前默认路由的网关"比——
+        // 后者只有一个值，永远相等，会误判。
+        let ethGw = interfaces.first(where: { $0.role == "以太网" })?.gateway ?? ""
+        let wifiGw = interfaces.first(where: { $0.role == "Wi-Fi" })?.gateway ?? ""
+        if !ethGw.isEmpty, ethGw != "-", ethGw == wifiGw {
+            snapshot.sameGateway = ethGw
+        }
+        // 链路协商速率。同网关时这往往是唯一还有意义的差异：
+        // 100M 的网线配 432M 的 Wi-Fi，「网速优先」挑 Wi-Fi 就是实实在在的提升。
+        //
+        // 只在同网关时才取，两个原因：
+        // 1) 这正是它唯一有意义的场合（不同网关时速率差会被"两条独立上游"覆盖）
+        // 2) system_profiler 一次要约 1.7 秒。每次都跑会让每次刷新都慢这么多，
+        //    而绝大多数网络根本不是同网关，白等。
+        if !snapshot.sameGateway.isEmpty {
+            let ethDev = interfaces.first(where: { $0.role == "以太网" && $0.active })?.device ?? ""
+            let wifiDev = interfaces.first(where: { $0.role == "Wi-Fi" && $0.active })?.device ?? ""
+            if !ethDev.isEmpty {
+                // getMedia 输出两行（Current: / Active:），要的是 Active 那行。
+                // 直接取整个输出会把 "Current: autoselect" 一起带进来。
+                let o = Shell.run("networksetup -getMedia \(ethDev) | awk -F': *' '/^Active:/{print $2; exit}'", timeout: 5).out
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !o.isEmpty { snapshot.linkSpeedEth = o }
+            }
+            if !wifiDev.isEmpty {
+                // Transmit Rate 是个裸数字（如 432），补上单位才有意义
+                let o = Shell.run("system_profiler SPAirPortDataType 2>/dev/null | awk -F': *' '/Transmit Rate/{print $2; exit}'", timeout: 8).out
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !o.isEmpty { snapshot.linkSpeedWifi = o + " Mbps" }
+            }
+        }
         snapshot.defaultReachable = gwReachable
         snapshot.ethOK = state["eth_ok"] ?? "-"
         snapshot.wifiOK = state["wifi_ok"] ?? "-"

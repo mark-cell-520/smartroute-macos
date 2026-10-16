@@ -337,6 +337,56 @@ doctorSrc.contains("speed=网速优先 / latency=延时优先")
     ? print("  OK 体检报告列全五个选路模式")
     : { failures += 1; print("  XX 模式说明漏了 speed/latency") }()
 
+print("== 13. 同网关：工具的招牌功能在此网络下无效，必须说清 ==")
+// 用户实测反馈："以太网卡主、WiFi 也不行、自动更换网络没用、双网并发也没效果"。
+// 根因：他的两个接口是同一 /24 网段、同一个网关（192.168.1.1），
+// 也就是同一台路由器出来的两个入口。此时：
+// · 路由器宕 = 两边一起宕，故障转移没有可切换的目标
+// · 双网并发没有第二条 WAN 可分
+// 而原来的同网关提示只在**双网并发页**出现，用户正在看的是状态页——
+// 结论没出现在他眼前，等于没说。
+checks += 1
+doctorSrc.contains("same_gateway")
+    ? print("  OK status 输出机器可读的 same_gateway")
+    : { failures += 1; print("  XX status 没有 same_gateway 输出") }()
+// 判定必须比两个接口各自的网关，不能拿"当前默认路由的网关"比（后者只有一个值，恒等）
+// 本测试可执行文件在项目根目录跑，但保险起见两个候选都试。
+// 之前读 ../smartroute.sh 就是这么栽的——四条断言一起假失败，
+// 而看起来像"代码没改"，最容易漏过去。
+func readSrc(_ rel: String) -> String {
+    for p in [rel, "../" + rel] {
+        if let d = FileManager.default.contents(atPath: p),
+           let t = String(data: d, encoding: .utf8), !t.isEmpty { return t }
+    }
+    return ""
+}
+let viewsSrc = readSrc("SmartRouteApp/NetworkModel.swift")
+checks += 1
+viewsSrc.contains("sameGateway") && viewsSrc.contains("ethGw == wifiGw")
+    ? print("  OK App 比较两个接口各自的网关")
+    : { failures += 1; print("  XX 同网关判定方式不对") }()
+// 状态页必须出现这个警告（用户实际看的那一页）
+let uiSrc = readSrc("SmartRouteApp/Views.swift")
+checks += 1
+uiSrc.contains("两个接口走同一台路由器，故障转移在此网络下无效")
+    ? print("  OK 状态页有同网关警告")
+    : { failures += 1; print("  XX 状态页没有同网关警告") }()
+// 必须给出唯一还有意义的动作，不能只宣布"没用"
+checks += 1
+uiSrc.contains("网速优先") && uiSrc.contains("挑更快的那条")
+    ? print("  OK 给出了同网关下仍有效的动作（网速优先）")
+    : { failures += 1; print("  XX 只宣布没用，没给出路") }()
+// 链路速率只在同网关时取（system_profiler 要约 1.7 秒，不能白等）
+checks += 1
+viewsSrc.contains("if !snapshot.sameGateway.isEmpty {") && viewsSrc.contains("linkSpeedEth")
+    ? print("  OK 链路速率只在同网关时取（省 1.7 秒）")
+    : { failures += 1; print("  XX 链路速率取值没有设条件") }()
+// getMedia 取的是 Active 行，不是整个输出（会带进 Current: autoselect）
+checks += 1
+viewsSrc.contains("/^Active:/")
+    ? print("  OK 链路速率取 Active 行（不混入 Current: autoselect）")
+    : { failures += 1; print("  XX 链路速率解析不对") }()
+
 print("")
 print("结果: \(checks - failures) 通过, \(failures) 失败")
 exit(failures == 0 ? 0 : 1)
