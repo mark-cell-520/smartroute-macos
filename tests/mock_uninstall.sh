@@ -272,3 +272,53 @@ if printf '%s\n' "$_uni_code" | grep -q '失败，可忽略'; then
 else
     ok "失败时给可照抄的手动命令，不说「可忽略」"
 fi
+
+echo "== 14. 默认路由：兜底钉上去的必须还原，且绝不能让用户断网 =="
+# do_switch 的兜底会 route delete default + route add default -interface，
+# 这样加出来的默认路由没有任何清理机制（EXIT trap 只清探测路由）。
+# 卸完它还留着，默认路由就停在 smartroute 最后切的接口上——
+# 用户只会觉得"卸载把网络搞坏了"。
+_uni_body="$(cat "$UNI")"
+printf '%s\n' "$_uni_body" | grep -q 'route delete default' \
+    && ok "卸载会删掉默认路由让系统重新裁决" || bad "不还原被钉住的默认路由"
+# 删之前必须先记下参数，否则加不回来
+printf '%s\n' "$_uni_body" | grep -q '_d_gw=' \
+    && ok "删之前记下网关参数（为了能加回来）" || bad "没记参数就删，加不回来"
+# configd 没动静时必须原样加回——这是安全底线
+printf '%s\n' "$_uni_body" | grep -q 'route_add_default "$_d_if" "$_d_gw"' \
+    && ok "系统没重建就原样加回（绝不让用户断网）" || bad "删了不加回，用户会断网"
+# 加不回来时要告诉用户怎么办，不能静默
+printf '%s\n' "$_uni_body" | grep -q '请手动开关一次 Wi-Fi 或重启 Mac' \
+    && ok "加不回来时给出恢复指引" || bad "加不回来时无声提示"
+
+echo "== 15. 通知必须说人话 =="
+# 开了通知的人收到"默认路由: en1 → en0"只会更困惑：en1 是什么？
+# 我被切去了哪里？所以所有通知都要过 dev_cn 映射。
+grep -q 'dev_cn()' "$SRC" && ok "smartroute.sh 有设备名人话映射" || bad "没有设备名映射"
+# 每条通知都不能把设备名原样漏出去
+_n=0
+while IFS= read -r _line; do
+    case "$_line" in
+        *notify*)
+            # 先把 $(dev_cn ...) 整段剥掉，剩下的若还有 $want/$cur 就是漏了映射。
+            # 直接 grep '$want' 会把 $(dev_cn "$want") 里的也算上——最早就是这么
+            # 写的，结果两条正确的通知被误判，白查一轮。
+            _stripped="$(printf '%s' "$_line" | sed 's#\$(dev_cn [^)]*)#<已映射>#g')"
+            if printf '%s' "$_stripped" | grep -q '\$want\|\$cur\|${cur'; then
+                bad "通知里出现裸设备名: $_line"; _n=$((_n+1))
+            fi
+            ;;
+    esac
+done < <(grep 'notify "' "$SRC")
+[ "$_n" -eq 0 ] && ok "所有通知都不漏裸设备名" || bad "$_n 条通知漏裸设备名"
+# dev_cn 要覆盖 en0/en1 和空值（首次切换时 cur 是空的）
+awk '/^dev_cn\(\)/,/^}/' "$SRC" | grep -q 'en0' && ok "映射覆盖 en0（以太网）" || bad "没映射 en0"
+awk '/^dev_cn\(\)/,/^}/' "$SRC" | grep -q 'en1' && ok "映射覆盖 en1（Wi-Fi）" || bad "没映射 en1"
+awk '/^dev_cn\(\)/,/^}/' "$SRC" | grep -q '""' && ok "映射覆盖空值（首次切换）" || bad "没映射空值，首次切换会显示空"
+# 自动打开 Wi-Fi 的通知必须说原因——用户在手动关掉 Wi-Fi 的场景下
+# 收到"已自动打开 Wi-Fi"格外不安，像软件在偷偷改他的设置
+grep -q '网线上不了网，已自动打开 Wi-Fi 保持联网' "$SRC" \
+    && ok "自动开 Wi-Fi 的通知说明了原因" || bad "自动开 Wi-Fi 没说原因"
+# 自动关双网并发也要说原因
+grep -q '有个接口上不了网，已自动关闭双网并发' "$SRC" \
+    && ok "自动关并发的通知说明了原因" || bad "自动关并发没说原因"

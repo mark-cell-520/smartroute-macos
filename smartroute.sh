@@ -334,6 +334,19 @@ as_escape() {   # $1=原文 -> stdout: 可安全放进 AppleScript 双引号串�
     printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
 }
 
+# 设备名 -> 人话。通知是给用户看的，而 "en0"/"en1" 对非技术用户毫无意义——
+# 开了通知的人收到"默认路由: en1 → en0"，只会更困惑：en1 是什么？
+# 我刚刚被切去了哪里？所以所有通知都要过这个函数。
+dev_cn() {
+    case "$1" in
+        en0) echo "以太网（有线）" ;;
+        en1) echo "Wi-Fi（无线）" ;;
+        en2|en3|en4|en5) echo "网卡 $1" ;;
+        "")  echo "无" ;;
+        *)   echo "$1" ;;
+    esac
+}
+
 notify() {   # $1=标题 $2=内容
     [ "$NOTIFY" = "1" ] || return 0
     command -v osascript >/dev/null 2>&1 || return 0
@@ -668,7 +681,7 @@ do_switch() {   # $1=目标设备 $2=原默认设备 $3=eth探测 $4=wifi探测 
             log "完成：服务顺序已调整，默认路由 -> $now"
             state_set last_switch "$(date +%s)"
             bump_switch_count
-            notify "smartroute 选路切换" "默认路由: ${cur:-无} → $want"
+            notify "SmartRoute 选路切换" "已从 $(dev_cn "${cur:-}") 切换到 $(dev_cn "$want")"
             return 0
         fi
         log "服务顺序已调整但默认路由仍为 ${now:-无}，尝试直接修改路由表"
@@ -684,7 +697,7 @@ do_switch() {   # $1=目标设备 $2=原默认设备 $3=eth探测 $4=wifi探测 
             log "完成：路由表已改为 default via $gw ($want)"
             state_set last_switch "$(date +%s)"
             bump_switch_count
-            notify "smartroute 选路切换" "默认路由: ${cur:-无} → $want"
+            notify "SmartRoute 选路切换" "已从 $(dev_cn "${cur:-}") 切换到 $(dev_cn "$want")"
         else
             log "失败：无法添加 default via $gw ($want)"
         fi
@@ -736,7 +749,8 @@ cmd_watch() {
         if [ "$eth_ok" -ne 1 ] || [ "$wifi_ok" -ne 1 ]; then
             log "并发分流安全阀: 以太网 ok=$eth_ok Wi-Fi ok=${wifi_ok}，自动关闭双网并发"
             balance_off quiet
-            notify "smartroute" "双网并发已自动关闭（接口状态变化）"
+            # 说明白为什么关——用户可能根本没开过这个开关，突然收到"已关闭"会很慌
+        notify "SmartRoute 双网并发" "有个接口上不了网，已自动关闭双网并发，改为单线路选路"
         elif ! pfctl -a "$PF_ANCHOR" -s rules 2>/dev/null | grep -q .; then
             # 规则丢失（系统重启后 pf 会恢复默认状态），尝试重新加载
             if [ -f "$PF_ANCHOR_FILE" ]; then
@@ -770,7 +784,9 @@ cmd_watch() {
        && [ "$(wifi_power "$ACTIVE_WIFI_DEV")" = "off" ]; then
         log "以太网无外网且 Wi-Fi 已关闭，自动打开 Wi-Fi ($ACTIVE_WIFI_DEV)"
         set_wifi_power "$ACTIVE_WIFI_DEV" on
-        notify "smartroute" "已自动打开 Wi-Fi"
+        # 补上原因。用户在手动关掉 Wi-Fi 的场景下收到"已自动打开 Wi-Fi" 格外不安，
+        # 像软件在偷偷改他的设置——说清是因为网线也没网了，才能安心。
+        notify "SmartRoute" "网线上不了网，已自动打开 Wi-Fi 保持联网"
     fi
 
     # 【Wi-Fi 自动故障转移】Wi-Fi 上不了网、以太网也没外网时，自动换个能上网的 Wi-Fi
@@ -1849,7 +1865,7 @@ balance_reevaluate() {
     pfctl -e 2>/dev/null
     pfctl -a "$PF_ANCHOR" -f "$PF_ANCHOR_FILE" 2>/dev/null || return 1
     state_set balance_winner "$want"
-    notify "smartroute" "已切换到更快的线路: ${want:-两条轮询}"
+    notify "SmartRoute 网速优先" "已切换到更快的线路：$(dev_cn "${want:-}")（两条线路轮流用）"
     return 0
 }
 

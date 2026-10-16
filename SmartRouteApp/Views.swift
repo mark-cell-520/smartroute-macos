@@ -784,8 +784,11 @@ struct RoutingView: View {
         "auto": "自动：两个接口谁有外网就走谁，以太网恢复外网后自动切回。",
         "ethernet": "强制有线：只要以太网有外网就走以太网（没有则保持现状）。",
         "wifi": "强制无线：只要 Wi-Fi 有外网就走 Wi-Fi，适合网线口是局域网/坏口的情况。",
-        "speed": "网速优先：两边都能上网时，实测下载吞吐大的赢。适合网线只协商到 100M、\nWi-Fi 更快的情况。差距不到 30% 判平手，继续用当前线路。",
-        "latency": "延时优先：两边都能上网时，实测延迟低的赢。适合游戏/视频会议等对延迟敏感的场景。"
+        // 名字造成的误解必须在这里拆掉。"网速优先"听起来像"让网变快"，
+        // 实际语义只是"哪个接口快就走哪个"——两条线都慢的时候它毫无办法，
+        // 用户却以为买了加速器。说明白，预期才对得上。
+        "speed": "网速优先：两边都能上网时，实测下载吞吐大的赢。适合网线只协商到 100M、\nWi-Fi 更快的情况。差距不到 30% 判平手，继续用当前线路。\n注意：这只是挑一条更快的线路，不会让你的宽带本身变快。",
+        "latency": "延时优先：两边都能上网时，实测延迟低的赢。适合游戏/视频会议等对延迟敏感的场景。\n注意：这只是挑一条延迟更低的线路，不会降低游戏或视频服务本身的延迟。"
     ]
 
     var body: some View {
@@ -1137,11 +1140,21 @@ struct DaemonView: View {
             }
 
             if !model.daemonMessage.isEmpty {
-                Section("输出") {
-                    Text(model.daemonMessage)
-                        .font(.system(.caption, design: .monospaced))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                // 输出分成两段：上面一句人话结论，原文折叠进"详情"。
+                // 以前把 install.sh 的终端原文（含 "sudo launchctl bootstrap ..."
+                // 这种命令）直接铺给纯 App 用户看——既读不懂又被吓到，
+                // 而他们真正想知道的只是"装好了吗"。
+                Section("结果") {
+                    Text(daemonResultSummary)
+                        .font(.callout)
+                        .foregroundStyle(daemonResultOK ? Theme.ok : Theme.bad)
+                    DisclosureGroup("详情（原始输出）") {
+                        Text(model.daemonMessage)
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .font(.caption)
                 }
             }
         }
@@ -1168,6 +1181,30 @@ struct DaemonView: View {
                  + "App 本体将保留（正在运行，删不掉自己）——卸完请自己拖进废纸篓。\n\n"
                  + "这个操作不可撤销，建议先导出配置。")
         }
+    }
+
+    /// 把 install.sh / uninstall.sh 的终端原文归纳成一句人话。
+    /// 纯 App 用户不需要看懂 launchctl，只需要知道"成没成"。
+    private var daemonResultSummary: String {
+        let msg = model.daemonMessage
+        if msg.contains("已取消授权") { return "已取消，什么都没有改动。" }
+        if msg.contains("守护进程没起来") || msg.contains("安装失败") {
+            return "安装失败：自动选路没有生效。展开「详情」看原因，照里面的命令手动做一遍即可。"
+        }
+        if msg.contains("卸载完成") { return "卸载完成。程序、配置、规则、路由、进程都已清干净。" }
+        if msg.contains("已暂停") { return "已暂停自动选路。重启 Mac 会恢复；想重启也不恢复，用 launchctl disable。" }
+        if msg.contains("已恢复自动选路") { return "已恢复自动选路，每 20 秒检测一次。" }
+        if msg.contains("已通过 bootstrap") || msg.contains("守护进程已加载并运行") {
+            return "守护进程已装好并在运行，每 20 秒自动检测一次。"
+        }
+        if msg.contains("失败") { return "操作失败，展开「详情」看原因。" }
+        return "操作完成。"
+    }
+
+    private var daemonResultOK: Bool {
+        let msg = model.daemonMessage
+        if msg.contains("已取消授权") { return true }
+        return !msg.contains("失败") && !msg.contains("守护进程没起来")
     }
 
     private func uninstallItem(_ text: String) -> some View {

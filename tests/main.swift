@@ -250,6 +250,54 @@ classify(300) == .stopped ? print("  OK 300 秒 → stopped（该告警了）") 
 checks += 1
 classify(99999) == .stopped ? print("  OK 很久没更新 → stopped") : { failures += 1; print("  XX 很久") }()
 
+print("== 11. 终端原文 → 一句人话（App 用户看不懂 launchctl）==")
+// install.sh / uninstall.sh 的原文含 "sudo launchctl bootstrap ..." 这种命令，
+// 直接铺给纯 App 用户既读不懂又被吓到。这里验归纳逻辑覆盖了每条真实路径。
+// 复刻 NetworkModel 的 daemonResultSummary（同一份规则，改规则时两边都要改）。
+func summarize(_ msg: String) -> String {
+    if msg.contains("已取消授权") { return "已取消，什么都没有改动。" }
+    if msg.contains("守护进程没起来") || msg.contains("安装失败") {
+        return "安装失败：自动选路没有生效。展开「详情」看原因，照里面的命令手动做一遍即可。"
+    }
+    if msg.contains("卸载完成") { return "卸载完成。程序、配置、规则、路由、进程都已清干净。" }
+    if msg.contains("已暂停") { return "已暂停自动选路。重启 Mac 会恢复；想重启也不恢复，用 launchctl disable。" }
+    if msg.contains("已恢复自动选路") { return "已恢复自动选路，每 20 秒检测一次。" }
+    if msg.contains("已通过 bootstrap") || msg.contains("守护进程已加载并运行") {
+        return "守护进程已装好并在运行，每 20 秒自动检测一次。"
+    }
+    if msg.contains("失败") { return "操作失败，展开「详情」看原因。" }
+    return "操作完成。"
+}
+checks += 1
+summarize("已取消授权，什么都没有改动。").contains("已取消")
+    ? print("  OK 取消授权说清「什么都没动」") : { failures += 1; print("  XX 取消") }()
+checks += 1
+summarize("✗ 守护进程没起来——自动选路不会工作。\nsudo launchctl bootstrap ...").contains("安装失败")
+    ? print("  OK 守护进程起不来 → 说失败并指向详情") : { failures += 1; print("  XX 起不来") }()
+checks += 1
+summarize("==> 安装 smartroute 到 /usr/local/bin\n✓ 已通过 bootstrap 注册").contains("已装好并在运行")
+    ? print("  OK 安装成功 → 说人话，不提 launchctl") : { failures += 1; print("  XX 成功") }()
+checks += 1
+summarize("卸载完成。接下来：\n1. ...").contains("卸载完成")
+    ? print("  OK 卸载完成") : { failures += 1; print("  XX 卸载") }()
+checks += 1
+summarize("已暂停自动选路").contains("重启 Mac 会恢复")
+    ? print("  OK 暂停时说明是临时的") : { failures += 1; print("  XX 暂停") }()
+checks += 1
+summarize("已恢复自动选路").contains("已恢复")
+    ? print("  OK 恢复") : { failures += 1; print("  XX 恢复") }()
+checks += 1
+// 顺序很重要："失败" 要排在 bootstrap 之后，否则安装成功但含 warn 的
+// 输出会被误判成失败。
+summarize("! 没找到 wifiscan 可执行文件\n✓ 已通过 bootstrap 注册\n安装完成").contains("已装好并在运行")
+    ? print("  OK 有 warn 但安装成功 → 不算失败")
+    : { failures += 1; print("  XX warn 被误判成失败") }()
+// 摘要里不能出现裸命令，那正是要避免的东西
+checks += 1
+!summarize("✗ 守护进程没起来\nsudo launchctl bootstrap system /Library/...").contains("sudo")
+    ? print("  OK 摘要里不含 sudo 命令（原文在详情里）")
+    : { failures += 1; print("  XX 摘要漏出命令") }()
+
 print("")
 print("结果: \(checks - failures) 通过, \(failures) 失败")
 exit(failures == 0 ? 0 : 1)

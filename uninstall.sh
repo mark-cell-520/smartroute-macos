@@ -110,6 +110,45 @@ else
     skip "没有服务顺序备份（smartroute 没改过，或已被清掉）"
 fi
 
+# ---------- 0.6 还原被钉住的默认路由 ----------
+# do_switch 的兜底路径会 `route delete default` + `route add default -interface`，
+# 这样加出来的默认路由**没有任何清理机制**（守护进程的 EXIT trap 只清探测路由）。
+# 卸完它还留着，默认路由就停在 smartroute 最后切过去的那个接口上——
+# 用户不知道原因，只会觉得"卸载把网络搞坏了"。
+#
+# 处理原则：**绝不能让用户断网**。所以先记下当前默认路由的完整参数，
+# 删掉它让 configd 按（已还原的）服务顺序重新裁决；等两秒，
+# 如果 configd 没把它加回来，就原样加回去。
+if [ "$DRY" = "1" ]; then
+    printf '    %s·%s 若默认路由是被直接钉上去的，会删掉让系统重新裁决\n' "$C_0" "$C_0"
+elif [ -n "$(route -n get default 2>/dev/null | awk '/^ *interface:/{print $2; exit}')" ]; then
+    _d_gw="$(route -n get default 2>/dev/null | awk '/^ *gateway:/{print $2; exit}')"
+    _d_if="$(route -n get default 2>/dev/null | awk '/^ *interface:/{print $2; exit}')"
+    if route delete default >/dev/null 2>&1; then
+        ok "已删掉默认路由（让系统按服务顺序重新裁决）"
+        # 给 configd 一点时间。它通常立刻就会按首选服务加回来。
+        _back=0
+        for _i in 1 2 3 4 5 6 7 8 9 10; do
+            sleep 0.2
+            if [ -n "$(route -n get default 2>/dev/null | awk '/^ *interface:/{print $2; exit}')" ]; then
+                _back=1; break
+            fi
+        done
+        if [ "$_back" = "1" ]; then
+            ok "系统已自动重建默认路由（interface=$(route -n get default 2>/dev/null | awk '/^ *interface:/{print $2; exit}')）"
+        elif [ -n "$_d_gw" ] && route_add_default "$_d_if" "$_d_gw"; then
+            # configd 没动静：原样加回去，绝不把用户留在没有默认路由的状态
+            warn "系统未自动重建，已按原参数加回（interface=${_d_if} gateway=${_d_gw}）"
+        else
+            warn "默认路由未能自动重建——请手动开关一次 Wi-Fi 或重启 Mac"
+        fi
+    else
+        skip "默认路由删不掉（可能本就不是我们加的）"
+    fi
+else
+    skip "没有默认路由"
+fi
+
 # ---------- 1. pf 分流规则 ----------
 say "清理 pf 分流规则"
 ANCHOR="com.apple/smartroute"
@@ -163,7 +202,23 @@ if [ "$DRY" = "0" ]; then
     fi
     [ "$n2" -gt 0 ] && ok "删了 $n2 条分流网段路由" || skip "没有分流网段路由"
 else
-    printf '    %s·%s 将删除探测 -host 路由和分流 -net 路由（若存在）\n' "$C_0" "$C_0"
+    printf '    %s·%s 将删除探测 -host 路由（按你配置的 PROBE_TARGETS）和分流 -net 路由\n' "$C_0" "$C_0"
+    # dry-run 的意义就是"让我看清会动什么"。原来只给一句通用描述，
+    # 用户最关心的"到底删我哪几条路由"答不出来。
+    if [ -f /Users/Shared/smartroute.rules ]; then
+        while read -r _c _d _rest; do
+            case "$_c" in ""|\#*) continue ;; esac
+            [ -n "$_d" ] && printf '    %s·%s 网段路由 %s via %s\n' "$C_0" "$C_0" "$_c" "$_d"
+        done < /Users/Shared/smartroute.rules
+    fi
+    # 两条最容易踩的预期差，dry-run 时就说清楚
+    printf '    %s·%s 服务顺序会按备份还原（若从未改过则无备份可还原）\n' "$C_0" "$C_0"
+    if [ "$KEEP_LOGS" = "1" ]; then
+        printf '    %s·%s 日志将保留\n' "$C_0" "$C_0"
+    else
+        printf '    %s·%s 日志默认删除——想留着排查加 --keep-logs\n' "$C_0" "$C_0"
+    fi
+    printf '    %s·%s 导入前的配置备份 .conf.bak 会保留，不删\n' "$C_0" "$C_0"
 fi
 
 # ---------- 3. 程序与配置 ----------
@@ -228,7 +283,16 @@ elif [ -d "$APP" ]; then
     if [ "$DRY" = "1" ]; then
         printf '    %s·%s 将删除 %s\n' "$C_0" "$C_0" "$APP"
     elif [ "$YES" = "1" ]; then
+        # --yes 是一把梭，用户不会逐行看输出。删完给一句回执，
+        # 把"我刚删了什么、什么被留下来了"说清——否则他以为日志也留着了。
         rm -rf "$APP" && ok "已删除 $APP" || warn "删除 App 失败"
+        if [ "$KEEP_LOGS" = "1" ]; then
+            printf '    %s·%s 日志已按 --keep-logs 保留在 /var/log/smartroute.*\n' "$C_0" "$C_0"
+        else
+            printf '    %s·%s 日志已删除（下次想保留加 --keep-logs）\n' "$C_0" "$C_0"
+        fi
+        [ -f /Users/Shared/smartroute.conf.bak ] && \
+            printf '    %s·%s 配置备份仍在：/Users/Shared/smartroute.conf.bak\n' "$C_0" "$C_0"
     else
         printf '    删除 %s ？[y/N] ' "$APP"
         read -r ans
