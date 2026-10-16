@@ -62,7 +62,7 @@ sudo smartroute status          # 当前状态：各接口 IP/网关、默认路
 sudo smartroute test -v         # 手动探测两个接口（-v 显示 ping/TCP/TLS 分层明细）
 sudo smartroute doctor          # 一键体检：定位"为什么上不了网"
 sudo smartroute config          # 查看当前生效配置
-sudo smartroute watch           # 手动执行一次检测/切换
+sudo smartroute watch           # 手动执行一次检测/切换（once / run 是同义别名）
 sudo smartroute set wifi        # 强制走 Wi-Fi（auto / ethernet / wifi / speed / latency）
 smartroute log 100              # 查看最近 100 行日志
 sudo smartroute report > r.txt  # 一键诊断报告（贴给别人排查用）

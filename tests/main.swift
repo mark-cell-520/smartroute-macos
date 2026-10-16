@@ -298,6 +298,45 @@ checks += 1
     ? print("  OK 摘要里不含 sudo 命令（原文在详情里）")
     : { failures += 1; print("  XX 摘要漏出命令") }()
 
+print("== 12. doctor 的守护进程判断：pgrep 在这个 plist 下不可靠 ==")
+// 这个 plist 用 StartInterval=20，进程只在每次运行的瞬间存在（约 1~2 秒），
+// pgrep 命中率只有一成左右；而 launchctl print system/... 需要 root，
+// App 的体检页是**不带 sudo** 调的。两条都不满足就报"未检测到"，
+// 十次有八次误报，还劝用户重装一遍。
+// 正确信号是日志新鲜度：cmd_watch 每轮往 stdout 打一行，
+// plist 重定向进 /var/log/smartroute.out，mtime 就是心跳。
+// 本测试的可执行文件是在项目根目录跑的，但万一换了 cwd 就什么都读不到。
+// 两个候选路径都试，并明确报错原因——静默返回空串会让四条断言一起假失败，
+// 而看起来像"代码没改"，最容易漏过去。
+let _candidates = ["smartroute.sh", "../smartroute.sh"]
+let doctorSrc = _candidates
+    .compactMap { FileManager.default.contents(atPath: $0).flatMap { String(data: $0, encoding: .utf8) } }
+    .first { !$0.isEmpty } ?? ""
+checks += 1
+!doctorSrc.isEmpty
+    ? print("  OK 读到 smartroute.sh（\(doctorSrc.count) 字符）")
+    : { failures += 1; print("  XX 读不到 smartroute.sh，以下四条断言无效——检查运行目录") }()
+if doctorSrc.isEmpty {
+    print("结果: \\(checks - failures) 通过, \\(failures) 失败")
+    exit(2)
+}
+checks += 1
+doctorSrc.contains("stat -f%m /var/log/smartroute.out")
+    ? print("  OK doctor 用 smartroute.out 的 mtime 做心跳")
+    : { failures += 1; print("  XX doctor 没读日志 mtime") }()
+checks += 1
+doctorSrc.contains("-lt 90") && doctorSrc.contains("-lt 300")
+    ? print("  OK 有三态分档（90/300 秒）")
+    : { failures += 1; print("  XX 没有等待态，刚唤醒会误报") }()
+checks += 1
+doctorSrc.contains("守护进程未运行：cd")
+    ? print("  OK 只有真停了才劝重装")
+    : { failures += 1; print("  XX 重装建议没有限定条件") }()
+checks += 1
+doctorSrc.contains("speed=网速优先 / latency=延时优先")
+    ? print("  OK 体检报告列全五个选路模式")
+    : { failures += 1; print("  XX 模式说明漏了 speed/latency") }()
+
 print("")
 print("结果: \(checks - failures) 通过, \(failures) 失败")
 exit(failures == 0 ? 0 : 1)

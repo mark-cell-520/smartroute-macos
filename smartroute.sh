@@ -1218,18 +1218,56 @@ cmd_doctor() {
         echo "    ${C_WARN}⚠️  以太网服务“${ACTIVE_ETH_SVC}”被禁用，插网线也不会生效${C_RST}"
         advice+=("以太网服务被禁用：系统设置→网络 里启用“${ACTIVE_ETH_SVC}”（确认要用有线时）")
     fi
-    echo "    选路模式: ${MODE}（auto=谁有外网走谁 / ethernet=强制有线 / wifi=强制无线）"
+    # 五个模式都要列。原来只写三个，用户选了"网速优先"后看体检报告，
+    # 会以为自己的设置没生效——又是"界面说的和实际不一样"。
+    echo "    选路模式: ${MODE}（auto=谁有外网走谁 / ethernet=强制有线 / wifi=强制无线 / speed=网速优先 / latency=延时优先）"
 
     echo
     echo "[7] smartroute 运行状态"
     echo "    eth_ok=$(state_get eth_ok) wifi_ok=$(state_get wifi_ok) streak_eth=$(state_get streak_eth) streak_wifi=$(state_get streak_wifi)"
     echo "    最近切换: $(human_ts "$(state_get last_switch)")，累计 $(state_get switch_count) 次"
-    if pgrep -f 'smartroute watch' >/dev/null 2>&1 || launchctl print system/com.user.smartroute >/dev/null 2>&1; then
-        echo "    守护进程: 运行中 ${C_OK}✓${C_RST}"
-    else
-        echo "    守护进程: ${C_WARN}未检测到（未安装或已停止）${C_RST}"
-        advice+=("守护进程未运行：cd ~/Pictures/smartroute && sudo bash install.sh")
+    # 判断守护进程活着，不能只看 pgrep。这个 plist 用的是 StartInterval=20，
+    # 进程只在每次运行的瞬间存在（约 1~2 秒），pgrep 命中率只有一成左右。
+    # 而 launchctl print system/... 要 root——App 里的体检页是**不带 sudo** 调的，
+    # 终端里也常有人忘了加 sudo。两条都不满足就报"未检测到"，
+    # 于是十次有八次误报，还劝人家重装一遍。
+    #
+    # 改用日志新鲜度：cmd_watch 每轮结束都往 stdout 打一行，plist 把它重定向到
+    # /var/log/smartroute.out，所以这个文件的 mtime 就是守护进程的心跳，
+    # 而且普通用户就能 stat 到。pgrep 降级为佐证，launchctl print 仅在有 root 时兜底。
+    local dstate="stopped" dage="?"
+    if [ -f /var/log/smartroute.out ]; then
+        local now mt
+        now="$(date +%s)"
+        mt="$(stat -f%m /var/log/smartroute.out 2>/dev/null || echo 0)"
+        dage=$(( now - mt ))
+        if [ "$dage" -lt 90 ]; then
+            dstate="running"
+        elif [ "$dage" -lt 300 ]; then
+            dstate="waiting"
+        fi
     fi
+    if [ "$dstate" = "stopped" ] && pgrep -f 'smartroute watch' >/dev/null 2>&1; then
+        dstate="running"; dage="<1"
+    fi
+    if [ "$dstate" = "stopped" ] && [ "$(id -u)" -eq 0 ] \
+       && launchctl print system/com.user.smartroute >/dev/null 2>&1; then
+        dstate="running"; dage="?"
+    fi
+    case "$dstate" in
+        running)
+            echo "    守护进程: 运行中 ${C_OK}✓${C_RST}（心跳 ${dage} 秒前）"
+            ;;
+        waiting)
+            # 刚唤醒或刚装完时日志会短暂过期。说清是在等，别让人以为坏了——
+            # 误报的代价是有人会去重装一遍。
+            echo "    守护进程: ${C_WARN}可能刚唤醒或刚安装，等待下一次检测（上次心跳 ${dage} 秒前）${C_RST}"
+            ;;
+        stopped)
+            echo "    守护进程: ${C_ERR}未检测到（未安装或已停止）${C_RST}（上次心跳 ${dage} 秒前）"
+            advice+=("守护进程未运行：cd ~/Pictures/smartroute && sudo bash install.sh")
+            ;;
+    esac
 
     echo
     if [ "${#advice[@]}" -gt 0 ]; then
