@@ -19,6 +19,9 @@ echo "=== 1. 卸载脚本覆盖所有持久化路径 ==="
 # smartroute.sh 里会写入的持久化位置（排除纯读取的 /etc/pf.conf 和临时文件）
 PATHS=(
     "/usr/local/bin/smartroute"
+    # 曾经漏过这个：install.sh 会装免权限扫描 helper，卸载清单里没有，
+    # 用户卸完软件还留一个 /usr/local/bin/smartroute-wifiscan 在系统里。
+    "/usr/local/bin/smartroute-wifiscan"
     "/etc/smartroute.conf"
     "/Users/Shared/smartroute.conf"
     "/Users/Shared/smartroute.rules"
@@ -129,6 +132,22 @@ if [ "$(id -u)" -ne 0 ]; then
 else
     echo "  - 当前是 root，跳过该项"
 fi
+
+echo
+echo "=== 9. install.sh 装的文件，uninstall.sh 必须都删（防再漏） ==="
+# 上面那份 PATHS 是手写的，会漏。这里改成从 install.sh 里把实际安装的
+# 文件路径抠出来，逐个要求卸载脚本覆盖——加新文件时忘了删就会红。
+# 两种写法都要认：install -m 0755 src dst  和  cp src dst
+inst_list="$(grep -oE '(install|cp)[[:space:]]+[^|]*[[:space:]]+/[A-Za-z0-9/._-]+$' install.sh \
+            | grep -oE '/[A-Za-z0-9/._-]+$' | sort -u)"
+# App  bundle 由用户自己拖废纸篓，不属于这里管
+inst_list="$(printf '%s\n' "$inst_list" | grep -v 'SmartRoute.app')"
+n_inst=0
+for f in $inst_list; do
+    n_inst=$((n_inst+1))
+    covered "$f" && ok "install 的 $f 卸载时会清掉" || bad "install 装了 $f 但 uninstall 不清它"
+done
+[ "$n_inst" -ge 3 ] && ok "从 install.sh 识别出 $n_inst 个安装目标" || bad "只识别出 $n_inst 个，抠路径的正则可能失效了"
 
 echo
 echo "结果: $PASS 通过, $FAIL 失败"

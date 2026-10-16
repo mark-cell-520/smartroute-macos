@@ -85,6 +85,27 @@ else
 fi
 printf '%s' "$DOC" | grep -q "建议：" && ok "有建议区" || bad "没有建议区"
 
+echo "=== 12. smartroute log：行数参数的两种写法都要能用 ==="
+# 出过真 bug：cmd_log 只认 `log 40`，而 `log --lines 40` 会把 "--lines"
+# 当行数传给 tail，报 "tail: illegal offset -- --lines"。
+# 人看 --lines 更自然，很容易踩到；App 当初也因此改成自己直接 tail。
+_l() { bash smartroute.sh log "$@" 2>&1; }
+_n() { bash smartroute.sh log "$@" 2>/dev/null | wc -l | tr -d ' '; }
+_l | grep -q "illegal offset" && bad "默认调用报 tail 错误" || ok "默认调用正常"
+[ "$(_n)" = "50" ] && ok "默认 50 行" || bad "默认得到 $(_n) 行"
+[ "$(_n 5)" = "5" ] && ok "log 5 取 5 行" || bad "log 5 得到 $(_n 5) 行"
+[ "$(_n --lines 5)" = "5" ] && ok "log --lines 5 取 5 行" || bad "--lines 5 得到 $(_n --lines 5) 行"
+[ "$(_n -n 5)" = "5" ] && ok "log -n 5 也认" || bad "-n 5 得到 $(_n -n 5) 行"
+# 垃圾/越界值要回落默认值，而不是把 "--lines"、"abc"、"0" 传给 tail
+for bad_arg in "--lines" "abc" "0" "-3"; do
+    if _l "$bad_arg" | grep -qE "illegal offset|用法"; then
+        bad "log $bad_arg 报错（应回落默认值）"
+    else
+        ok "log $bad_arg 安全回落（$(_n "$bad_arg") 行）"
+    fi
+done
+bash smartroute.sh --help 2>&1 | grep -q "log \[N\]" && ok "--help 说明两种写法" || bad "--help 未说明"
+
 echo
 echo "结果: $PASS 通过, $FAIL 失败"
 [ "$FAIL" -eq 0 ]

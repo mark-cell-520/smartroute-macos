@@ -100,6 +100,7 @@ fi
 # ---------- 3. 程序与配置 ----------
 say "删除程序与配置"
 run "命令行工具 /usr/local/bin/smartroute"       rm -f /usr/local/bin/smartroute
+run "免权限扫描 helper /usr/local/bin/smartroute-wifiscan" rm -f /usr/local/bin/smartroute-wifiscan
 run "守护进程 plist"                             rm -f /Library/LaunchDaemons/com.user.smartroute.plist
 run "系统配置 /etc/smartroute.conf"              rm -f /etc/smartroute.conf
 run "用户配置 /Users/Shared/smartroute.conf"     rm -f /Users/Shared/smartroute.conf

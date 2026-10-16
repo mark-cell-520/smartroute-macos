@@ -101,7 +101,7 @@ usage() {
   doctor       一键体检：定位“为什么上不了网”（网关/DNS/HTTPS/门户/网段冲突）
   set          设置选路模式: auto | ethernet | wifi；也可 set KEY=VALUE（如 NOTIFY=1，普通用户可写用户级配置）
   config       显示当前生效配置（含两个配置文件内容）
-  log          查看最近日志（默认 50 行）
+  log [N]      查看最近日志（log 40 或 log --lines 40，默认 50 行）
 
 双网并发 / 分流:
   balance on [round-robin|fastest]
@@ -934,7 +934,15 @@ conf_set_auto() {   # $1=KEY $2=VALUE
 }
 
 cmd_log() {
+    # 两种写法都认：log 40  和  log --lines 40。
+    # 以前只认第一种，于是 `log --lines 40` 会把 "--lines" 当行数传给 tail，
+    # 报 "tail: illegal offset"——而人看 --lines 更自然，很容易踩到。
     local n="${1:-50}"
+    case "$n" in
+        --lines|-n) n="${2:-50}" ;;
+        ''|*[!0-9]*) n=50 ;;     # 其它非数字一律回落默认值，别把垃圾传给 tail
+    esac
+    [ "$n" -ge 1 ] 2>/dev/null || n=50
     if [ -f "$LOG_FILE" ]; then
         tail -n "$n" "$LOG_FILE"
     else
@@ -1478,12 +1486,21 @@ balance_on() {
         die "检测到全流量 VPN（默认路由或 0/1+128/1 由 VPN 持有），无法安全分流，请先断开 VPN"
     fi
 
-    # 模式: balance on [round-robin|fastest]
-    local mode="${1:-$BALANCE_MODE}"
+    # 模式: balance on [round-robin|fastest] [--force]
+    # --force 要先从参数里摘掉，再解析模式。否则 mode 会变成 "--force"，
+    # 落到下面的 *) 直接报"用法"错误——同网关时想强行验证 pf 规则根本用不了。
+    local mode="" a
+    for a in "$@"; do
+        case "$a" in
+            --force|-f) ;;                       # 摘掉，后面单独判断
+            *) [ -n "$mode" ] || mode="$a" ;;
+        esac
+    done
+    mode="${mode:-$BALANCE_MODE}"
     case "$mode" in
         round-robin|rr|轮询) mode="round-robin" ;;
         fastest|fast|最快)   mode="fastest" ;;
-        *) die "用法: smartroute balance on [round-robin|fastest]" ;;
+        *) die "用法: smartroute balance on [round-robin|fastest] [--force]" ;;
     esac
 
     find_active
@@ -1500,8 +1517,10 @@ balance_on() {
     #   · 反而更慢：一半的连接被赶到更慢的那个接口（本机 100M 有线 vs Wi-Fi）
     #   · 还可能引入非对称路由的问题
     # 所以默认拒绝。确实想试（比如验证 pf 规则）可以用 --force。
-    local force=0
-    case "${1:-}" in --force|-f) force=1 ;; esac
+    local force=0 a2
+    for a2 in "$@"; do
+        case "$a2" in --force|-f) force=1 ;; esac
+    done
     if [ "$eth_gw" = "$wifi_gw" ] && [ "$force" != "1" ]; then   # 与 eth_wifi_same_gateway 同一判据
         cat >&2 <<MSG
 两个接口的网关相同（都是 $eth_gw），它们经同一台路由器上网——
@@ -2002,10 +2021,15 @@ wifi_nearby() { wifi_scan "$(wifi_saved_list | tr '\n' ' ')" "${1:-0}"; }
 # 也不能用"进程内变量缓存"偷懒——调用方都是 $(...) 子 shell，
 # 子 shell 里的赋值传不回父 shell，缓存永远命中不了。
 wifi_current_all() {
-    local out rssi ch rate noise bin
+    local out rssi ch rate noise bin fast=0
     # 快路径：CoreWLAN helper。system_profiler 一次要约 1.6 秒，而 App 每 5 秒
     # 轮询一次、status 也要用；helper 首次约 0.3 秒、之后命中缓存只要 0.01 秒。
-    # helper 不在（没装/没构建）就回退 system_profiler——功能不变，只是慢。
+    # helper 不在（没装/没构建）、或输出不合格，就回退 system_profiler——
+    # 功能不变，只是慢。
+    #
+    # 注意这里用 fast 标志而不是直接 return：校验不过时必须"继续往下走"去
+    # 用 system_profiler，而不是 return 1。曾经写成 return 1，结果 Wi-Fi
+    # 没连上时（rssi=0）整个函数直接返回失败，连兜底都不走了。
     bin="$(wifi_scan_bin)"
     if [ -n "$bin" ]; then
         out="$("$bin" --current 2>/dev/null)"
@@ -2014,9 +2038,19 @@ wifi_current_all() {
             IFS="$(printf '\t')" read -r rssi ch rate noise <<EOF2
 $out
 EOF2
-            [ -n "$rssi" ] && [ "$rssi" != "0" ] || return 1
-            printf '%s %s %s %s\n' "$rssi" "${ch:-0}" "${rate:-0}" "${noise:-0}"
-            return 0
+            # 校验：必须是数字，否则当没读到，回退 system_profiler。
+            # 不校验的话 helper 一旦输出异常（格式变动、partial write），
+            # 用户就会看到"信号 abc dBm（?/4 格）"这种垃圾，还以为程序坏了。
+            case "$rssi" in ''|*[!0-9-]*) rssi="" ;; esac
+            case "$ch"   in ''|*[!0-9-]*) ch="" ;; esac
+            case "$rate" in ''|*[!0-9-]*) rate="" ;; esac
+            case "$noise" in ''|*[!0-9-]*) noise="" ;; esac
+            # rssi=0 对 Wi-Fi 不可能，通常是没连上——同样回退
+            [ -n "$rssi" ] && [ "$rssi" != "0" ] && fast=1
+            if [ "$fast" = "1" ]; then
+                printf '%s %s %s %s\n' "$rssi" "${ch:-0}" "${rate:-0}" "${noise:-0}"
+                return 0
+            fi
         fi
     fi
     out="$(system_profiler SPAirPortDataType 2>/dev/null)"
