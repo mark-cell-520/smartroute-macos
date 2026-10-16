@@ -149,6 +149,36 @@ for f in $inst_list; do
 done
 [ "$n_inst" -ge 3 ] && ok "从 install.sh 识别出 $n_inst 个安装目标" || bad "只识别出 $n_inst 个，抠路径的正则可能失效了"
 
+echo "== 9. UTF-8 locale 下脚本必须能跑（bash 3.2 的 $VAR+中文陷阱） =="
+# 出过真 bug：bash 3.2 在 UTF-8 locale 下会把 $VAR 后面的多字节字符并进
+# 变量名（isalnum 对 >=0x80 的字节返回真），而 uninstall.sh 有 set -u，
+# 于是在删任何东西之前就 unbound variable 退出。
+# 本测试专门在 UTF-8 locale 下跑——现有测试全在 C locale 下跑，永远抓不到。
+for loc in en_US.UTF-8 zh_CN.UTF-8 C; do
+    out="$(LC_ALL=$loc bash uninstall.sh --bogus 2>&1)"; rc=$?
+    [ "$rc" -ne 0 ] && ok "locale=$loc 对非法参数返回非 0" || bad "locale=$loc 没报错"
+    printf '%s' "$out" | grep -q "unbound variable" && bad "locale=$loc 触发 unbound variable" || ok "locale=$loc 没有 unbound variable"
+    # 全角括号必须完整出现在输出里（被并进变量名时字符会消失）
+    printf '%s' "$out" | grep -q "（用 --help 看用法）" && ok "locale=$loc 全角括号完整输出" || bad "locale=$loc 全角括号被吃掉: $out"
+done
+# 静态检查：源码里不能有 $VAR 后紧跟多字节字符的写法
+n="$(python3 - <<'PYEOF2'
+import re
+bad = 0
+for fn in ["uninstall.sh", "install.sh", "smartroute.sh",
+           "build_release.sh", "build_app.sh", "build_dmg.sh", "sync-github.sh"]:
+    for i, line in enumerate(open(fn, encoding="utf-8").read().split("\n"), 1):
+        for m in re.finditer(r"\$[A-Za-z_][A-Za-z0-9_]*", line):
+            e = m.end()
+            if e < len(line) and ord(line[e]) > 0x2000 and line[e] not in " \t)}];,./=+*":
+                print("  %s:%d: %s" % (fn, i, line.strip()[:60]))
+                bad += 1
+                break
+print(bad)
+PYEOF2
+)"
+[ "$n" = "0" ] && ok "源码无 $VAR+中文 陷阱" || bad "源码还有 $n 处 $VAR+中文 陷阱"
+
 echo
 echo "结果: $PASS 通过, $FAIL 失败"
 [ "$FAIL" -eq 0 ]

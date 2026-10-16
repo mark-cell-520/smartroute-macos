@@ -41,7 +41,9 @@ echo "==> 编译 Swift 源码（SwiftUI + AppKit）"
 # 源码用 glob，不手写清单：手写过两份（本文件和 build_release.sh 各一份），
 # 两次新增 .swift 都只改了一处，另一处漏掉直接编译失败。glob 从根上消除这个问题。
 # make_icon.swift 排除掉——它是生成图标的独立命令行工具，自带 main，不能编进 App。
-SRCS="$(ls SmartRouteApp/*.swift | grep -v 'make_icon.swift' | tr '\n' ' ')"
+# 排除要按完整文件名匹配：grep -v 'make_icon.swift' 是子串匹配，
+# 以后加个 my_make_icon.swift 之类的会被误排除，而且很难查。
+SRCS="$(ls SmartRouteApp/*.swift | grep -v '/make_icon\.swift$' | tr '\n' ' ')"
 swiftc -O -swift-version 5 \
     -module-cache-path "$PWD/.build/module-cache" \
     -o "$APP/Contents/MacOS/SmartRoute" \

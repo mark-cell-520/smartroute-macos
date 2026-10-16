@@ -796,17 +796,34 @@ final class NetworkModel: ObservableObject {
         // 不防重入的话连点几下就堆积一堆探测进程
         guard beginOp("balance") else { return }
         DispatchQueue.global().async {
-            let (out, _) = Shell.run("'\(ScriptLocator.scriptPath)' balance status", timeout: 25)
+            // 退出码也要看：超时或 die 时 out 里没有 BALANCE=1，
+            // 会把 UI 置成"未开启"、按钮变成"开启"——假状态。
+            let (out, code) = Shell.run("'\(ScriptLocator.scriptPath)' balance status", timeout: 25)
+            let ok = (code == 0 && !out.isEmpty)
             DispatchQueue.main.async {
                 self.endOp("balance")
                 self.balanceStatusText = out
-                self.balanceOn = out.contains("BALANCE=1")
+                self.balanceOn = ok && out.contains("BALANCE=1")
                 // "两个接口网关相同（192.168.1.1）" -> 取出网关
                 self.balanceSameGateway = ""
                 for line in out.components(separatedBy: "\n") {
                     if line.contains("两个接口网关相同") {
                         let t = line.replacingOccurrences(of: "两个接口网关相同", with: "")
-                        if let l = t.firstIndex(of: "("), let r = t.firstIndex(of: ")") {
+                        // 脚本输出用的是**全角括号**（U+FF08/U+FF09）。
+                        // 原来找半角 "(" ")"，firstIndex 恒为 nil，
+                        // 于是 balanceSameGateway 永远是空——
+                        // 「同网关无收益」那条横幅 100% 不显示，
+                        // 而它是本项目认定"当前网络下开双网并发有害"的唯一拦阻。
+                        // 两种括号都认，免得脚本以后改成半角又失效。
+                        var l = t.firstIndex(of: "（")
+                        var r = t.firstIndex(of: "）")
+                        if l == nil || r == nil {
+                            l = t.firstIndex(of: "(")
+                            r = t.firstIndex(of: ")")
+                        }
+                        // l < r 必须成立：否则 t.index(after: l)..<r 会
+                        // 构造出 lowerBound > upperBound 的 Range，直接 trap。
+                        if let l, let r, l < r {
                             self.balanceSameGateway = String(t[t.index(after: l)..<r])
                         }
                         break
@@ -1015,7 +1032,11 @@ final class NetworkModel: ObservableObject {
                         if p[0] == "eth" { es = p[1] } else if p[0] == "wifi" { ws = p[1] }
                     }
                 } else if line.hasPrefix("latency:") {
-                    let p = line.dropFirst(9).components(separatedBy: "=")
+                    // 必须按前缀长度取，不能写死数字："latency:" 是 8 个字符，
+                    // 原来写死 9 把 e 也吃掉了，得到 "th=14.3 ms"，
+                    // p[0] 永远匹配不上 "eth"/"wifi"——实测延迟恒显示"未测"。
+                    // 写死数字这类错很容易再犯，所以用 "latency:".count。
+                    let p = line.dropFirst("latency:".count).components(separatedBy: "=")
                     if p.count == 2 {
                         if p[0] == "eth" { el = p[1] } else if p[0] == "wifi" { wl = p[1] }
                     }

@@ -35,13 +35,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         menu.addItem(withTitle: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
 
+        // target 只能设给**实现了该 action** 的对象。"退出"项的 action 是
+        // NSApplication.terminate:，而 AppDelegate 没有实现它——以前对全部条目
+        // 一律设 target = self，AppKit 发现 target 不响应 action 就把该条目
+        // 永久禁用（实测 enabled=false），用户只能走主菜单 ⌘Q 或 Dock 退出。
+        // "退出"保持 target = nil，action 会沿 responder chain 找到
+        // NSApplication.terminate:（系统默认就有）。
         for (index, menuItem) in menu.items.enumerated() {
-            menuItem.target = self
             switch index {
-            case 2: menuItem.tag = 0   // auto
-            case 3: menuItem.tag = 2   // wifi
-            case 4: menuItem.tag = 1   // ethernet
-            default: break
+            case 2: menuItem.tag = 0; menuItem.target = self   // auto
+            case 3: menuItem.tag = 2; menuItem.target = self   // wifi
+            case 4: menuItem.tag = 1; menuItem.target = self   // ethernet
+            default: break                                     // 含"退出"：不设 target
             }
         }
         balanceItem = menu.item(at: 6)
@@ -70,9 +75,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         DispatchQueue.global().async {
-            let (out, _) = Shell.run("'\(ScriptLocator.scriptPath)' balance status", timeout: 8)
-            let on = out.contains("BALANCE=1")
+            // 退出码必须看。balance status 超时（这里只给 8 秒，而它含两边
+            // 延迟实测）或中途 die 时，out 里不会有 "BALANCE=1"，
+            // 于是 on=false——然后下面拿这个未验证的状态取反去执行开关：
+            // 并发实际开着，用户想关，App 却去执行 balance on，
+            // 反复点毫无反应，pf 分流规则一直留着。
+            let (out, code) = Shell.run("'\(ScriptLocator.scriptPath)' balance status", timeout: 8)
+            let ok = (code == 0 && !out.isEmpty)
+            let on = ok && out.contains("BALANCE=1")
             DispatchQueue.main.async {
+                guard ok else {
+                    // 读不到状态就不要动——宁可提示重试，也不要凭猜做反向操作
+                    self.notify(title: "SmartRoute", body: "读不到双网并发状态，请重试")
+                    return
+                }
                 // 不在 @Sendable 闭包里捕获 model（非 Sendable 会告警）；
                 // 回到主线程后再从 shared 取，等价且干净
                 NetworkModel.shared?.setBalance(on: !on)
@@ -100,7 +116,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func notify(title: String, body: String) {
-        let escaped = body.replacingOccurrences(of: "\"", with: "\\\"")
+        // 必须先转义反斜杠再转义双引号——顺序反了会二次转义。
+        // 只转义 " 不够：AppleScript 只认 \n \t \r \" \\ 五种转义，
+        // 遇到 \d、\0 这类直接报 -2741 编译错误，而 error 参数没人检查，
+        // 结果就是通知静默不弹。body 来自脚本输出，含反斜杠很常见。
+        // （bash 侧 notify() 的同类问题已经修了，这里是对齐。）
+        let escaped = body
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
         var error: NSDictionary?
         NSAppleScript(source: "display notification \"\(escaped)\" with title \"\(title)\"")?.executeAndReturnError(&error)
     }

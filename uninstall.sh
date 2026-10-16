@@ -28,7 +28,7 @@ for a in "$@"; do
         --keep-logs) KEEP_LOGS=1 ;;
         --keep-app) KEEP_APP=1 ;;
         -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
-        *) echo "未知参数: $a（用 --help 看用法）" >&2; exit 1 ;;
+        *) echo "未知参数: ${a}（用 --help 看用法）" >&2; exit 1 ;;
     esac
 done
 
@@ -42,7 +42,7 @@ skip() { printf '    %s-%s %s（本来就没有）\n' "$C_0" "$C_0" "$*"; }
 run() {
     local desc="$1"; shift
     if [ "$DRY" = "1" ]; then printf '    %s·%s 将删除: %s\n' "$C_0" "$C_0" "$desc"; return 0; fi
-    if "$@" >/dev/null 2>&1; then ok "$desc"; else warn "$desc（失败，可忽略）"; fi
+    if "$@" >/dev/null 2>&1; then ok "$desc"; else warn "${desc}（失败，可忽略）"; fi
 }
 
 # 需要 root：pfctl/route/删系统文件都要
@@ -52,7 +52,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 echo
-say "SmartRoute 卸载（dry-run=$DRY 保留日志=$KEEP_LOGS 保留App=$KEEP_APP）"
+say "SmartRoute 卸载（dry-run=${DRY} 保留日志=${KEEP_LOGS} 保留App=${KEEP_APP}）"
 echo
 
 # ---------- 0. 先停守护进程（否则它会把规则/路由又写回来） ----------
@@ -123,7 +123,7 @@ fi
 say "App 本体"
 APP="/Applications/SmartRoute.app"
 if [ "$KEEP_APP" = "1" ]; then
-    warn "保留 $APP（可随时自己拖进废纸篓）"
+    warn "保留 ${APP}（可随时自己拖进废纸篓）"
 elif [ -d "$APP" ]; then
     if [ "$DRY" = "1" ]; then
         printf '    %s·%s 将删除 %s\n' "$C_0" "$C_0" "$APP"
@@ -134,7 +134,7 @@ elif [ -d "$APP" ]; then
         read -r ans
         case "$ans" in
             y|Y|yes) rm -rf "$APP" && ok "已删除 $APP" || warn "删除 App 失败" ;;
-            *) warn "保留 $APP（可随时自己拖进废纸篓）" ;;
+            *) warn "保留 ${APP}（可随时自己拖进废纸篓）" ;;
         esac
     fi
 else

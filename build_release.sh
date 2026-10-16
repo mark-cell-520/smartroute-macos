@@ -41,7 +41,9 @@ cp "$PWD/.build/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 # 曾经这里是手写清单，和 build_app.sh 各一份，两次新增 .swift 都只改了一处，
 # 另一处漏掉直接编译报 "cannot find 'X' in scope"。glob 从根上消除这个问题。
 # make_icon.swift 排除掉——它是生成图标的独立命令行工具，自带 main，不能编进 App。
-SRCS="$(ls SmartRouteApp/*.swift | grep -v 'make_icon.swift' | tr '\n' ' ')"
+# 排除要按完整文件名匹配：grep -v 'make_icon.swift' 是子串匹配，
+# 以后加个 my_make_icon.swift 之类的会被误排除，而且很难查。
+SRCS="$(ls SmartRouteApp/*.swift | grep -v '/make_icon\.swift$' | tr '\n' ' ')"
 
 echo "==> 编译 Apple Silicon 切片 (arm64, macOS $MIN_OS+)"
 swiftc -O -swift-version 5 -module-cache-path "$MC" \
@@ -58,10 +60,34 @@ lipo -create "$PWD/.build/arm64" "$PWD/.build/x86_64" -output "$APP/Contents/Mac
 lipo -info "$APP/Contents/MacOS/SmartRoute"
 
 # ---------- 3. 资源 ----------
-echo "==> 编译 Wi-Fi 扫描组件（免权限，按指定 SSID 扫）"
-swiftc -O -module-cache-path "$MC" tools/wifiscan.swift \
-    -o "$APP/Contents/MacOS/wifiscan" || {
-    echo "!! wifiscan 编译失败，附近网络扫描将不可用"; exit 1; }
+echo "==> 编译 Wi-Fi 扫描组件（免权限，按指定 SSID 扫，也要通用二进制）"
+# 必须编两架构再 lipo。以前只编主机架构：Apple Silicon 机器上产出的 helper 是
+# Non-fat arm64，Intel 用户一 exec 就是 "Bad CPU type"，
+# 而 wifi_scan_bin() 只查 -x 不查架构——于是 wifi scan 静默降级成
+# "附近没有已保存的网络在范围"，tryall/auto 的排序也跟着退化，
+# 用户完全看不出是架构问题。
+swiftc -O -module-cache-path "$MC" -target "arm64-apple-macosx$MIN_OS" \
+    tools/wifiscan.swift -o "$PWD/.build/wifiscan_arm64" || {
+    echo "!! wifiscan (arm64) 编译失败，附近网络扫描将不可用"; exit 1; }
+swiftc -O -module-cache-path "$MC" -target "x86_64-apple-macosx$MIN_OS" \
+    tools/wifiscan.swift -o "$PWD/.build/wifiscan_x86_64" || {
+    echo "!! wifiscan (x86_64) 编译失败，附近网络扫描将不可用"; exit 1; }
+lipo -create "$PWD/.build/wifiscan_arm64" "$PWD/.build/wifiscan_x86_64" \
+    -output "$APP/Contents/MacOS/wifiscan"
+lipo -info "$APP/Contents/MacOS/wifiscan"
+
+# 架构断言：主程序和 helper 都必须是通用二进制。少了这道断言，
+# 以后有人改回单架构编译，产物会静默退化（上面说的那种）。
+for bin in SmartRoute wifiscan; do
+    f="$APP/Contents/MacOS/$bin"
+    if ! lipo -info "$f" 2>/dev/null | grep -q "x86_64" || \
+       ! lipo -info "$f" 2>/dev/null | grep -q "arm64"; then
+        echo "!! $bin 不是通用二进制（缺 x86_64 或 arm64），拒绝打包"
+        lipo -info "$f" || true
+        exit 1
+    fi
+    echo "    $bin: $(lipo -info "$f" | sed 's/.*are: //')"
+done
 
 echo "==> 拷贝资源"
 cp smartroute.sh install.sh uninstall.sh com.user.smartroute.plist "$APP/Contents/Resources/"
@@ -114,8 +140,23 @@ PLIST
 
 # ---------- 5. 签名 ----------
 echo "==> ad-hoc 签名"
-codesign --force --deep --sign - "$APP" 2>&1 | head -3 || true
-codesign --verify --verbose "$APP" 2>&1 | head -3
+# 校验的退出码必须能传出来。`cmd 2>&1 | head -3` 的退出码是 head 的
+# （恒 0），于是签名失败、校验失败都静默通过，坏签名直接进 ZIP/DMG，
+# 用户侧表现为"已损坏"，而文档让人以为只是 Gatekeeper 的事。
+# 这里先存退出码再输出，head 只负责截断显示。
+codesign --force --deep --sign - "$APP" > "$PWD/.build/sign.log" 2>&1
+_sign_rc=$?
+head -3 "$PWD/sign.log" 2>/dev/null || head -3 "$PWD/.build/sign.log"
+[ "$_sign_rc" -eq 0 ] || { echo "!! 签名失败（退出码 $_sign_rc）"; exit 1; }
+
+codesign --verify --verbose "$APP" > "$PWD/.build/verify.log" 2>&1
+_verify_rc=$?
+head -3 "$PWD/.build/verify.log"
+[ "$_verify_rc" -eq 0 ] || {
+    echo "!! 签名校验失败（退出码 $_verify_rc），拒绝打包"
+    cat "$PWD/.build/verify.log"
+    exit 1
+}
 
 # ---------- 6. 打包 ----------
 STAGE="$DIST/SmartRoute"          # DMG 用：App + Applications 快捷方式 + 说明

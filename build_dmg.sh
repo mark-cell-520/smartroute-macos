@@ -62,6 +62,10 @@ if [ -f INSTALL.md ]; then cp INSTALL.md "$STAGE/安装说明.txt"; chmod 644 "$
 # 所以标准做法是两步：先建 UDRW 可写映像 → 挂载设置布局 → 再 convert 成 UDZO。
 say "创建可写映像（UDRW，约 10-30 秒）"
 RW="dist/.SmartRoute-${VERSION}-rw.$$.dmg"
+# 干净 clone 里没有 dist/（被 .gitignore 忽略），而 hdiutil create 不会建目录，
+# 直接报"create failed - 无此文件或目录"。脚本原来的提示是"若提示
+# Operation not permitted 请改用普通终端"——把缺目录误导向成权限问题，误导。
+mkdir -p dist
 rm -f "$RW"
 CREATE_LOG="$(mktemp)"
 if ! hdiutil create -volname "$VOL" -srcfolder "$STAGE" -fs HFS+ -format UDRW -ov -o "$RW" >"$CREATE_LOG" 2>&1; then
@@ -170,7 +174,7 @@ say "转换成压缩 DMG（UDZO）"
 CONVERT_LOG="$(mktemp)"
 if ! hdiutil convert "$RW" -format UDZO -ov -o "$DMG" >"$CONVERT_LOG" 2>&1; then
     echo "--- hdiutil 输出 ---" >&2; tail -5 "$CONVERT_LOG" >&2; rm -f "$CONVERT_LOG"
-    die "转换成 DMG 失败（可写映像仍在: $RW，可手动转换）"
+    die "转换成 DMG 失败（可写映像仍在: ${RW}，可手动转换）"
 fi
 rm -f "$CONVERT_LOG" "$RW"
 [ -s "$DMG" ] || die "转换后的 DMG 为空文件"
