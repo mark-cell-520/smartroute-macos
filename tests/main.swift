@@ -1,0 +1,165 @@
+import Foundation
+
+// Swift 纯解析函数的单测。为什么单独做：审计意见说"Swift NetworkModel 的解析
+// 函数没有任何自动化测试，唯一覆盖是 mock_wifi_parse（且只测脚本）"。
+// 这些函数是 App 显示一切数据的地基——解析错，界面就显示错，而界面是用户
+// 唯一能看到的东西。此前改 bug 全靠人眼点开 App 看。
+//
+// 编译方式见 tests/mock_swift_parse.sh：把生产源文件（去掉带 @main 的
+// SmartRouteApp.swift 和 make_icon.swift）连同本文件一起编成可执行文件。
+
+var failures = 0, checks = 0
+func eq(_ got: String, _ want: String, _ name: String) {
+    checks += 1
+    if got == want { print("  OK \(name)") }
+    else { failures += 1; print("  XX \(name): got [\(got)] want [\(want)]") }
+}
+func eqI(_ got: Int, _ want: Int, _ name: String) {
+    checks += 1
+    if got == want { print("  OK \(name)") }
+    else { failures += 1; print("  XX \(name): got \(got) want \(want)") }
+}
+func isTrue(_ cond: Bool, _ name: String) {
+    checks += 1
+    if cond { print("  OK \(name)") }
+    else { failures += 1; print("  XX \(name)") }
+}
+
+print("== 1. savedNetworks：一行一个 SSID ==")
+// --raw 输出：一行一个 SSID，不带序号
+eq(WifiParsing.savedNetworks("Home-5G\nOffice\n").joined(separator: "|"), "Home-5G|Office", "两个网络")
+eq(WifiParsing.savedNetworks("").joined(separator: "|"), "", "空输入")
+// 带序号的格式不能被剥错：SSID 本身可以叫 "1. CZ-305"，
+// 按 "数字. " 剥前缀会把真正的名字切掉。所以 --raw 不带序号，
+// 但万一收到带序号的也不该崩
+eq(WifiParsing.savedNetworks("1. CZ-305\n").joined(separator: "|"), "1. CZ-305", "序号开头的 SSID 不被误剥")
+// 空行要忽略，否则列表里出现空白项
+eq(WifiParsing.savedNetworks("A\n\nB\n").joined(separator: "|"), "A|B", "忽略空行")
+
+print("== 2. bars：RSSI → 格数 ==")
+// 分档必须和脚本的 wifi_bars 逐档对齐，否则同一个信号命令行显示 4 格、
+// App 里显示 3 格。真实分档：-59...-40→4 / -69...-60→3 / -79...-70→2 / 其余→1。
+// 每个边界都实测——区间方向写反（-40...(-59)）编译能过但一运行就 SIGTRAP。
+eqI(WifiParsing.bars(for: "-30"), 1, "-30（强于最高档）→ 1")
+eqI(WifiParsing.bars(for: "-39"), 1, "-39 刚出 4 格区 → 1")
+eqI(WifiParsing.bars(for: "-40"), 4, "-40 是 4 格区下界")
+eqI(WifiParsing.bars(for: "-50"), 4, "-50 → 4 格")
+eqI(WifiParsing.bars(for: "-59"), 4, "-59 是 4 格区上界")
+eqI(WifiParsing.bars(for: "-60"), 3, "-60 是 3 格区下界")
+eqI(WifiParsing.bars(for: "-69"), 3, "-69 是 3 格区上界")
+eqI(WifiParsing.bars(for: "-70"), 2, "-70 是 2 格区下界")
+eqI(WifiParsing.bars(for: "-79"), 2, "-79 是 2 格区上界")
+eqI(WifiParsing.bars(for: "-80"), 1, "-80 落进 default → 1")
+eqI(WifiParsing.bars(for: "-100"), 1, "-100 → 1（不是 0）")
+// 非数字不能崩，也不能给出错的格数
+eqI(WifiParsing.bars(for: ""), 0, "空串 → 0 格")
+eqI(WifiParsing.bars(for: "abc"), 0, "非数字 → 0 格")
+eqI(WifiParsing.bars(for: "n/a"), 0, "n/a → 0 格")
+
+print("== 3. currentSignal：解析当前连接 ==")
+// App 实际用的是 --raw 的 key=value 格式（system_profiler 一次约 1.7 秒，能少调一次就少调一次）
+let sig = WifiParsing.currentSignal("rssi=-67 channel=44 rate=432 noise=-97")
+isTrue(sig != nil, "能解析 key=value 格式")
+if let s = sig {
+    eq(s.rssi, "-67", "RSSI 值")
+    eq(s.channel, "44", "信道")
+    eqI(s.bars, 3, "-67 → 3 格")
+}
+// 人看的格式也要认（命令行输出粘过来时的场景）
+let human = WifiParsing.currentSignal("Wi-Fi en1  信号 -70 dBm（2/4 格）  信道 44")
+isTrue(human != nil, "能解析人类格式")
+if let h = human {
+    eq(h.rssi, "-70", "人类格式 RSSI")
+    eq(h.channel, "44", "人类格式信道")
+    eqI(h.bars, 2, "人类格式直接取括号里的格数（2）")
+}
+isTrue(WifiParsing.currentSignal("没有信号信息") == nil, "没有信号时返回 nil（不崩）")
+isTrue(WifiParsing.currentSignal("") == nil, "空输入返回 nil")
+
+print("== 4. nearbyNetworks：附近网络列表 ==")
+// 真实输出：先一行"在范围的..."标题，然后每行 "  SSID  -52 dBm（4/4 格）  信道 6"
+let scanText = """
+在范围的已保存网络（按信号排序，越靠前越好）：
+  CZ-305    -52 dBm（4/4 格）  信道 6
+  Office    -70 dBm（2/4 格）  信道 44
+
+确认不在范围的（旁边没有这些路由器，属正常）：
+  Ghost    -85 dBm（1/4 格）  信道 11
+"""
+let near = WifiParsing.nearbyNetworks(scanText)
+eqI(near.count, 2, "只取「在范围的」那一段（2 个）")
+if near.count == 2 {
+    eq(near[0].name, "CZ-305", "第一个名字")
+    eqI(near[0].rssi, -52, "第一个 RSSI")
+    eq(near[0].channel, "6", "第一个信道")
+    eqI(near[0].bars, 4, "直接取括号里的格数（4）")
+    eq(near[1].name, "Office", "第二个名字")
+    eqI(near[1].rssi, -70, "第二个 RSSI")
+}
+eqI(WifiParsing.nearbyNetworks("").count, 0, "空输入 → 空列表")
+// 没有"在范围的"标题时就该是空的——不能把整段输出都当成附近网络
+eqI(WifiParsing.nearbyNetworks("确认不在范围的：\n  Ghost  -85 dBm（1/4 格）  信道 11\n").count, 0,
+    "没有在范围标题时不解析（否则不在范围的也显示成能连）")
+// 名字取到第一个空白为止：SSID 带空格时只取第一段（已知限制，写在注释里）
+let spaced = WifiParsing.nearbyNetworks("在范围的：\n  A9 5G  -55 dBm（4/4 格）  信道 36\n")
+eqI(spaced.count, 1, "带空格 SSID 也能解析出一条")
+if spaced.count == 1 { eq(spaced[0].name, "A9", "带空格 SSID 只取第一个词（文档化的限制）") }
+
+print("== 5. scanUnknownCount：未能确认的数量 ==")
+// 脚本原文："有 $WIFI_SCAN_UNKNOWN 个没能确认（系统扫描有冷却，不是故障），重试即可。"
+// 注意是"没能确认"不是"未能确认"——这个词必须和脚本逐字对上，
+// 差一个字这个提示就永远不出现，用户以为全查过了。
+eqI(WifiParsing.scanUnknownCount("有 3 个没能确认（系统扫描有冷却，不是故障），重试即可。") ?? -1, 3, "解析出 3")
+eqI(WifiParsing.scanUnknownCount("有 0 个没能确认") ?? -1, 0, "0 也能解析（不是 nil）")
+isTrue(WifiParsing.scanUnknownCount("扫描完成") == nil, "没有该提示时返回 nil")
+isTrue(WifiParsing.scanUnknownCount("") == nil, "空输入返回 nil")
+
+print("== 6. capture：通用正则捕获 ==")
+eq(WifiParsing.capture("IP: 192.168.1.5", pattern: "IP: ([0-9.]+)") ?? "", "192.168.1.5", "捕获 IP")
+isTrue(WifiParsing.capture("没有匹配", pattern: "IP: ([0-9.]+)") == nil, "不匹配返回 nil")
+// 恶意/异常正则不能让 App 崩（NSRegularExpression 对坏 pattern 抛异常）
+isTrue(WifiParsing.capture("abc", pattern: "([") == nil, "坏正则不崩，返回 nil")
+
+print("== 7. sanitizeConf：导入配置的校验 ==")
+// 与 smartroute.sh 的 conf_value_ok 同源。导入是破坏性操作，
+// 非法行必须被丢掉并计数，不能假报"已导入并生效"。
+let (clean1, rej1) = NetworkModel.sanitizeConf("MODE=auto\nOK_N=2\n")
+isTrue(clean1.contains("MODE=auto"), "合法键保留")
+isTrue(clean1.contains("OK_N=2"), "数字键保留")
+eqI(rej1, 0, "没有非法行")
+
+let (clean2, rej2) = NetworkModel.sanitizeConf("MODE=banana\nOK_N=2\n")
+isTrue(!clean2.contains("banana"), "非法 MODE 值被拒")
+isTrue(clean2.contains("OK_N=2"), "同批的合法行仍保留")
+eqI(rej2, 1, "计 1 行被拒")
+
+let (clean3, rej3) = NetworkModel.sanitizeConf("BOGUS_KEY=1\nOK_N=3\n")
+isTrue(!clean3.contains("BOGUS_KEY"), "白名单外的键被拒")
+isTrue(clean3.contains("OK_N=3"), "合法行仍保留")
+eqI(rej3, 1, "陌生键计 1 行")
+
+// 布尔键只认 0/1
+let (_, rejBool) = NetworkModel.sanitizeConf("NOTIFY=yes\n")
+eqI(rejBool, 1, "NOTIFY=yes 被拒")
+isTrue(NetworkModel.sanitizeConf("NOTIFY=0\n").1 == 0, "NOTIFY=0 通过")
+
+// 数字键必须是非负整数
+let (_, rejNeg) = NetworkModel.sanitizeConf("OK_N=-1\n")
+eqI(rejNeg, 1, "负数被拒")
+isTrue(NetworkModel.sanitizeConf("COOLDOWN=abc\n").1 == 1, "非数字被拒")
+
+// 注释和空行不算被拒（用户配置文件里很常见）
+let (cleanC, rejC) = NetworkModel.sanitizeConf("# 注释\n\nMODE=wifi\n")
+isTrue(cleanC.contains("MODE=wifi"), "注释不影响合法行")
+eqI(rejC, 0, "注释和空行不计入被拒")
+
+// 没有 = 的行算被拒（格式错误）
+eqI(NetworkModel.sanitizeConf("这一行没有等号\n").1, 1, "无等号的行被拒")
+
+// 全是非法内容时返回空，调用方要能发现"什么都没导入"
+let (cleanAll, _) = NetworkModel.sanitizeConf("MODE=banana\nBOGUS=1\n")
+isTrue(cleanAll.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, "全非法时内容为空")
+
+print("")
+print("结果: \(checks - failures) 通过, \(failures) 失败")
+exit(failures == 0 ? 0 : 1)
