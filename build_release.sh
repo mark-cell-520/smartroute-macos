@@ -147,13 +147,13 @@ echo "==> ad-hoc 签名"
 codesign --force --deep --sign - "$APP" > "$PWD/.build/sign.log" 2>&1
 _sign_rc=$?
 head -3 "$PWD/sign.log" 2>/dev/null || head -3 "$PWD/.build/sign.log"
-[ "$_sign_rc" -eq 0 ] || { echo "!! 签名失败（退出码 $_sign_rc）"; exit 1; }
+[ "${_sign_rc}" -eq 0 ] || { echo "!! 签名失败（退出码 ${_sign_rc}）"; exit 1; }
 
 codesign --verify --verbose "$APP" > "$PWD/.build/verify.log" 2>&1
 _verify_rc=$?
 head -3 "$PWD/.build/verify.log"
 [ "$_verify_rc" -eq 0 ] || {
-    echo "!! 签名校验失败（退出码 $_verify_rc），拒绝打包"
+    echo "!! 签名校验失败（退出码 ${_verify_rc}），拒绝打包"
     cat "$PWD/.build/verify.log"
     exit 1
 }
