@@ -106,6 +106,41 @@ for bad_arg in "--lines" "abc" "0" "-3"; do
 done
 bash smartroute.sh --help 2>&1 | grep -q "log \[N\]" && ok "--help 说明两种写法" || bad "--help 未说明"
 
+echo "=== 13. 写不进配置时必须报错，不能假成功 ==="
+# 这一类 bug 出过三次：balance off / wifi auto on|off / config set
+# 都是"打印已成功，但配置文件一个字都没改"。共同点是忽略了
+# conf_set_auto 的返回值，而 /Users/Shared/smartroute.conf 属 root 时
+# 普通用户根本写不进去——用户以为设好了，守护进程完全不按这个来。
+# 判据：非 root 且配置不可写时，命令必须返回非 0，且 stderr 有说明。
+if [ -w /Users/Shared/smartroute.conf ] || [ -w /Users/Shared ]; then
+    echo "  （本机配置可写，跳过——这类断言要在配置属 root 的机器上才生效）"
+else
+    for c in "wifi auto on" "wifi auto off" "config set BALANCE 1" "balance off"; do
+        out="$(bash smartroute.sh $c 2>&1)"; rc=$?
+        [ "$rc" -ne 0 ] && ok "$c 写不进时返回非 0" || bad "$c 假成功（rc=0）"
+        printf '%s' "$out" | grep -q "root" && ok "$c 提示了 root 相关原因" || bad "$c 没说明为什么失败"
+    done
+fi
+# 但配置可写时（App 提权后）必须真的生效——不能为了防假成功而永远拒绝
+if [ -w /Users/Shared/smartroute.conf ] || [ -w /Users/Shared ]; then
+    before="$(grep -c '^WIFI_FAILOVER=' /Users/Shared/smartroute.conf 2>/dev/null || echo 0)"
+    bash smartroute.sh wifi auto on >/dev/null 2>&1
+    after="$(grep '^WIFI_FAILOVER=' /Users/Shared/smartroute.conf 2>/dev/null | head -1)"
+    [ "${after#WIFI_FAILOVER=}" = "1" ] && ok "配置可写时 wifi auto on 真的写入" || bad "可写时也没写入: $after"
+    bash smartroute.sh wifi auto off >/dev/null 2>&1
+    after2="$(grep '^WIFI_FAILOVER=' /Users/Shared/smartroute.conf 2>/dev/null | head -1)"
+    [ "${after2#WIFI_FAILOVER=}" = "0" ] && ok "wifi auto off 真的写入" || bad "off 也没写入: $after2"
+fi
+
+# 这两个不受配置权限影响，能证明 config set 真的转发给了 cmd_set
+# （以前 config 完全忽略参数，只打印一遍当前配置）
+out="$(bash smartroute.sh config set 不存在的KEY 1 2>&1)"; rc=$?
+printf '%s' "$out" | grep -q "不支持的配置项" && ok "config set 转发到校验（拒绝未知键）" || bad "config set 没校验: $out"
+out="$(bash smartroute.sh config set BALANCE 2>&1)"; rc=$?
+printf '%s' "$out" | grep -q "KEY VALUE" && ok "config set 缺值时给用法" || bad "缺值没给用法: $out"
+out="$(bash smartroute.sh config 乱参数 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "用法" && ok "config 带陌生参数时报用法错误" || bad "config 陌生参数被静默忽略"
+
 echo
 echo "结果: $PASS 通过, $FAIL 失败"
 [ "$FAIL" -eq 0 ]

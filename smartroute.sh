@@ -951,6 +951,23 @@ cmd_log() {
 }
 
 cmd_config() {
+    # `config set KEY VALUE` 是很自然的输入，但以前这里完全忽略参数，
+    # 只打印一遍当前配置——用户以为设成功了，其实什么都没改。
+    # 转给 cmd_set 处理（它认 KEY=VALUE），设不了会明确报错。
+    if [ "${1:-}" = "set" ] && [ -n "${2:-}" ]; then
+        # 支持 config set KEY VALUE 和 config set KEY=VALUE 两种写法
+        case "$2" in
+            *=*) cmd_set "$2" ;;
+            *)   [ -n "${3:-}" ] || { echo "用法: smartroute config set KEY VALUE" >&2; exit 1; }
+                 cmd_set "$2=$3" ;;
+        esac
+        return $?
+    fi
+    if [ -n "${1:-}" ]; then
+        echo "用法: smartroute config            （查看当前配置）"
+        echo "  或: smartroute config set KEY VALUE"
+        exit 1
+    fi
     echo "当前生效配置（默认值 < $CONF < ${USER_CONF}，后者优先）"
     local k v
     for k in $VALID_KEYS; do
@@ -1405,16 +1422,26 @@ write_pf_rules() {   # $1=设备A $2=网关A $3=设备B $4=网关B $5=额外排�
 
 balance_off() {   # $1=quiet 时不输出（安全阀内部调用）
     local q="${1:-}"
-    if [ "$(id -u)" -eq 0 ]; then
-        pfctl -a "$PF_ANCHOR" -F all 2>/dev/null
-        rm -f "$PF_ANCHOR_FILE" 2>/dev/null
-        if pf_enabled_by_us; then
-            pfctl -d 2>/dev/null && log "双网并发: 关闭由 smartroute 开启的系统 pf"
-        fi
-        rm -f "$PF_STATE_FILE" 2>/dev/null
-        log "双网并发分流已关闭，网络恢复原状"
+    # 必须 root：pf 规则和锚点文件只有 root 能动。以前这里非 root 时
+    # 什么都不做，却照样打印"已关闭，网络已恢复原状"——用户以为关掉了，
+    # 其实规则还在生效，排查半天白费。宁可明确报错，不要假成功。
+    if [ "$(id -u)" -ne 0 ]; then
+        [ "$q" = "quiet" ] || echo "错误: 关闭双网并发需要 root（要清掉 pf 分流规则）: sudo smartroute balance off" >&2
+        return 1
     fi
-    conf_set_auto BALANCE 0
+    pfctl -a "$PF_ANCHOR" -F all 2>/dev/null
+    rm -f "$PF_ANCHOR_FILE" 2>/dev/null
+    if pf_enabled_by_us; then
+        pfctl -d 2>/dev/null && log "双网并发: 关闭由 smartroute 开启的系统 pf"
+    fi
+    rm -f "$PF_STATE_FILE" 2>/dev/null
+    log "双网并发分流已关闭，网络恢复原状"
+    # 配置也可能写不进去（root 建的 /Users/Shared/smartroute.conf 普通用户改不动）。
+    # 这个返回值以前被丢掉了，于是配置没改成也报成功。
+    if ! conf_set_auto BALANCE 0; then
+        [ "$q" = "quiet" ] || echo "错误: pf 规则已清掉，但配置写不进去（BALANCE 仍是 1），守护进程可能会重新开启" >&2
+        return 1
+    fi
     [ "$q" = "quiet" ] || echo "双网并发分流已关闭，网络已恢复原状"
     return 0
 }
@@ -2481,8 +2508,27 @@ cmd_wifi() {
         auto)
             shift
             case "${1:-status}" in
-                on|1)  conf_set_auto WIFI_FAILOVER 1; echo "已开启 Wi-Fi 自动故障转移" ;;
-                off|0) conf_set_auto WIFI_FAILOVER 0; echo "已关闭 Wi-Fi 自动故障转移" ;;
+                # conf_set_auto 的返回值必须看：配置文件属 root 时普通用户写不进去，
+                # 以前这里直接忽略，于是打印"已开启"但配置一个字都没改——
+                # 用户以为设好了，守护进程却完全不按这个来。
+                on|1)
+                    if conf_set_auto WIFI_FAILOVER 1; then
+                        echo "已开启 Wi-Fi 自动故障转移"
+                    else
+                        echo "错误: 写不进配置（/Users/Shared/smartroute.conf 属 root）" >&2
+                        echo "     普通用户改不动它。请用 App 里的开关（会自动提权），" >&2
+                        echo "     或 sudo chown \$USER /Users/Shared/smartroute.conf 后重试。" >&2
+                        return 1
+                    fi ;;
+                off|0)
+                    if conf_set_auto WIFI_FAILOVER 0; then
+                        echo "已关闭 Wi-Fi 自动故障转移"
+                    else
+                        echo "错误: 写不进配置（/Users/Shared/smartroute.conf 属 root）" >&2
+                        echo "     普通用户改不动它。请用 App 里的开关（会自动提权），" >&2
+                        echo "     或 sudo chown \$USER /Users/Shared/smartroute.conf 后重试。" >&2
+                        return 1
+                    fi ;;
                 status|st)
                     echo "WIFI_FAILOVER=$WIFI_FAILOVER"
                     echo "优先列表: ${WIFI_PREFERRED:-(空，按系统保存顺序)}"
@@ -2615,7 +2661,7 @@ main() {
         status|st)      cmd_status ;;
         test|check)     cmd_test "$@" ;;
         doctor|dr)      cmd_doctor ;;
-        config|conf)    cmd_config ;;
+        config|conf)    cmd_config "$@" ;;
         set)            cmd_set "$@" ;;
         log)            cmd_log "$@" ;;
         balance|bal)    cmd_balance "$@" ;;
