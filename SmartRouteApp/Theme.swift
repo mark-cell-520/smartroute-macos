@@ -288,6 +288,15 @@ struct WelcomeView: View {
                     title: "装守护进程（推荐）",
                     detail: "装了以后开机自启，每 20 秒自动检测：以太网断网自动切 Wi-Fi，恢复自动切回。只需要一次管理员密码。"
                 )
+                // 必须说清楚它改什么。用户在这里点下"安装"，批准的是一个 root 级
+                // 守护进程：会调整系统网络服务顺序、增删默认路由、双网并发还要
+                // 启用系统 pf 写锚点、必要时自动打开 Wi-Fi。这些不说，等于让用户
+                // 在一无所知的情况下交出管理员权限——发现时信任已经没了。
+                welcomeStep(
+                    icon: "shield.lefthalf.filled", color: Theme.warn,
+                    title: "它会修改你的系统网络设置",
+                    detail: "具体是：网络服务顺序、默认路由、双网并发的 pf 防火墙规则，必要时自动打开 Wi-Fi。不动 DNS、VPN、代理和 hosts。随时可在「守护进程」页暂停，或一键彻底卸载（会还原服务顺序）。"
+                )
                 welcomeStep(
                     icon: "3.circle.fill", color: Theme.brand,
                     title: "需要时再开双网并发",

@@ -217,8 +217,9 @@ struct WifiView: View {
                 if !model.wifiMessage.isEmpty {
                     Text(model.wifiMessage)
                         .font(.callout)
-                        .foregroundStyle(model.wifiMessage.contains("失败") || model.wifiMessage.contains("❌")
-                                         ? Theme.bad : Theme.ok)
+                        // 用显式 severity，不再靠字符串匹配——匹配漏一个词，
+                        // 警告就会被染成成功绿，用户以为存进去了其实没有。
+                        .foregroundStyle(model.wifiMessageFailed ? Theme.bad : Theme.ok)
                         .textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
                 }

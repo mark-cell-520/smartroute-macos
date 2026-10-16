@@ -52,7 +52,9 @@ for p in "${PATHS[@]}"; do
 done
 
 echo "=== 2. pf 锚点规则与主机路由也要清 ==="
-grep -q 'pfctl -a "\$ANCHOR" -F rules' "$UNI" && ok "会刷掉 pf 锚点规则" || bad "没有刷 pf 锚点规则"
+# -F all 而不是 -F rules：和 balance_off 对齐。当前锚点里只有 pass 规则，
+# 用 -F rules 侥幸干净，将来加了 nat/表就会漏。
+grep -qE 'pfctl -a "\$ANCHOR" -F (rules|all)' "$UNI" && ok "会刷掉 pf 锚点规则" || bad "没有刷 pf 锚点规则"
 grep -q 'route delete -host' "$UNI"             && ok "会删探测主机路由" || bad "没有删主机路由"
 grep -q 'pf_enabled_by_us=1' "$UNI"             && ok "会判断并关掉我们自己开的 pf" || bad "不管 pf 是否我们开的"
 grep -q 'bootout system/com.user.smartroute' "$UNI" && ok "会 bootout 守护进程" || bad "不停守护进程"
@@ -138,7 +140,15 @@ echo "=== 9. install.sh 装的文件，uninstall.sh 必须都删（防再漏） 
 # 上面那份 PATHS 是手写的，会漏。这里改成从 install.sh 里把实际安装的
 # 文件路径抠出来，逐个要求卸载脚本覆盖——加新文件时忘了删就会红。
 # 两种写法都要认：install -m 0755 src dst  和  cp src dst
-inst_list="$(grep -oE '(install|cp)[[:space:]]+[^|]*[[:space:]]+/[A-Za-z0-9/._-]+$' install.sh \
+# 但 install.sh 里守护进程 plist 写的是变量（DAEMON_PLIST="/Library/LaunchDaemons/$PLIST_LABEL.plist"），
+# 直接抠路径抠不到——加新文件时忘了删，这条检查就瞎了。所以先把已知路径变量
+# 还原成字面量再抠。只替换这几个明确的名字，不做通用 eval（不安全）。
+inst_src="$(sed -e 's#\${PLIST_LABEL}#com.user.smartroute#g' \
+                 -e 's#\$PLIST_LABEL#com.user.smartroute#g' \
+                 -e 's#"\$DAEMON_PLIST"#/Library/LaunchDaemons/com.user.smartroute.plist#g' \
+                 install.sh)"
+inst_list="$(printf '%s\n' "$inst_src" \
+            | grep -oE '(install|cp)[[:space:]]+[^|]*[[:space:]]+/[A-Za-z0-9/._-]+$' \
             | grep -oE '/[A-Za-z0-9/._-]+$' | sort -u)"
 # App  bundle 由用户自己拖废纸篓，不属于这里管
 inst_list="$(printf '%s\n' "$inst_list" | grep -v 'SmartRoute.app')"
@@ -182,3 +192,83 @@ PYEOF2
 echo
 echo "结果: $PASS 通过, $FAIL 失败"
 [ "$FAIL" -eq 0 ]
+
+echo "=== 12. 服务顺序：备份要发生在改之前，卸载要还原 ==="
+# reorder_first 用 networksetup -ordernetworkservices 把首选服务挪到第一位，
+# 这是**持久化**修改：重启、重连都在，卸载软件本身不会还原。
+# 以前全库没有备份，卸载也不还原不提，而脚本最后还印"网络设置未改动"——
+# 用户在系统设置>网络里发现顺序被动过却不知道是谁干的，信任直接归零。
+grep -q 'svc_order_backup_once' "$SRC" && ok "smartroute.sh 有服务顺序备份函数" || bad "没有服务顺序备份函数"
+# 备份必须在 reorder_first 里被调用，且是在实际改顺序之前
+_reorder_body="$(awk '/^reorder_first\(\)/,/^}/' "$SRC")"
+printf '%s' "$_reorder_body" | grep -q 'svc_order_backup_once' \
+    && ok "备份在 reorder_first 里被调用（改之前就存）" || bad "备份没接到 reorder_first 上，等于没备份"
+# 备份要幂等：只存第一次。否则第二次切换会把"已改过的顺序"又存成原始顺序，
+# 还原时就回到中间态，永远回不到真正的起点。
+printf '%s' "$_reorder_body" | grep -q 'svc_order_backup_once' \
+    && ok "reorder_first 调用了备份" || bad "reorder_first 没调用备份"
+awk '/^svc_order_backup_once\(\)/,/^}/' "$SRC" | grep -q '\[ -s "\$SVC_ORDER_BAK" \] && return 0' \
+    && ok "备份幂等：只存第一次（不会把改过的顺序存成原始顺序）" || bad "备份不幂等，会存错原始顺序"
+# 备份用单独文件而不是 state：服务名可能含空格，拼进 key=value 会歧义
+grep -q 'SVC_ORDER_BAK=' "$SRC" && ok "备份路径用变量（不是硬编码）" || bad "备份路径硬编码"
+# 卸载必须还原，且必须在删 /var/db/smartroute 之前读
+grep -q 'networksetup -ordernetworkservices "${_order\[@\]}"' "$UNI" \
+    && ok "卸载会还原服务顺序" || bad "卸载不还原服务顺序"
+_uni_body="$(cat "$UNI")"
+# 还原的代码必须出现在 rm -rf /var/db/smartroute 之前
+_restore_at="$(printf '%s\n' "$_uni_body" | grep -n 'ordernetworkservices' | head -1 | cut -d: -f1)"
+_rmstate_at="$(printf '%s\n' "$_uni_body" | grep -n 'rm -rf /var/db/smartroute' | head -1 | cut -d: -f1)"
+if [ -n "$_restore_at" ] && [ -n "$_rmstate_at" ] && [ "$_restore_at" -lt "$_rmstate_at" ]; then
+    ok "还原发生在删状态目录之前（否则备份先没了）"
+else
+    bad "还原在删状态目录之后，备份已被删掉（还原:$_restore_at 删目录:$_rmstate_at）"
+fi
+# 服务名逐行读：服务名可能含空格（"Thunderbolt Bridge"），不能按空格拆
+grep -q 'while IFS= read -r _s' "$UNI" && ok "逐行读服务名（容忍空格）" || bad "按空格拆服务名会拆错"
+# 备份里的服务可能已不存在，networksetup 会整体失败——不能因此中断卸载
+grep -q '还原服务顺序失败' "$UNI" && ok "还原失败有兜底提示（不让卸载中断）" || bad "还原失败会中断卸载"
+
+echo "=== 13. 校验清单必须和删除清单一一对应 ==="
+# 以前有四项"删了却不验"，结果 ✅ 零残留有时是假的。
+# 用户唯一想从卸载得到的答案就是"真的干净了吗"，骗他一次之前所有
+# 诚实的交代都作废。这里要求：每个 rm 目标都要出现在校验循环里。
+_missing=0
+for _f in /Users/Shared/smartroute.conf.tmp /var/log/smartroute.out.1 \
+           /var/log/smartroute.err.1 /var/db/smartroute/svc_order_orig; do
+    # 校验清单用 glob（如 smartroute.out.*），所以按前缀匹配
+    _pre="${_f%.1}"
+    if printf '%s\n' "$_uni_body" | grep -qF "$_pre"; then :; else
+        bad "删了 $_f 但校验清单没有它（会假报 ✅）"; _missing=$((_missing+1))
+    fi
+done
+[ "$_missing" -eq 0 ] && ok "删掉的轮转/临时文件都在校验清单里" || bad "$_missing 项删而不验"
+# App 路径：用户可能放在 ~/Applications，硬编码 /Applications 会漏
+printf '%s\n' "$_uni_body" | grep -qF 'HOME/Applications/SmartRoute.app' \
+    && ok "App 路径同时查 ~/Applications（不只 /Applications）" || bad "App 路径只查 /Applications"
+# 探测目标从配置读，不用硬编码 IP 列表
+printf '%s\n' "$_uni_body" | grep -q 'PROBE_TARGETS' \
+    && ok "探测目标从配置读（追得上用户自定义）" || bad "探测目标还是硬编码列表，会漏"
+# .conf.bak 是 App 承诺的"后悔药"，不能静默删
+if printf '%s\n' "$_uni_body" | grep -q 'rm -f /Users/Shared/smartroute.conf.bak'; then
+    bad "还在静默删 .conf.bak（App 承诺过的后悔药）"
+else
+    ok "不再删 .conf.bak，改为保留并告知路径"
+fi
+# 默认路由和 pf 要如实报告，不能拍脑袋说"网络设置未改动"
+printf '%s\n' "$_uni_body" | grep -q 'route -n get default' \
+    && ok "卸载后报告默认路由真实状态" || bad "不报告默认路由"
+printf '%s\n' "$_uni_body" | grep -q 'pfctl -s info' \
+    && ok "卸载后报告 pf 真实状态" || bad "不报告 pf 状态"
+# 只查可执行代码：注释里解释了"为什么不那么做"，直接 grep 会误判
+_uni_code="$(printf '%s\n' "$_uni_body" | grep -v '^[[:space:]]*#')"
+if printf '%s\n' "$_uni_code" | grep -q '网络设置未改动'; then
+    bad "还印着「网络设置未改动」——服务顺序明明会改，这话不实"
+else
+    ok "删掉了「网络设置未改动」这句不实的话"
+fi
+# 失败不再说"可忽略"
+if printf '%s\n' "$_uni_code" | grep -q '失败，可忽略'; then
+    bad "还在说「失败，可忽略」——会把用户训练成忽视失败"
+else
+    ok "失败时给可照抄的手动命令，不说「可忽略」"
+fi

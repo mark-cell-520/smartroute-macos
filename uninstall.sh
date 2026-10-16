@@ -32,17 +32,32 @@ for a in "$@"; do
     esac
 done
 
-C_G=$'\033[1;32m'; C_Y=$'\033[1;33m'; C_R=$'\033[1;31m'; C_B=$'\033[1;36m'; C_0=$'\033[0m'
+# 只在真终端里上色。经 App 的 do shell script 调到这里时 stdout 是管道、
+# 不是 tty，此时若还发 ANSI 转义符，\033[1;32m 会原样进 SwiftUI 的 Text，
+# 用户看到一串乱码。install.sh 早有这个判断，这里补上。
+if [ -t 1 ]; then
+    C_G=$'\033[1;32m'; C_Y=$'\033[1;33m'; C_R=$'\033[1;31m'; C_B=$'\033[1;36m'; C_0=$'\033[0m'
+else
+    C_G=""; C_Y=""; C_R=""; C_B=""; C_0=""
+fi
 say()  { printf '%s==>%s %s\n' "$C_B" "$C_0" "$*"; }
 ok()   { printf '    %s✓%s %s\n' "$C_G" "$C_0" "$*"; }
 warn() { printf '    %s⚠%s %s\n' "$C_Y" "$C_0" "$*"; }
 skip() { printf '    %s-%s %s（本来就没有）\n' "$C_0" "$C_0" "$*"; }
 
 # 统一执行/预览：run <描述> <命令...>
+# 失败时不再说"（失败，可忽略）"——那句话会把用户训练成忽视失败，
+# 而卸载是他对工具信任最脆弱的时刻，满屏 ⚠ 反而更慌：到底哪个要紧？
+# 改成给出可以照抄的手动命令，让他自己能收尾。
 run() {
     local desc="$1"; shift
     if [ "$DRY" = "1" ]; then printf '    %s·%s 将删除: %s\n' "$C_0" "$C_0" "$desc"; return 0; fi
-    if "$@" >/dev/null 2>&1; then ok "$desc"; else warn "${desc}（失败，可忽略）"; fi
+    if "$@" >/dev/null 2>&1; then
+        ok "$desc"
+    else
+        printf '    %s✗%s %s —— 删除失败\n' "$C_R" "$C_0" "$desc"
+        printf '      可手动执行：sudo %s\n' "$*"
+    fi
 }
 
 # 需要 root：pfctl/route/删系统文件都要
@@ -67,12 +82,40 @@ if [ "$DRY" = "0" ]; then
     pkill -f "smartroute watch" >/dev/null 2>&1 && ok "已杀掉残留 watch 进程" || true
 fi
 
+# ---------- 0.5 还原网络服务顺序（必须在删状态目录之前） ----------
+# smartroute 每次切换都会用 networksetup -ordernetworkservices 把当前首选服务
+# 挪到第一位，这是**持久化**修改：重启、重连网络都还在，卸载软件本身不会还原。
+# 用户会在系统设置>网络里发现顺序被动过却不知道是谁干的，而脚本最后还告诉他
+# "网络设置未改动"——对不上就彻底没信任了。所以按 smartroute 首次切换前存下的
+# 原始顺序还原。存的是文件（一行一个服务名），因为服务名可能含空格。
+SVC_ORDER_BAK="/var/db/smartroute/svc_order_orig"
+if [ "$DRY" = "1" ]; then
+    printf '    %s·%s 将按 %s 还原网络服务顺序（若存在）\n' "$C_0" "$C_0" "$SVC_ORDER_BAK"
+elif [ -s "$SVC_ORDER_BAK" ]; then
+    _order=()
+    while IFS= read -r _s; do
+        [ -n "$_s" ] && _order+=("$_s")
+    done < "$SVC_ORDER_BAK"
+    if [ "${#_order[@]}" -gt 0 ]; then
+        # 备份里可能有已经不存在的服务，networksetup 会整体失败；
+        # 失败不致命——顺序留着只影响"默认走哪个"，不影响能不能上网。
+        if networksetup -ordernetworkservices "${_order[@]}" >/dev/null 2>&1; then
+            ok "已还原网络服务顺序（${#_order[@]} 个服务）"
+        else
+            warn "还原服务顺序失败（备份里的服务可能已不存在）"
+            printf '      可手动恢复：系统设置 > 网络 > ⋯ > 设置服务顺序\n'
+        fi
+    fi
+else
+    skip "没有服务顺序备份（smartroute 没改过，或已被清掉）"
+fi
+
 # ---------- 1. pf 分流规则 ----------
 say "清理 pf 分流规则"
 ANCHOR="com.apple/smartroute"
 if [ "$DRY" = "0" ]; then
     if pfctl -a "$ANCHOR" -s rules 2>/dev/null | grep -q .; then
-        pfctl -a "$ANCHOR" -F rules >/dev/null 2>&1 && ok "已刷掉锚点 $ANCHOR 内的规则" || warn "刷规则失败"
+        pfctl -a "$ANCHOR" -F all >/dev/null 2>&1 && ok "已刷掉锚点 $ANCHOR 内的规则" || warn "刷规则失败"
     else
         skip "锚点内没有规则"
     fi
@@ -88,8 +131,17 @@ run "锚点文件 /etc/pf.anchors/com.user.smartroute" rm -f /etc/pf.anchors/com
 # ---------- 2. 路由清理 ----------
 say "清理路由"
 if [ "$DRY" = "0" ]; then
+    # 探测目标从配置里读，不用硬编码列表。硬编码永远追不上用户自定义的
+    # PROBE_TARGETS（比如默认值里的 119.29.29.29 就不在旧列表里），
+    # 结果是卸完路由表里还留着来历不明的主机路由。
     n=0
-    for t in 1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4 9.9.9.9 208.67.222.222 223.5.5.5 114.114.114.114; do
+    _probes="1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4 9.9.9.9 208.67.222.222 223.5.5.5 114.114.114.114 119.29.29.29"
+    for _cf in /etc/smartroute.conf /Users/Shared/smartroute.conf; do
+        [ -f "$_cf" ] || continue
+        _v="$(grep -m1 '^PROBE_TARGETS=' "$_cf" | cut -d= -f2-)"
+        [ -n "$_v" ] && _probes="$_v"
+    done
+    for t in $_probes; do
         route delete -host "$t" >/dev/null 2>&1 && n=$((n+1))
     done
     [ "$n" -gt 0 ] && ok "删了 $n 条探测主机路由" || skip "没有残留的探测路由"
@@ -122,7 +174,15 @@ run "守护进程 plist"                             rm -f /Library/LaunchDaemon
 run "系统配置 /etc/smartroute.conf"              rm -f /etc/smartroute.conf
 run "用户配置 /Users/Shared/smartroute.conf"     rm -f /Users/Shared/smartroute.conf
 run "用户配置临时残留 .conf.tmp*"                bash -c 'rm -f /Users/Shared/smartroute.conf.tmp*'
-run "导入前的配置备份 .conf.bak"                 rm -f /Users/Shared/smartroute.conf.bak
+# .conf.bak 是 App 导入配置前自动备份的用户原始配置，导入成功的提示里
+# 明写"原配置备份为 smartroute.conf.bak"、注释原话"留个后悔药"。
+# 卸载时静默删掉它，等于把用户唯一的退路悄悄拿走——而这是我们自己承诺过的。
+# 所以保留，并在输出里说清路径，让用户自己决定。
+if [ -f /Users/Shared/smartroute.conf.bak ]; then
+    warn "保留导入前的配置备份 /Users/Shared/smartroute.conf.bak（你自己决定要不要删）"
+else
+    skip "没有导入前的配置备份"
+fi
 run "分流规则 /Users/Shared/smartroute.rules"    rm -f /Users/Shared/smartroute.rules
 run "状态目录 /var/db/smartroute"                rm -rf /var/db/smartroute
 run "锁目录 /var/run/smartroute.lock"            rm -rf /var/run/smartroute.lock
@@ -151,6 +211,12 @@ else
     run "日志轮转 /var/log/smartroute.log.*"      bash -c 'rm -f /var/log/smartroute.log.*' 
     run "守护进程 stdout /var/log/smartroute.out" rm -f /var/log/smartroute.out
     run "守护进程 stderr /var/log/smartroute.err" rm -f /var/log/smartroute.err
+    # log() 也会把 .out/.err 轮转成 .out.1/.err.1，旧版只删本体，
+    # 卸完 /var/log 里还躺着上一代——"零残留"就漏了。
+    run "守护进程 stdout 轮转 /var/log/smartroute.out.*" bash -c 'rm -f /var/log/smartroute.out.*'
+    run "守护进程 stderr 轮转 /var/log/smartroute.err.*" bash -c 'rm -f /var/log/smartroute.err.*'
+    # 用户级配置的临时残留（state_set 的 $STATE_FILE.$$ 同类）
+    run "状态临时残留 /var/db/smartroute/*.tmp"  bash -c 'rm -f /var/db/smartroute/*.tmp' 
 fi
 
 # ---------- 4. App 本体 ----------
@@ -180,21 +246,35 @@ if [ "$DRY" = "0" ]; then
     echo
     say "校验残留"
     left=0
+    # 这份清单必须和上面的删除清单**逐项对应**。以前有四项删了却不验
+    # （.conf.tmp*、.out.1/.err.1、App 放在 ~/Applications），
+    # 结果是"✅ 零残留"有时是假的——用户唯一想从卸载得到的答案就是这个，
+    # 骗他一次，之前所有诚实的交代都作废。
+    # .conf.bak 是故意保留的（见上），所以不在这份清单里，下面单独说明。
     for f in /usr/local/bin/smartroute /usr/local/bin/smartroute-wifiscan \
-             /Users/Shared/smartroute.rules.tmp \
+             /Users/Shared/smartroute.rules.tmp /Users/Shared/smartroute.conf.tmp* \
              /Library/LaunchDaemons/com.user.smartroute.plist \
-             /etc/smartroute.conf /Users/Shared/smartroute.conf /Users/Shared/smartroute.conf.bak \
+             /etc/smartroute.conf /Users/Shared/smartroute.conf \
              /Users/Shared/smartroute.rules \
              /etc/pf.anchors/com.user.smartroute /var/db/smartroute /var/run/smartroute.lock \
              "$HOME/Library/LaunchAgents/com.user.smartroute.app.plist" \
              /Users/*/Library/LaunchAgents/com.user.smartroute.app.plist \
-             "$APP"; do
+             /var/log/smartroute.log /var/log/smartroute.log.* \
+             /var/log/smartroute.out /var/log/smartroute.out.* \
+             /var/log/smartroute.err /var/log/smartroute.err.* \
+             /Applications/SmartRoute.app "$HOME/Applications/SmartRoute.app"; do
         if [ -e "$f" ] || [ -L "$f" ]; then printf '    %s✗%s 仍在: %s\n' "$C_R" "$C_0" "$f"; left=$((left+1)); fi
     done
     if [ "$KEEP_LOGS" != "1" ]; then
-        for f in /var/log/smartroute.log /var/log/smartroute.out /var/log/smartroute.err; do
+        for f in /var/log/smartroute.log /var/log/smartroute.log.* \
+                 /var/log/smartroute.out /var/log/smartroute.out.* \
+                 /var/log/smartroute.err /var/log/smartroute.err.*; do
             [ -e "$f" ] && { printf '    %s✗%s 仍在: %s\n' "$C_R" "$C_0" "$f"; left=$((left+1)); }
         done
+    fi
+    # .conf.bak 是故意留的，说清楚，别让人以为校验漏了它
+    if [ -f /Users/Shared/smartroute.conf.bak ]; then
+        printf '    %s·%s 按设计保留: /Users/Shared/smartroute.conf.bak（导入前的配置备份）\n' "$C_0" "$C_0"
     fi
     if ls /tmp/.smartroute.probe.* >/dev/null 2>&1; then
         printf '    %s✗%s /tmp 仍有探测残留\n' "$C_R" "$C_0"; left=$((left+1))
@@ -219,16 +299,50 @@ if [ "$DRY" = "0" ]; then
         printf '    %s✗%s watch 进程仍在运行\n' "$C_R" "$C_0"; left=$((left+1))
     fi
 
+    # 用户卸完真正想知道的是"我的网络被改了吗"。以前这句是拍脑袋的
+    # "网络设置未改动"——而服务顺序明明被改过（见 0.5 节）。
+    # 现在如实报告默认路由和 pf 的真实状态，让他自己能核对。
+    echo
+    say "网络现状（供你核对）"
+    _def="$(route -n get default 2>/dev/null | awk '/^ *gateway:/{print $2; exit}')"
+    _ifc="$(route -n get default 2>/dev/null | awk '/^ *interface:/{print $2; exit}')"
+    if [ -n "$_ifc" ]; then
+        printf '    %s·%s 默认路由：interface=%s gateway=%s\n' "$C_0" "$C_0" "$_ifc" "${_def:-未知}"
+    else
+        printf '    %s·%s 默认路由：读不到（系统会自己重新裁决）\n' "$C_0" "$C_0"
+    fi
+    # pf 状态：我们开过的要关掉（见上面），用户自己开的别动。说清楚是哪种。
+    if [ -f /var/db/smartroute/pf.state ] && grep -q "pf_enabled_by_us=1" /var/db/smartroute/pf.state 2>/dev/null; then
+        printf '    %s·%s 系统 pf：本工具曾开启，已关闭\n' "$C_0" "$C_0"
+    elif pfctl -s info 2>/dev/null | grep -q "Status: Enabled"; then
+        printf '    %s·%s 系统 pf：当前为开启（这是你自己的设置，未改动）\n' "$C_0" "$C_0"
+    else
+        printf '    %s·%s 系统 pf：当前为关闭（与安装前一致）\n' "$C_0" "$C_0"
+    fi
+    if [ -s "$SVC_ORDER_BAK" ]; then
+        printf '    %s·%s 服务顺序：已按备份还原\n' "$C_0" "$C_0"
+    else
+        printf '    %s·%s 服务顺序：本工具没有改过（无备份可还原）\n' "$C_0" "$C_0"
+    fi
+
     if [ "$left" -eq 0 ]; then
         # 措辞要兜得住。App 偏好和窗口状态在用户自己的 Library 里，属用户数据，
         # 上面只提示不删——所以不能说"所有东西都清干净了"。
         printf '    %s✅ 程序、配置、规则、路由、进程都已清干净%s\n' "$C_G" "$C_0"
         printf '    %s   （App 偏好与窗口状态属用户数据，未删；上面已列出路径）%s\n' "$C_0" "$C_0"
     else
-        printf '    %s还有 %d 项残留（见上），可重跑一次或手动处理%s\n' "$C_Y" "$left" "$C_0"
+        printf '    %s还有 %d 项残留（见上）%s\n' "$C_Y" "$left" "$C_0"
+        printf '    %s  重跑一次：sudo bash %s --yes%s\n' "$C_0" "$C_0" "$0"
+        printf '    %s  或照上面每条给出的手动命令逐条删%s\n' "$C_0" "$C_0"
     fi
     echo
-    say "卸载完成。网络设置未改动，当前路由/pf 保持原样。"
+    say "卸载完成。接下来："
+    echo "    1. App 本体按你的选择保留着——拖进废纸篓即可（见上面提示）"
+    echo "    2.  退出 App（菜单栏图标随之消失）"
+    echo "    3.  如果上网感觉异常：开关一次 Wi-Fi，或重启 Mac，让系统重新裁决路由"
+    echo "    4.  导入前的配置备份若还在，路径见上面；不需要就自己删掉"
+    echo
+    echo "    本工具没有动过：DNS、VPN、系统代理、hosts、系统 pf 开关"
 else
     echo
     say "dry-run 结束，未做任何改动。去掉 --dry-run 正式执行。"

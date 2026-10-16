@@ -99,6 +99,12 @@ struct StatusView: View {
             VStack(alignment: .leading, spacing: Theme.gapM) {
                 if !ScriptLocator.daemonInstalled {
                     daemonBanner
+                } else if model.installFailed || !model.snapshot.daemonRunning {
+                    // 这一态以前不存在，于是它是唯一存活的"以为成功实际失败"路径：
+                    // 横幅条件只看 plist 文件在不在，而 plist 在校验之前就 cp 进去了，
+                    // 安装失败时横幅照样消失、状态页回到正常模样，用户几周后才发现
+                    // 自动选路从未工作。现在把"已安装但没在跑"单独告警。
+                    daemonNotRunningBanner
                 } else if model.snapshot.daemonScriptOutdated {
                     daemonOutdatedBanner
                 }
@@ -128,6 +134,19 @@ struct StatusView: View {
                title: "守护进程尚未安装",
                message: "安装后每 20 秒自动检测：以太网没有外网时自动切到 Wi-Fi，恢复后自动切回（开机自启）",
                buttonTitle: model.daemonInstalling ? nil : "安装守护进程") {
+            model.installDaemon()
+        }
+    }
+
+    /// 已安装但没在跑。最常见的原因就是安装时 launchctl 那步失败了——
+    /// 而 install.sh 现在已经会验证并报错，这里把结论呈现给用户。
+    private var daemonNotRunningBanner: some View {
+        Banner(icon: "xmark.octagon.fill", color: Theme.bad,
+               title: model.installFailed ? "守护进程安装失败" : "守护进程未在运行",
+               message: model.installFailed
+                   ? "自动选路没有生效。下面的输出里有失败原因和手动排查命令，照着做即可。"
+                   : "守护进程已安装但没在跑，自动选路不会发生。可在终端执行：sudo launchctl bootstrap system /Library/LaunchDaemons/com.user.smartroute.plist",
+               buttonTitle: model.daemonInstalling ? nil : "重试安装") {
             model.installDaemon()
         }
     }
@@ -527,7 +546,13 @@ struct BalanceView: View {
         Card(title: "并发分流状态") {
             VStack(alignment: .leading, spacing: Theme.gapS) {
                 HStack {
-                    statusDot(on: model.balanceOn, text: model.balanceOn ? "已开启" : "未开启")
+                    // 读不到状态时说"未知"，别拿上次的值冒充现值，更别猜"未开启"——
+                    // 那会让用户去点"开启"，实际把正在跑的 pf 规则关掉。
+                    if model.balanceUnknown {
+                        statusDot(on: false, text: "状态未知，点击右侧重试")
+                    } else {
+                        statusDot(on: model.balanceOn, text: model.balanceOn ? "已开启" : "未开启")
+                    }
                     Spacer()
                     if model.balanceLoading { ProgressView().controlSize(.small) }
                 }
@@ -1015,6 +1040,18 @@ struct DaemonView: View {
                 Button("安装 / 重装守护进程") { model.installDaemon() }
                     .disabled(model.daemonInstalling)
                 Button("立即运行一次检测（需要管理员密码）") { runWatchOnce() }
+
+                // 暂停入口。用户说"它老动我网络，我想让它停一下"时，
+                // 以前唯一的选择是那颗红色"彻底卸载"——于是被逼在
+                // "忍受不安"和"连根拔"之间二选一。现在有第三条路。
+                Button(model.daemonPaused ? "恢复自动选路" : "暂停自动选路") {
+                    model.setDaemonPaused(!model.daemonPaused)
+                }
+                .disabled(model.daemonInstalling)
+                Text(model.daemonPaused
+                     ? "已暂停：自动选路不再改你的网络。这是临时的——重启 Mac 会自动恢复；想重启也不恢复，在终端执行 sudo launchctl disable system/com.user.smartroute。"
+                     : "暂停后自动选路不再改你的网络，但配置和安装都保留。这是临时的——重启 Mac 会自动恢复。")
+                    .font(.caption2).foregroundStyle(.tertiary)
             }
             Section("登录时启动 App") {
                 Toggle("开机自启 SmartRoute", isOn: .init(
@@ -1054,16 +1091,25 @@ struct DaemonView: View {
                         uninstallItem("探测用的临时主机路由")
                         uninstallItem("全部配置文件（/etc 与 /Users/Shared）")
                         uninstallItem("状态目录、日志、/tmp 残留")
-                        uninstallItem("App 本体 /Applications/SmartRoute.app")
+                        uninstallItem("App 本体（保留，需自己拖进废纸篓）")
                     }
                     .font(.caption)
                     .foregroundStyle(.secondary)
+
+                    Toggle(isOn: $model.uninstallKeepLogs) {
+                        Text("保留日志（/var/log/smartroute.*）")
+                    }
+                    .font(.caption)
+                    Text(model.uninstallKeepLogs
+                         ? "日志会留在 /var/log 下，方便回头排查问题。"
+                         : "很多人卸载正是因为用着有问题——建议保留日志，卸完好排查。")
+                        .font(.caption2).foregroundStyle(.tertiary)
 
                     Button(role: .destructive) { model.confirmFullUninstall = true } label: {
                         Label("彻底卸载…", systemImage: "trash")
                     }
                     .disabled(model.daemonInstalling)
-                    Text("卸载后网络设置保持原样，不会动你现有的路由。")
+                    Text("卸载会还原网络服务顺序；DNS、VPN、代理都没有动过。")
                         .font(.caption2).foregroundStyle(.tertiary)
                 }
                 .padding(.vertical, Theme.gapXS)
@@ -1083,10 +1129,17 @@ struct DaemonView: View {
         .alert("确认彻底卸载？", isPresented: $model.confirmFullUninstall) {
             Button("取消", role: .cancel) {}
             Button("彻底卸载", role: .destructive) {
-                model.uninstallDaemon()
+                model.uninstallDaemon(keepLogs: model.uninstallKeepLogs)
             }
         } message: {
-            Text("将停止并删除守护进程、命令行工具、pf 分流规则、全部配置与日志，以及 /Applications/SmartRoute.app。\n\n"
+            // 文案必须和 uninstall.sh 的实际行为一致。以前这里写"以及
+            // /Applications/SmartRoute.app"，而命令实际带 --keep-app
+            // （正在运行的 App 删不掉自己）——用户点完看到输出里"保留 App"，
+            // "说好的全删呢？"卸载是信任最脆弱的时刻，这种对不上的承诺伤害尤其大。
+            // 网络那句也要改：服务顺序会被改，但卸载时会按备份还原。
+            Text("将停止并删除守护进程、命令行工具、pf 分流规则、全部配置与日志，"
+                 + "并还原网络服务顺序。\n\n"
+                 + "App 本体将保留（正在运行，删不掉自己）——卸完请自己拖进废纸篓。\n\n"
                  + "这个操作不可撤销，建议先导出配置。")
         }
     }

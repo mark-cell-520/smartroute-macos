@@ -143,10 +143,11 @@ sudo smartroute wifi auto on     # Wi-Fi 上不了网时自动换网络
 |---|---|
 | 守护进程 | 停止 launchd 服务 + 删 `/Library/LaunchDaemons/com.user.smartroute.plist` |
 | pf 规则 | 刷掉 `com.apple/smartroute` 锚点里的分流规则 + 删锚点文件；**如果是本工具打开的 pf，会连 pf 一起关掉** |
-| 路由 | 探测时添加的临时主机路由 |
+| 路由 | 探测时添加的临时主机路由（按你配置的 `PROBE_TARGETS` 删，不限于默认那几个）+ 双网并发的静态网段路由 |
 | 命令行 | `/usr/local/bin/smartroute` |
 | 配置 | `/etc/smartroute.conf`、`/Users/Shared/smartroute.conf`（含 `.tmp` 残留）、`/Users/Shared/smartroute.rules` |
-| 状态与日志 | `/var/db/smartroute`、`/var/log/smartroute.{log,out,err}`、`/var/run/smartroute.lock` |
+| 状态与日志 | `/var/db/smartroute`、`/var/log/smartroute.{log,out,err}`（含轮转的 `.1`）、`/var/run/smartroute.lock` |
+| 服务顺序 | **会按备份还原**成安装前的网络服务顺序 |
 | 临时文件 | `/tmp/.smartroute.probe.*` |
 | App 本体 | `/Applications/SmartRoute.app` |
 
@@ -173,7 +174,13 @@ sudo bash uninstall.sh --keep-logs
 
 卸载完成后脚本会**自动校验**，输出「✅ 零残留」或列出遗漏项，确认文件、规则、路由、进程全都清干净了。
 
-> 卸载不会改动你现有的网络设置（当前路由、系统 pf 配置保持原样）。
+> 卸载后脚本会**如实报告**网络现状（默认路由走哪个接口、系统 pf 开还是关、
+> 服务顺序有没有还原），你可以自己核对。
+>
+> 保留的东西：App 偏好与窗口状态在 `~/Library` 里，属你的个人数据，不会删；
+> 导入配置前的备份 `smartroute.conf.bak` 也保留，路径会打出来，你自己决定。
+>
+> 本工具从来没有动过：DNS、VPN、系统代理、hosts。
 
 ---
 
@@ -230,6 +237,10 @@ macOS 睡眠唤醒可能重建默认路由。守护进程 20 秒内会自动修�
   子进程数会降到 0，不会在后台白烧电。切回前台会立刻补一次刷新。
 - 守护进程是常驻的，每 20 秒探测一次，CPU 占用可忽略。
 - 不想让 App 常驻：直接退出即可，选路状态会保留；需要自动切换再打开。
+  > 注意：**退出 App 不会停掉自动选路**——自动选路由守护进程（launchd 的
+  > 系统级服务）负责，跟 App 在不在前台无关，菜单栏图标消失只是看不见了。
+  > 想真的暂停：App 的「守护进程」页有「暂停自动选路」按钮（临时，重启恢复），
+  > 或在终端执行 `sudo launchctl bootout system/com.user.smartroute`。
 
 ## 十一、从源码构建（开发者）
 

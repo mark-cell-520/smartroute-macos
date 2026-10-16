@@ -614,10 +614,33 @@ update_streak() {   # $1=eth|wifi  $2=ok|fail|na -> 输出新连续值
 
 # ---------------- 切换动作 ----------------
 
+# 原始网络服务顺序的备份文件路径。
+# 用单独的文件而不是 state：服务名可能含空格（如 "Thunderbolt Bridge"），
+# 用空格/逗号拼进 state 的 key=value 会歧义；一行一个最稳。
+SVC_ORDER_BAK="${STATE_FILE%/*}/svc_order_orig"
+
+# reorder_first 会把当前首选服务挪到服务顺序第一位，而
+# networksetup -ordernetworkservices 是**持久化**修改——重启、重连网络都还在，
+# 卸载本软件也不会自动还原。用户在系统设置>网络里发现顺序被动过，却不知道
+# 是谁干的；而卸载脚本最后还告诉他"网络设置未改动"，对不上就彻底没信任了。
+# 所以：第一次改之前先把原始顺序存下来，卸载时据此还原。
+svc_order_backup_once() {
+    [ -s "$SVC_ORDER_BAK" ] && return 0        # 只存第一次，别把已改过的又存一遍
+    local d
+    d="$(dirname "$SVC_ORDER_BAK")"
+    mkdir -p "$d" 2>/dev/null || return 0
+    if ordered_service_names > "$SVC_ORDER_BAK" 2>/dev/null && [ -s "$SVC_ORDER_BAK" ]; then
+        log "已备份原始网络服务顺序（${SVC_ORDER_BAK}），卸载时可还原"
+    else
+        rm -f "$SVC_ORDER_BAK" 2>/dev/null      # 存了个空的比没存更糟
+    fi
+}
+
 # 把某个服务挪到服务顺序第一位（其余保持相对顺序）
 reorder_first() {   # $1=服务名
     local primary="$1" svc
     local rest=()
+    svc_order_backup_once
     while IFS= read -r svc; do
         [ -z "$svc" ] && continue
         [ "$svc" = "$primary" ] && continue

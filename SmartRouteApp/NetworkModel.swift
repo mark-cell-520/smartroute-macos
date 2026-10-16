@@ -112,6 +112,20 @@ final class NetworkModel: ObservableObject {
     static weak var shared: NetworkModel?
 
     // MARK: 基础状态
+    /// 双网并发状态是否"未知"（读取失败）。为 true 时界面要显示"状态未知，
+    /// 点击重试"，不能拿上次的值冒充当前值，更不能猜"未开启"——
+    /// 猜错会让用户去点"开启"，实际把正在跑的 pf 规则关掉。
+    @Published var balanceUnknown: Bool = false
+    /// 上一次安装/更新守护进程是否失败。用于把横幅从"装好了"翻成"没装上"——
+    /// 以前横幅只看 plist 文件在不在，而 plist 在校验之前就 cp 进去了，
+    /// 于是安装失败时横幅照样消失，用户在状态页看到的是完全正常的假象。
+    @Published var installFailed: Bool = false
+    /// 卸载时是否保留日志。默认 true：卸载的常见原因是"用着有问题"，
+    /// 卸完想排查时日志却被卸载流程自己吃了，唯一的证据就没了。
+    @Published var uninstallKeepLogs: Bool = true
+    /// 用户是否主动暂停了自动选路。暂停不是卸载：守护进程 plist 还在，
+    /// 重启 Mac 会自动恢复运行。要"重启也不恢复"得用 launchctl disable。
+    @Published var daemonPaused = false
     @Published var snapshot = NetworkSnapshot()
     @Published var busy: Bool = false
     @Published var message: String = ""
@@ -235,6 +249,10 @@ final class NetworkModel: ObservableObject {
     @Published var wifiScanAt: Date? = nil            // 上次扫描时间
     @Published var wifiLoading = false
     @Published var wifiMessage = ""
+    /// wifiMessage 是成功还是失败。以前靠字符串匹配 "失败"/"❌" 上色，
+    /// 于是"网络名里含空格，无法加入优先列表"这种**警告**被染成成功绿——
+    /// 用户以为存进去了，其实没有。severity 由设置消息的人显式给出。
+    @Published var wifiMessageFailed = false
     @Published var wifiJoining = ""                  // 正在连接的 SSID（用于转圈）
     @Published var wifiFailoverOn = false
     @Published var wifiPreferred = ""                // 逗号分隔的优先列表
@@ -653,7 +671,14 @@ final class NetworkModel: ObservableObject {
         busy = true
         setConfigBatch(pending) { [weak self] ok, msg in
             self?.busy = false
-            self?.routingSavedText = ok ? "已保存，≤20 秒生效" : "保存失败：\(msg)"
+            // "≤20 秒生效"是守护进程的轮询周期——没装守护进程时根本没人应用
+            // 这条配置，用户照着提示干等，等到以为软件坏了。
+            // 先问一句装没装、跑没跑，再决定说什么。
+            let daemonLive = ScriptLocator.daemonInstalled && (self?.snapshot.daemonRunning ?? false)
+            self?.routingSavedText = ok
+                ? (daemonLive ? "已保存，≤20 秒生效"
+                              : "已保存，但守护进程未在运行——自动选路不会生效")
+                : "保存失败：\(msg)"
             if ok { self?.refresh() }
         }
     }
@@ -714,29 +739,91 @@ final class NetworkModel: ObservableObject {
     func installDaemon() {
         daemonInstalling = true
         daemonMessage = ""
+        // 安装日志的临时位置。用 /tmp 而不是日志目录：这个文件要能被
+        // **非特权**的 App 进程读回来展示，日志目录是 root 的读不到。
+        let log = "/tmp/smartroute-install.log"
+        DispatchQueue.global().async {
+            var result = ""
+            var failed = false
+            do {
+                // 用 runWithLog 而不是 run：do shell script 失败时只返回 stderr，
+                // install.sh 里那段"请手动执行 launchctl bootstrap / log show"
+                // 的排查指引（走 stdout）会被全部吞掉，用户只剩一句裸错误。
+                let (out, code) = try Privileged.runWithLog(
+                    "bash '\(ScriptLocator.resource("install.sh"))'", logFile: log)
+                result = out
+                failed = (code != 0)
+            } catch PrivilegedError.cancelled {
+                // 取消密码框不是失败。说清"什么都没变"，别骂用户一句"失败"，
+                // 更别让他不知道到底装没装。
+                result = "已取消授权，什么都没有改动。"
+                failed = false
+            } catch {
+                result = "失败: \(error.localizedDescription)"
+                failed = true
+            }
+            DispatchQueue.main.async {
+                self.daemonMessage = result
+                self.daemonInstalling = false
+                self.installFailed = failed
+                self.refresh()
+            }
+        }
+    }
+
+    /// 暂停/恢复自动选路。
+    ///
+    /// 这是用户最基本的心理需求："它老动我网络，我想让它停一下"——
+    /// 以前 App 里**完全没有这个入口**，唯一的红色按钮是"彻底卸载"，
+    /// 于是用户被逼在"忍受不安"和"连根拔"之间二选一，大多数人只能忍着。
+    ///
+    /// 实现用 launchctl bootout/bootstrap：bootout 只让 launchd 现在别跑它，
+    /// 重启后会自动恢复（plist 还在 /Library/LaunchDaemons）；
+    /// 想重启也不恢复得用 disable。所以文案必须说清是"临时"。
+    func setDaemonPaused(_ paused: Bool) {
+        daemonInstalling = true
+        daemonMessage = ""
+        let plist = "/Library/LaunchDaemons/com.user.smartroute.plist"
+        let cmd = paused
+            ? "launchctl bootout system/com.user.smartroute"
+            : "launchctl bootstrap system '\(plist)'"
+        let log = "/tmp/smartroute-pause.log"
         DispatchQueue.global().async {
             var result = ""
             do {
-                result = try Privileged.run("bash '\(ScriptLocator.resource("install.sh"))'")
+                let (out, code) = try Privileged.runWithLog(cmd, logFile: log)
+                result = out.isEmpty ? (paused ? "已暂停自动选路" : "已恢复自动选路") : out
+                if code != 0 { result += "\n(退出码 \(code))" }
+            } catch PrivilegedError.cancelled {
+                result = "已取消授权，什么都没有改动。"
             } catch {
                 result = "失败: \(error.localizedDescription)"
             }
             DispatchQueue.main.async {
                 self.daemonMessage = result
                 self.daemonInstalling = false
+                self.daemonPaused = paused
                 self.refresh()
             }
         }
     }
 
-    func uninstallDaemon() {
+    func uninstallDaemon(keepLogs: Bool = false) {
         daemonInstalling = true
         daemonMessage = ""
+        let log = "/tmp/smartroute-uninstall.log"
         DispatchQueue.global().async {
             var result = ""
             do {
-                // 带 --keep-app：否则会把正在运行的 App 自己删掉
-                result = try Privileged.run("bash '\(ScriptLocator.resource("uninstall.sh"))' --keep-app --yes")
+                // 带 --keep-app：否则会把正在运行的 App 自己删掉。
+                // keepLogs：很多人卸载正是因为"用着有问题"，卸完想排查时
+                // 日志却被卸载流程自己吃了——留个开关。
+                var cmd = "bash '\(ScriptLocator.resource("uninstall.sh"))' --keep-app --yes"
+                if keepLogs { cmd += " --keep-logs" }
+                let (out, _) = try Privileged.runWithLog(cmd, logFile: log)
+                result = out
+            } catch PrivilegedError.cancelled {
+                result = "已取消授权，什么都没有改动。"
             } catch {
                 result = "失败: \(error.localizedDescription)"
             }
@@ -860,7 +947,18 @@ final class NetworkModel: ObservableObject {
             DispatchQueue.main.async {
                 self.endOp("balance")
                 self.balanceStatusText = out
-                self.balanceOn = ok && out.contains("BALANCE=1")
+                // 读失败时**不能**把 balanceOn 置 false。以前就是这么写的，
+                // 于是 balance status 超时（它内含延迟实测，4-5 秒起）时，
+                // 界面斩钉截铁显示"未开启"、按钮变成"开启"——而 pf 规则可能
+                // 还在跑。用户点一下"开启"，实际是关掉了正在工作的功能。
+                // 同代码库的 toggleBalance 处理是对的（"读不到状态就不要动"）。
+                if ok {
+                    self.balanceOn = out.contains("BALANCE=1")
+                    self.balanceUnknown = false
+                } else {
+                    // 保留上次已知的 balanceOn，只标记"现在不知道"
+                    self.balanceUnknown = true
+                }
                 // "两个接口网关相同（192.168.1.1）" -> 取出网关
                 self.balanceSameGateway = ""
                 for line in out.components(separatedBy: "\n") {
@@ -1028,6 +1126,7 @@ final class NetworkModel: ObservableObject {
                     self.wifiJoining = ""
                     self.loadWifi()
                     self.wifiMessage = out.isEmpty ? "已连接到 \(ssid)" : out
+                    self.wifiMessageFailed = false
                 }
             } catch {
                 DispatchQueue.main.async {
@@ -1038,6 +1137,7 @@ final class NetworkModel: ObservableObject {
                         msg += "\n新网络请先在系统菜单栏的 Wi-Fi 里连一次，之后这里就能一键切了。"
                     }
                     self.wifiMessage = "切换失败: \(msg)"
+                    self.wifiMessageFailed = true
                 }
             }
         }
@@ -1060,6 +1160,7 @@ final class NetworkModel: ObservableObject {
                 DispatchQueue.main.async {
                     self.wifiLoading = false
                     self.wifiMessage = "失败: \(error.localizedDescription)"
+                    self.wifiMessageFailed = true
                 }
             }
         }
@@ -1077,11 +1178,13 @@ final class NetworkModel: ObservableObject {
                     self.wifiLoading = false
                     self.loadWifiFailover()
                     self.wifiMessage = on ? "已开启自动切换" : "已关闭自动切换"
+                    self.wifiMessageFailed = false
                 }
             } catch {
                 DispatchQueue.main.async {
                     self.wifiLoading = false
                     self.wifiMessage = "设置失败: \(error.localizedDescription)"
+                    self.wifiMessageFailed = true
                 }
             }
         }
@@ -1160,6 +1263,7 @@ final class NetworkModel: ObservableObject {
         let normalized = wifiPreferred.replacingOccurrences(of: "，", with: ",")
         if normalized.contains(" ") {
             wifiMessage = "网络名里含空格，无法加入优先列表（脚本用空格分隔多项）。可改用系统菜单栏 Wi-Fi 调整顺序。"
+            wifiMessageFailed = true
             return
         }
         wifiPreferred = normalized
@@ -1167,6 +1271,7 @@ final class NetworkModel: ObservableObject {
         setConfigBatch([("WIFI_PREFERRED", Shell.quote(normalized))]) { ok, msg in
             DispatchQueue.main.async {
                 self.wifiMessage = ok ? (normalized.isEmpty ? "已恢复默认顺序" : "优先列表已保存") : "保存失败: \(msg)"
+                self.wifiMessageFailed = !ok
                 self.loadWifiFailover()
             }
         }

@@ -27,6 +27,42 @@ enum Privileged {
         return try DispatchQueue.main.sync { try execute(command) }
     }
 
+    /// 执行命令并**保证失败时也能拿回完整输出**。
+    ///
+    /// `do shell script` 只在成功时返回 stdout；一旦退出码非 0，
+    /// AppleScript 直接抛错，我们精心写的排查指引（全走 stdout）会被吞光，
+    /// 用户只看到一句裸 stderr。install.sh 失败时那段"请手动执行
+    /// launchctl bootstrap / log show"就是这么丢的。
+    ///
+    /// 做法：把输出重定向到临时日志，只把退出码打到 stdout，
+    /// 再用非特权权限把日志读回来展示。
+    /// - Returns: (输出内容, 退出码)
+    static func runWithLog(_ command: String, logFile: String) throws -> (out: String, code: Int32) {
+        let wrapped = "\(command) > '\(logFile)' 2>&1; echo \"SR_EXIT=$?\""
+        let stdout = try run(wrapped)
+        // 最后一行是 SR_EXIT=<码>，前面是 wrapped 命令本身的 echo（没有）
+        var code: Int32 = -1
+        let lines = stdout.components(separatedBy: "\n")
+        for line in lines.reversed() {
+            let t = line.trimmingCharacters(in: .whitespaces)
+            if t.hasPrefix("SR_EXIT=") {
+                code = Int32(t.dropFirst("SR_EXIT=".count)) ?? -1
+                break
+            }
+        }
+        // 读回日志。文件由 root 经 do shell script 创建，umask 022 → 0644，
+        // 普通用户读得到。读不到也不致命，退回 stdout。
+        var out = ""
+        if let data = FileManager.default.contents(atPath: logFile),
+           let text = String(data: data, encoding: .utf8) {
+            out = text
+        }
+        if out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            out = stdout
+        }
+        return (out, code)
+    }
+
     private static func execute(_ command: String) throws -> String {
         let escaped = command
             .replacingOccurrences(of: "\\", with: "\\\\")

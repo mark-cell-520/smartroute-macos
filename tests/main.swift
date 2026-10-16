@@ -193,6 +193,38 @@ quoteRoundTrip("网络 名 带空格", "中文带空格")
 // 恶意 Wi-Fi 名的真实 payload（历史漏洞）：双引号里嵌 do shell script
 quoteRoundTrip("x\" & (do shell script \"touch /tmp/PWNED2\") & \"", "AppleScript 注入 payload 原样往返")
 
+print("== 9. Privileged.runWithLog：失败时也必须拿回完整输出 ==")
+// 这个函数的存在理由：do shell script 只在成功时返回 stdout，一旦退出码非 0，
+// AppleScript 直接抛错，install.sh 里那段"请手动执行 launchctl bootstrap /
+// log show"的排查指引（全走 stdout）会被全部吞掉，用户只剩一句裸 stderr。
+// 这里验的是退出码解析——真实 AppleScript 调不了，但解析逻辑必须对。
+func parseExitCode(_ stdout: String) -> Int32 {
+    for line in stdout.components(separatedBy: "\n").reversed() {
+        let t = line.trimmingCharacters(in: .whitespaces)
+        if t.hasPrefix("SR_EXIT=") {
+            return Int32(t.dropFirst("SR_EXIT=".count)) ?? -1
+        }
+    }
+    return -1
+}
+checks += 1
+parseExitCode("SR_EXIT=0") == 0 ? print("  OK 退出码 0") : { failures += 1; print("  XX 退出码 0") }()
+checks += 1
+parseExitCode("SR_EXIT=1") == 1 ? print("  OK 退出码 1（安装失败）") : { failures += 1; print("  XX 退出码 1") }()
+checks += 1
+parseExitCode("SR_EXIT=127") == 127 ? print("  OK 退出码 127（命令不存在）") : { failures += 1; print("  XX 退出码 127") }()
+// 多行输出里 SR_EXIT 在最后一行——真实场景 stdout 会有很多内容
+checks += 1
+parseExitCode("==> 安装 smartroute\n==> 注册 launchd\nSR_EXIT=1") == 1
+    ? print("  OK 多行输出也能取到退出码")
+    : { failures += 1; print("  XX 多行输出取不到退出码") }()
+// 退出码后面可能跟换行
+checks += 1
+parseExitCode("SR_EXIT=2\n") == 2 ? print("  OK 带尾随换行") : { failures += 1; print("  XX 带尾随换行") }()
+// 没有 SR_EXIT 行时返回 -1，调用方据此判失败，不能误判成成功
+checks += 1
+parseExitCode("啥都没有") == -1 ? print("  OK 没有 SR_EXIT 时返回 -1（不当成功）") : { failures += 1; print("  XX 没有 SR_EXIT") }()
+
 print("")
 print("结果: \(checks - failures) 通过, \(failures) 失败")
 exit(failures == 0 ? 0 : 1)
