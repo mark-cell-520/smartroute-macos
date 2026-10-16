@@ -94,18 +94,14 @@ sudo cp com.user.smartroute.plist "$DAEMON_PLIST"
 sudo chown root:wheel "$DAEMON_PLIST"
 sudo chmod 0644 "$DAEMON_PLIST"
 
-BOOTSTRAPPED=0
 if sudo launchctl bootstrap system "$DAEMON_PLIST" 2>/dev/null; then
-    BOOTSTRAPPED=1
     ok "已通过 bootstrap 注册"
 else
     # bootstrap 失败的常见原因是"已经加载过了"（重复安装），
     # 这种情况先 kickstart 重启一下，让新代码生效。
     if sudo launchctl kickstart -k "system/$PLIST_LABEL" 2>/dev/null; then
-        BOOTSTRAPPED=1
         ok "已加载过，已用新代码重启守护进程"
     elif sudo launchctl load "$DAEMON_PLIST" 2>/dev/null; then
-        BOOTSTRAPPED=1
         ok "已通过 load 注册（旧版 macOS）"
     fi
 fi
@@ -147,7 +143,10 @@ echo "      sudo launchctl disable system/com.user.smartroute"
 echo "  · 重新启用："
 echo "      sudo launchctl enable system/com.user.smartroute"
 echo "      sudo launchctl bootstrap system /Library/LaunchDaemons/com.user.smartroute.plist"
-echo "  · 彻底卸载：  sudo bash uninstall.sh"
+# 卸载命令要给绝对路径。原来写的是相对路径 "sudo bash uninstall.sh"，
+# 用户照抄时只要换了个目录就是 "No such file or directory"——
+# 而卸载是他最想顺利完成的动作，卡在这一步特别恼火。
+echo "  · 彻底卸载：  sudo bash \"$(dirname "$0")/uninstall.sh\""
 echo "    （卸载会还原网络服务顺序；DNS/VPN/代理都没动过）"
 echo
 echo "常用命令："

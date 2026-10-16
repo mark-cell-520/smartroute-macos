@@ -92,6 +92,9 @@ struct NetworkSnapshot {
     var defaultDevice: String = ""
     var defaultGateway: String = ""
     var defaultReachable: Bool = false
+    /// 网关状态是否"未知"（禁 ping / VPN 虚拟网关 / 同网段直连）。
+    /// 为 true 时界面不能说"不可达"——那会用红字吓一个正在正常上网的用户。
+    var gatewayUnknown: Bool = false
     var ethOK: String = "-"
     var wifiOK: String = "-"
     var streakEth: String = "-"
@@ -99,7 +102,7 @@ struct NetworkSnapshot {
     var lastSwitch: String = "从未"
     var switchCount: String = "0"
     var mode: String = "auto"
-    var daemonRunning: Bool = false
+    var daemonState: DaemonState = .stopped
     var daemonScriptOutdated: Bool = false
     var lastUpdated: String = ""
     /// 上次成功采集的时间（用于算"x 秒前"，比字符串更准）
@@ -126,6 +129,9 @@ final class NetworkModel: ObservableObject {
     /// 用户是否主动暂停了自动选路。暂停不是卸载：守护进程 plist 还在，
     /// 重启 Mac 会自动恢复运行。要"重启也不恢复"得用 launchctl disable。
     @Published var daemonPaused = false
+    /// 守护进程是否确实在跑。注意"未在运行"的判定只认 .stopped——
+    /// .waiting（刚唤醒/刚装完）不下结论，避免误报让人去重装。
+    var daemonRunning: Bool { snapshot.daemonState == .running }
     @Published var snapshot = NetworkSnapshot()
     @Published var busy: Bool = false
     @Published var message: String = ""
@@ -323,11 +329,42 @@ final class NetworkModel: ObservableObject {
             }
         }
 
+        // 网关"不可达"的红字以前只 ping 一次（800ms），于是三类完全正常的情况
+        // 都会被判成不可达：走 VPN 时默认网关是 utun 的虚拟地址、网络禁 ICMP、
+        // 以及 route 报 "gateway: link"（同网段直连，没有可 ping 的网关 IP）。
+        // 用户明明上着网，却被一个红字吓到。
+        // 修：ping 不通时用 TCP 兜一次——本项目自己就有 TCP/TLS 三层探测，
+        // 没理由在这里只信 ICMP。
         var gwReachable = false
+        var gwUnknown = false
         if !defGw.isEmpty {
-            let (_, code) = Shell.run("ping -c 1 -W 800 \(defGw)", timeout: 3)
-            gwReachable = (code == 0)
+            if defGw == "link" {
+                // 同网段直连，没有网关 IP 可 ping。这不是故障，是"没有这项信息"。
+                gwUnknown = true
+            } else {
+                let (_, code) = Shell.run("ping -c 1 -W 800 \(defGw)", timeout: 3)
+                if code == 0 {
+                    gwReachable = true
+                } else {
+                    // ICMP 不通 ≠ 不通。禁 ping 的路由器、VPN 的 utun 虚拟网关
+                    // 都很常见。用 TCP 连网关的 80/443 复核一次再下结论。
+                    let (_, tcp) = Shell.run(
+                        "nc -z -G 1 \(defGw) 80 2>/dev/null || nc -z -G 1 \(defGw) 443 2>/dev/null",
+                        timeout: 4)
+                    if tcp == 0 {
+                        gwReachable = true
+                    } else {
+                        // TCP 也不通：可能是真断了，也可能只是这个网关不响应
+                        // 这两种探测（比如纯二层设备）。标成"未知"而不是"不可达"，
+                        // 让界面说"探测不到"，别用红字吓人。
+                        gwUnknown = true
+                    }
+                }
+            }
+        } else {
+            gwUnknown = true
         }
+        snapshot.gatewayUnknown = gwUnknown
 
         // 一次性拿所有接口的 IP 和网关：比"每个接口各跑一次 ifconfig /
         // networksetup -getinfo"少 2N-2 个进程。一次采集从十多个进程降到 5 个。
@@ -367,7 +404,7 @@ final class NetworkModel: ObservableObject {
         snapshot.switchCount = state["switch_count"] ?? "0"
         snapshot.lastSwitch = humanize(state["last_switch"] ?? "")
         snapshot.mode = readMode()
-        snapshot.daemonRunning = daemonIsRunning()
+        snapshot.daemonState = daemonState()
         snapshot.daemonScriptOutdated = ScriptLocator.daemonScriptOutdated
         snapshot.lastUpdated = Self.timeString()
         snapshot.lastUpdatedAt = Date()
@@ -674,7 +711,7 @@ final class NetworkModel: ObservableObject {
             // "≤20 秒生效"是守护进程的轮询周期——没装守护进程时根本没人应用
             // 这条配置，用户照着提示干等，等到以为软件坏了。
             // 先问一句装没装、跑没跑，再决定说什么。
-            let daemonLive = ScriptLocator.daemonInstalled && (self?.snapshot.daemonRunning ?? false)
+            let daemonLive = ScriptLocator.daemonInstalled && (self?.daemonRunning ?? false)
             self?.routingSavedText = ok
                 ? (daemonLive ? "已保存，≤20 秒生效"
                               : "已保存，但守护进程未在运行——自动选路不会生效")
@@ -1527,13 +1564,37 @@ private func humanize(_ epoch: String) -> String {
     return "\(Int(d / 86400)) 天前"
 }
 
-private func daemonIsRunning() -> Bool {
-    // 方式一：守护进程每 20 秒往 smartroute.out 写一行，看文件新鲜度
+/// 守护进程运行态。
+///
+/// 为什么必须有三态而不是布尔：这个 plist 用的是 StartInterval=20，
+/// 意味着进程**大部分时间并不存在**（只在每次运行的瞬间活着），
+/// 所以 pgrep 几乎永远查不到——它不能作为"没在跑"的证据。
+/// 唯一可用的非特权信号是日志 mtime（每 20 秒写一行）。
+/// 而 Mac 睡眠期间 launchd 不跑 job，唤醒后要等最多 20 秒才写第一行：
+/// 用户刚唤醒就打开 App 时，mtime 是旧的——只看布尔就会误报"未在运行"。
+/// 误报的代价很大：会让人以为自动选路没在工作，甚至去重装。
+/// 所以加一个"等待下次检测"的中间态，只有**确实**长时间没更新才告警。
+enum DaemonState {
+    case running        // 日志新鲜，确实在跑
+    case waiting        // 日志略旧：刚唤醒或刚装完，等下一次检测
+    case stopped        // 日志长时间没更新，或根本没有日志文件
+}
+
+private func daemonState() -> DaemonState {
+    // 守护进程每 20 秒往 smartroute.out 写一行，看文件新鲜度。
     if let attrs = try? FileManager.default.attributesOfItem(atPath: ScriptLocator.daemonOut),
        let mtime = attrs[.modificationDate] as? Date {
-        if Date().timeIntervalSince(mtime) < 90 { return true }
+        let age = Date().timeIntervalSince(mtime)
+        // 90 秒 = 4~5 个轮询周期，正常情况一定更新过了
+        if age < 90 { return .running }
+        // 5 分钟内：可能是刚唤醒（唤醒后最多 20 秒就会写），
+        // 也可能是刚装完还没跑第一次。这时候不能下结论。
+        if age < 300 { return .waiting }
+        return .stopped
     }
-    // 方式二：进程表
+    // 没有日志文件：可能是从没跑过（刚装完、还没到第一次），
+    // 也可能是被 bootout 了。用进程表兜一下——虽然 StartInterval 下
+    // 大部分时间查不到，但恰好撞上它在跑就能确认"是活的"。
     let (_, code) = Shell.run("pgrep -f 'smartroute watch'", timeout: 5)
-    return code == 0
+    return code == 0 ? .running : .stopped
 }

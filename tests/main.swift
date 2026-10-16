@@ -225,6 +225,31 @@ parseExitCode("SR_EXIT=2\n") == 2 ? print("  OK 带尾随换行") : { failures +
 checks += 1
 parseExitCode("啥都没有") == -1 ? print("  OK 没有 SR_EXIT 时返回 -1（不当成功）") : { failures += 1; print("  XX 没有 SR_EXIT") }()
 
+print("== 10. 守护进程三态：不允许把「刚唤醒」误判成「没在跑」 ==")
+// plist 用的是 StartInterval=20，进程大部分时间并不存在，pgrep 几乎永远查不到
+// ——它不能作为"没在跑"的证据。唯一可用的非特权信号是日志 mtime。
+// 而 Mac 睡眠期间 launchd 不跑 job，唤醒后要等最多 20 秒才写第一行：
+// 只看布尔就会误报"未在运行"，误报的代价是有人会去重装。
+// 这里验的是分档逻辑本身（真实 mtime 依赖运行环境，用等价运算表达）。
+enum TestDaemonState { case running, waiting, stopped }
+func classify(_ age: TimeInterval) -> TestDaemonState {
+    if age < 90 { return .running }
+    if age < 300 { return .waiting }
+    return .stopped
+}
+checks += 1
+classify(0) == .running ? print("  OK 日志刚写 → running") : { failures += 1; print("  XX 0 秒") }()
+checks += 1
+classify(89) == .running ? print("  OK 89 秒（4~5 个轮询周期内）→ running") : { failures += 1; print("  XX 89 秒") }()
+checks += 1
+classify(90) == .waiting ? print("  OK 90 秒刚过 → waiting（不下结论）") : { failures += 1; print("  XX 90 秒") }()
+checks += 1
+classify(299) == .waiting ? print("  OK 299 秒 → waiting") : { failures += 1; print("  XX 299 秒") }()
+checks += 1
+classify(300) == .stopped ? print("  OK 300 秒 → stopped（该告警了）") : { failures += 1; print("  XX 300 秒") }()
+checks += 1
+classify(99999) == .stopped ? print("  OK 很久没更新 → stopped") : { failures += 1; print("  XX 很久") }()
+
 print("")
 print("结果: \(checks - failures) 通过, \(failures) 失败")
 exit(failures == 0 ? 0 : 1)

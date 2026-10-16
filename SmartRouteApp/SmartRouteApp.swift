@@ -27,9 +27,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.addItem(withTitle: "打开面板", action: #selector(openPanel), keyEquivalent: "")
         menu.addItem(.separator())
+        // 五个模式都要有。以前只有 auto/ethernet/wifi 三个，而设置页和 README
+        // 都有五个——于是用户在 App 里选了"网速优先"，菜单栏点一下"自动模式"
+        // 就把它静默覆盖了，且菜单上看不出当前是哪个（没有勾选）。
+        // 这是个"影子控制台"：看起来能控制，实际会悄悄改掉你刚设的东西。
         menu.addItem(withTitle: "自动模式", action: #selector(setMode(_:)), keyEquivalent: "")
         menu.addItem(withTitle: "强制走 Wi-Fi", action: #selector(setMode(_:)), keyEquivalent: "")
         menu.addItem(withTitle: "强制走以太网", action: #selector(setMode(_:)), keyEquivalent: "")
+        menu.addItem(withTitle: "网速优先", action: #selector(setMode(_:)), keyEquivalent: "")
+        menu.addItem(withTitle: "延时优先", action: #selector(setMode(_:)), keyEquivalent: "")
         menu.addItem(.separator())
         menu.addItem(withTitle: "双网并发：开 / 关", action: #selector(toggleBalance), keyEquivalent: "")
         menu.addItem(.separator())
@@ -41,18 +47,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 永久禁用（实测 enabled=false），用户只能走主菜单 ⌘Q 或 Dock 退出。
         // "退出"保持 target = nil，action 会沿 responder chain 找到
         // NSApplication.terminate:（系统默认就有）。
+        // tag = 模式在 modeList 里的下标。用下标而不是写死的数字，
+        // 加模式时只改 modeList 一处，不会出现 tag 和标题对不上的情况。
         for (index, menuItem) in menu.items.enumerated() {
-            switch index {
-            case 2: menuItem.tag = 0; menuItem.target = self   // auto
-            case 3: menuItem.tag = 2; menuItem.target = self   // wifi
-            case 4: menuItem.tag = 1; menuItem.target = self   // ethernet
-            default: break                                     // 含"退出"：不设 target
+            if let tag = Self.modeList.firstIndex(of: menuItem.title) {
+                menuItem.tag = tag
+                menuItem.target = self
             }
+            // 其余条目（含"退出"）不设 target：AppKit 发现 target 不响应 action
+            // 会把条目永久禁用，"退出"的 action 沿 responder chain 就能找到。
         }
-        balanceItem = menu.item(at: 6)
-
+        balanceItem = menu.item(at: 8)
+        modeMenu = menu
         item.menu = menu
         statusItem = item
+        // 定时刷新勾选状态。没有这一步，用户在 App 里改了模式，
+        // 菜单栏还勾着旧的那个——又是一个"界面说的和实际不一样"。
+        Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            self?.refreshMenuState()
+        }
+    }
+
+    /// 模式标识 -> 菜单标题。顺序即 tag，两处都从这里取。
+    static let modeList = ["自动模式", "强制走 Wi-Fi", "强制走以太网", "网速优先", "延时优先"]
+    /// 模式标识 -> 中文名（通知用）。以前通知里直接弹 "ethernet" 这种英文，
+    /// 非技术用户看不懂自己刚被切成了什么。
+    static let modeNames = ["auto": "自动模式", "ethernet": "强制走以太网",
+                            "wifi": "强制走 Wi-Fi", "speed": "网速优先",
+                            "latency": "延时优先"]
+
+    private var modeMenu: NSMenu?
+
+    /// 按当前模式打勾。当前模式从 Model 读（它每次 refresh 都会更新），
+    /// 读不到就全不打勾——不打勾比打错勾好，打错会让人以为选错了东西。
+    func refreshMenuState() {
+        guard let menu = modeMenu, let model = NetworkModel.shared else { return }
+        let cur = model.mode
+        let curTitle = Self.modeNames[cur] ?? "自动模式"
+        for item in menu.items {
+            guard let tag = Self.modeList.firstIndex(of: item.title) else { continue }
+            _ = tag
+            item.state = (item.title == curTitle) ? .on : .off
+        }
+        balanceItem?.state = model.balanceOn ? .on : .off
     }
 
     /// 失去焦点时停掉每秒采样：用户切到别的 App 时，没人看曲线，
@@ -104,13 +141,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func setMode(_ sender: NSMenuItem) {
-        let modes = ["auto", "ethernet", "wifi"]
-        let mode = modes[sender.tag]
+        // 标题 -> 模式标识。用标题反查而不是按下标，加模式时不会错位。
+        guard let title = Self.modeList.first(where: { $0 == sender.title }),
+              let mode = Self.modeNames.first(where: { $0.value == title })?.key else { return }
         DispatchQueue.global().async {
             let (out, code) = Shell.run("'\(ScriptLocator.configScriptPath)' set \(mode)")
             DispatchQueue.main.async {
-                let body = code == 0 ? "选路模式已切换为 \(mode)" : "切换失败：\(out.prefix(150))"
+                // 中文名，别弹 "ethernet" —— 非技术用户看不懂自己刚被切成了什么
+                let name = Self.modeNames[mode] ?? mode
+                let body = code == 0 ? "选路模式已切换为 \(name)" : "切换失败：\(out.prefix(150))"
                 self.notify(title: "SmartRoute", body: body)
+                NetworkModel.shared?.refresh()
+                self.refreshMenuState()
             }
         }
     }

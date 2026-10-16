@@ -94,12 +94,20 @@ struct StatusView: View {
     private var ethInterface: InterfaceInfo? { model.snapshot.interfaces.first { $0.role == "以太网" } }
     private var wifiInterface: InterfaceInfo? { model.snapshot.interfaces.first { $0.role == "Wi-Fi" } }
 
+    private var daemonStateText: String {
+        switch model.snapshot.daemonState {
+        case .running: return "运行中"
+        case .waiting: return "等待下次检测"
+        case .stopped: return "未在运行"
+        }
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.gapM) {
                 if !ScriptLocator.daemonInstalled {
                     daemonBanner
-                } else if model.installFailed || !model.snapshot.daemonRunning {
+                } else if model.installFailed || model.snapshot.daemonState == .stopped {
                     // 这一态以前不存在，于是它是唯一存活的"以为成功实际失败"路径：
                     // 横幅条件只看 plist 文件在不在，而 plist 在校验之前就 cp 进去了，
                     // 安装失败时横幅照样消失、状态页回到正常模样，用户几周后才发现
@@ -179,8 +187,14 @@ struct StatusView: View {
                     Text("\(deviceDisplayName(model.snapshot.defaultDevice))   via   \(model.snapshot.defaultGateway.isEmpty ? "?" : model.snapshot.defaultGateway)")
                         .font(.title3.monospaced())
                     HStack(spacing: Theme.gapXS) {
-                        Pill(text: model.snapshot.defaultReachable ? "网关可达" : "网关不可达",
-                             color: model.snapshot.defaultReachable ? Theme.ok : Theme.warn)
+                        Pill(text: model.snapshot.gatewayUnknown
+                             ? "网关状态未知"
+                             : (model.snapshot.defaultReachable ? "网关可达" : "网关不可达"),
+                             // 未知时用中性色。以前未知也按"不可达"涂成警示色，
+                             // 而禁 ping、VPN 虚拟网关、同网段直连都是正常情况——
+                             // 用户上着网被一个红字吓到，比不显示更糟。
+                             color: model.snapshot.gatewayUnknown ? Theme.idle
+                                 : (model.snapshot.defaultReachable ? Theme.ok : Theme.warn))
                         FreshnessBadge(since: model.snapshot.lastUpdatedAt)
                         Text("最近切换 \(model.snapshot.lastSwitch)（共 \(model.snapshot.switchCount) 次）")
                             .font(.caption).foregroundStyle(.secondary)
@@ -1026,12 +1040,18 @@ struct DaemonView: View {
                 LabeledContent("运行状态") {
                     HStack(spacing: Theme.gapXS) {
                         Circle()
-                            .fill(model.snapshot.daemonRunning ? Theme.ok : Theme.idle)
+                            .fill(model.snapshot.daemonState == .stopped ? Theme.bad : Theme.ok)
                             .frame(width: 8, height: 8)
-                        Text(model.snapshot.daemonRunning ? "运行中" : "未在运行")
+                        Text(daemonStateText)
                     }
                 }
                 LabeledContent("检测频率") { Text("每 20 秒（开机自启）") }
+                if model.snapshot.daemonState == .waiting {
+                    // 刚唤醒或刚装完时日志会短暂过期。说明白是在等，
+                    // 别让人以为它坏了——误报的代价是有人会去重装。
+                    Text("刚唤醒或刚安装，正在等待下一次检测（≤20 秒）")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
                 LabeledContent("当前脚本") {
                     Text(ScriptLocator.scriptPath).textSelection(.enabled).truncationMode(.middle)
                 }
@@ -1039,7 +1059,12 @@ struct DaemonView: View {
             Section("操作") {
                 Button("安装 / 重装守护进程") { model.installDaemon() }
                     .disabled(model.daemonInstalling)
-                Button("立即运行一次检测（需要管理员密码）") { runWatchOnce() }
+                // 按钮名要和行为一致。这个按钮跑的是 `smartroute watch`，
+                // 它会探测 + 滞回判定 + **当场切换默认路由**。
+                // 叫"立即检测"让只想看状态的用户意外遭遇路由被改。
+                Button("立即检测并切换（会改默认路由，需要管理员密码）") { runWatchOnce() }
+                Text("只想看状态的话，点上面的「刷新」即可——那个是只读的，不会改任何东西。")
+                    .font(.caption2).foregroundStyle(.tertiary)
 
                 // 暂停入口。用户说"它老动我网络，我想让它停一下"时，
                 // 以前唯一的选择是那颗红色"彻底卸载"——于是被逼在
@@ -1079,8 +1104,12 @@ struct DaemonView: View {
                             .foregroundStyle(Theme.bad)
                             .font(.title3)
                         VStack(alignment: .leading, spacing: Theme.gapXS) {
-                            Text("彻底卸载（零残留）").font(.headline)
-                            Text("会一次清掉下面全部内容，卸载完不留任何痕迹")
+                            Text("彻底卸载（程序与配置零残留）").font(.headline)
+                            // 标题必须兜得住实际行为。原来写"不留任何痕迹"，
+                            // 而脚本明确不删 App 偏好/窗口状态（属用户个人数据），
+                            // 也不删导入前的 .conf.bak——大标题和输出自相矛盾，
+                            // 用户会以为脚本漏了东西。
+                            Text("程序、配置、规则、路由、进程全部清干净；你的 App 偏好与配置备份属个人数据，会保留")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                     }
@@ -1127,7 +1156,12 @@ struct DaemonView: View {
         .formStyle(.grouped)
         .onAppear { model.loadAppAutoLaunch() }
         .alert("确认彻底卸载？", isPresented: $model.confirmFullUninstall) {
-            Button("取消", role: .cancel) {}
+            Button("取消，先去导出配置", role: .cancel) {
+                // 卸载不可撤销，而配置可能是用户调了很久的。
+                // 原来只在文案里说"建议先导出配置"，没有按钮——
+                // 用户得自己去找导出入口，多数人就跳过这步然后后悔。
+                model.exportConfig()
+            }
             Button("彻底卸载", role: .destructive) {
                 model.uninstallDaemon(keepLogs: model.uninstallKeepLogs)
             }
@@ -1182,6 +1216,23 @@ struct AboutView: View {
                     }
                 }
                 .padding(.vertical, 6)
+            }
+            // 「安全吗」在 App 内原来没有总览，答案散落在安装文档里。
+            // 用户装了 root 级守护进程，理应在 App 内一眼看清
+            // 它要什么权限、会改哪些系统位置、不碰什么。文案 INSTALL.md 早有，
+            // 搬进来即可——放在"工作方式"前面，因为这是更靠前的疑问。
+            Section("权限与隐私") {
+                Text("需要管理员密码的操作")
+                    .font(.caption).foregroundStyle(.secondary)
+                Text("• 安装 / 更新 / 卸载守护进程、暂停或恢复自动选路")
+                Text("• 修改网络服务顺序与默认路由、启用系统 pf 写分流规则")
+                Text("• 手动检测、手动测速（读取状态不需要密码）")
+                Text("不会碰的东西")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .padding(.top, Theme.gapXS)
+                Text("• DNS、VPN、系统代理、hosts 一律不动")
+                Text("• 导出的报告不含密码、令牌或任何凭据")
+                Text("• 不在后台联网回传任何数据")
             }
             Section("工作方式") {
                 Text("• 每 20 秒探测以太网和 Wi-Fi 的外网连通性（ping → TCP → TLS 三层）")
