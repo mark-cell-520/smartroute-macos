@@ -352,5 +352,70 @@ _verdict() {   # 打印 balance_on 的判定：拒绝 / 放行 / 用法错误 / 
 [ "$(_verdict 'bogus')" = "用法错误" ] && ok "非法模式仍报用法错误" || bad "bogus：$(_verdict 'bogus')"
 
 echo
+echo "== 14. 规则应用路径必须校验（/Users/Shared 是世界可写的） =="
+# /Users/Shared 是 drwxrwxrwt，任何本地用户都能创建/改写 smartroute.rules，
+# 而守护进程是 root、会照着文件内容执行 route add -net <内容>。
+# 以前只有 cmd_rule add 校验 CIDR，应用路径什么都不看——
+# 等于把"以 root 添加任意路由"的能力开放给任何本地用户。
+_vc() {   # valid_cidr 的判定
+    bash -c "
+        . '$T/sr.sh'
+        valid_cidr '$1' && echo OK || echo NO
+    " 2>/dev/null
+}
+for good in "10.0.0.0/8" "192.168.1.0/24" "172.16.0.0/12" "10.1.2.3/32"; do
+    [ "$(_vc "$good")" = "OK" ] && ok "合法 CIDR 通过: $good" || bad "合法 CIDR 被拒: $good"
+done
+# 前缀 0 要拒：0.0.0.0/0 是默认路由，应用它会抢走全部流量
+[ "$(_vc '0.0.0.0/0')" = "NO" ] && ok "拒绝 0.0.0.0/0（会抢默认路由）" || bad "放了 0.0.0.0/0"
+for badc in "10.0.0.0/33" "10.0.0.0" "foo" "10.0.0.0/8; rm -rf /tmp/x" "10.0.0.0/-1" "999.1.1.1/8"; do
+    [ "$(_vc "$badc")" = "NO" ] && ok "拒绝非法 CIDR: $badc" || bad "非法 CIDR 被放过: $badc"
+done
+# 接口也要校验：写个不存在的接口名，route add 会失败但守护进程每轮都重试
+_vd() {
+    bash -c "
+        . '$T/sr.sh'
+        valid_dev '$1' && echo OK || echo NO
+    " 2>/dev/null
+}
+[ "$(_vd en0)" = "OK" ] && ok "真实接口通过" || bad "真实接口被拒"
+[ "$(_vd 不存在的接口)" = "NO" ] && ok "假接口被拒" || bad "假接口被放过"
+[ "$(_vd 'en0; id')" = "NO" ] && ok "带注入的接口名被拒" || bad "注入字符串被放过"
+
+# apply_rules 遇到非法条目要跳过并记账，不能静默应用。
+# 注意 apply_rules 第一行就要求 root，而 run() 里不是 root——
+# 所以这里像第 13 节那样自己起 bash 并在 source 之后把 PATH 设好（脚本第 2 行会重置 PATH）。
+cat > "$T/bin/id" <<'EOF'
+#!/bin/bash
+[ "${1:-}" = "-u" ] && { echo 0; exit 0; }
+exec /usr/bin/id "$@"
+EOF
+chmod +x "$T/bin/id"
+# log() 写文件不打印，所以把 LOG_FILE 指到临时文件再读它
+out="$(bash -c "
+    . '$T/sr.sh'
+    export PATH='$T/bin:/usr/bin:/bin:/usr/sbin:/sbin'
+    LOG_FILE='$T/sr.log'
+    printf '%s\n' '10.0.0.0/8 en0' '0.0.0.0/0 en0' '垃圾 en0' '192.168.2.0/24 假接口' > '$T/r.txt'
+    RULES_FILE='$T/r.txt'
+    apply_rules
+    cat '$T/sr.log' 2>/dev/null
+" 2>&1 | grep -v 'Broken pipe')"
+echo "  --- apply_rules 日志 ---"
+printf '%s\n' "$out" | sed 's/^/    /' | head -6
+# 判据要看日志内容，不能 grep 内部变量名（want 是 local，永远不会输出）。
+# 每条非法条目都该有一条"跳过"日志；合法那条不该出现在跳过日志里。
+_skipped() { printf '%s\n' "$out" | grep "跳过非法条目" | grep -c "$1"; }
+[ "$(_skipped '0.0.0.0/0')" = "1" ] && ok "0.0.0.0/0 被跳过并记账" || bad "0.0.0.0/0 的处理不对"
+[ "$(_skipped '垃圾')" = "1" ] && ok "垃圾 CIDR 被跳过并记账" || bad "垃圾 CIDR 的处理不对"
+[ "$(_skipped '假接口')" = "1" ] && ok "假接口条目被跳过并记账" || bad "假接口条目的处理不对"
+[ "$(_skipped '10.0.0.0/8')" = "0" ] && ok "合法条目没被误跳过" || bad "合法条目被误跳过了"
+printf '%s\n' "$out" | grep -q "有 3 条非法条目已跳过" \
+    && ok "汇总计数正确（3 条）" || bad "汇总计数不对"
+# 合法条目应该真的去添加路由（这里 route 是真实的，会失败，但日志应有尝试痕迹）
+printf '%s\n' "$out" | grep -q "跳过非法条目 '10.0.0.0/8" && bad "合法条目被当成非法" || ok "合法条目走了应用路径"
+rm -f /tmp/_r.txt
+
+echo
 echo "结果: $PASS 通过, $FAIL 失败"
 exit $([ "$FAIL" -eq 0 ] && echo 0 || echo 1)

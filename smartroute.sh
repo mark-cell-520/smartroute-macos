@@ -1182,11 +1182,21 @@ apply_rules() {   # 由守护进程调用：把规则文件落地为静态路由
     applied="$(state_get applied_routes)"
 
     if [ -f "$RULES_FILE" ]; then
+        local bad=0
         while read -r cidr dev extra; do
             case "$cidr" in ""|\#*) continue ;; esac
             [ -n "$dev" ] || continue
+            # 和 cmd_rule add 用同一套校验。smartroute.rules 在 /Users/Shared
+            # （世界可写 + sticky），任何本地用户都能写；不校验就等于让 root
+            # 照着文件内容执行 route add -net <任意字符串>。
+            if ! valid_cidr "$cidr" || ! valid_dev "$dev"; then
+                bad=$((bad+1))
+                log "分流规则: 跳过非法条目 '$cidr $dev'（CIDR 或接口不合法）"
+                continue
+            fi
             want="$want$cidr@$dev;"
         done < "$RULES_FILE"
+        [ "$bad" -eq 0 ] || log "分流规则: 有 $bad 条非法条目已跳过（详见上面的日志）"
     fi
 
     # 删除已应用但规则里没有的
@@ -1217,6 +1227,32 @@ apply_rules() {   # 由守护进程调用：把规则文件落地为静态路由
     return 0
 }
 
+# CIDR 合法性：IPv4/前缀 1..32。
+# 抽成函数是因为**写入和应用两条路都要校验**——以前只有 cmd_rule add 校验，
+# 而守护进程照 smartroute.rules 应用路由时什么都不看，于是往那个文件里
+# 写任意内容就能让 root 执行 route add -net <任意内容>。
+valid_cidr() {   # $1=CIDR -> 0 合法
+    local cidr="$1" pfx
+    printf '%s' "$cidr" | grep -qE '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$' || return 1
+    pfx="${cidr#*/}"
+    [ "$pfx" -ge 1 ] && [ "$pfx" -le 32 ] || return 1
+    # 每段还必须落在 0..255。只查位数不够——999.1.1.1/8 能通过 [0-9]{1,3}，
+    # 而 route add 对这种地址的行为是未定义的。
+    printf '%s' "${cidr%/*}" | awk -F. '{
+        if (NF != 4) exit 1
+        for (i = 1; i <= 4; i++) {
+            if ($i !~ /^[0-9]+$/) exit 1
+            if ($i + 0 > 255) exit 1
+        }
+    }' || return 1
+    return 0
+}
+
+# 接口是否真实存在
+valid_dev() {   # $1=设备名 -> 0 存在
+    hardware_ports | awk -F'\t' -v d="$1" '$2==d{f=1} END{exit f?0:1}'
+}
+
 cmd_rule() {
     local sub="${1:-list}"
     case "$sub" in
@@ -1224,12 +1260,8 @@ cmd_rule() {
             local cidr="$2" dev="$3"
             [ -n "$cidr" ] && [ -n "$dev" ] || die "用法: smartroute rule add <CIDR> <接口>
 例: smartroute rule add 10.0.0.0/8 en0   （公司内网段走有线）"
-            printf '%s' "$cidr" | grep -qE '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$' \
-                || die "CIDR 格式不正确: ${cidr}（例 10.0.0.0/8）"
-            local pfx="${cidr#*/}"
-            [ "$pfx" -ge 1 ] && [ "$pfx" -le 32 ] || die "前缀长度必须在 1..32"
-            hardware_ports | awk -F'\t' -v d="$dev" '$2==d{f=1} END{exit f?0:1}' \
-                || die "没有这个接口: ${dev}（用 smartroute status 查看可用接口）"
+            valid_cidr "$cidr" || die "CIDR 格式不正确: ${cidr}（例 10.0.0.0/8，前缀 1..32）"
+            valid_dev  "$dev"  || die "没有这个接口: ${dev}（用 smartroute status 查看可用接口）"
             mkdir -p "$(dirname "$RULES_FILE")" 2>/dev/null
             if [ ! -f "$RULES_FILE" ]; then
                 printf '# smartroute 分流规则：每行 "CIDR 接口"，守护进程（root）自动应用\n' > "$RULES_FILE" 2>/dev/null \
