@@ -673,6 +673,12 @@ do_switch() {   # $1=目标设备 $2=原默认设备 $3=eth探测 $4=wifi探测 
     svc="$(svc_of_dev "$want")"
     log "切换默认路由: ${cur:-无} -> $want (服务:${svc:-无}) [eth=$3/$5 wifi=$4/$6 mode=$MODE]"
 
+    # 一进来就记尝试时间。原来只在两条成功路径的末尾才写 last_switch，
+    # 失败的尝试不落时间——于是冷却期形同虚设：目标接口持续不可用时，
+    # 每 20 秒就重试一次，每次都走一遍"删默认路由再添加"。
+    # 失败的尝试同样会动路由表，一样该被节流。
+    state_set last_switch "$(date +%s)"
+
     # 1) 首选：调整服务顺序（持久，网络重连后依然有效）
     if [ -n "$svc" ] && reorder_first "$svc"; then
         sleep 2
@@ -692,6 +698,14 @@ do_switch() {   # $1=目标设备 $2=原默认设备 $3=eth探测 $4=wifi探测 
     # 2) 兜底：直接改路由表，立即生效（configd 之后若重建默认路由，下次 watch 会再修正）
     gw="$(svc_router "$svc")"
     if [ -n "$gw" ]; then
+        # 先把当前默认路由的参数记下来。原来是先 route delete default 再 add，
+        # 而 add 有三条命令、任一条都不保证成功（路由表被占、网关不可达、
+        # 权限问题都会失败）。一旦 add 失败，系统就**没有默认路由了**——
+        # 不是"切过去失败"，是整台机器断网，而且不会自己恢复。
+        # 所以：记下原参数，加失败就原样加回去。宁可切换没做成，也不能让人掉线。
+        local bak_if bak_gw
+        bak_if="$(default_dev)"
+        bak_gw="$(default_gw)"
         route delete default >/dev/null 2>&1
         if route_add_default "$want" "$gw"; then
             log "完成：路由表已改为 default via $gw ($want)"
@@ -699,7 +713,14 @@ do_switch() {   # $1=目标设备 $2=原默认设备 $3=eth探测 $4=wifi探测 
             bump_switch_count
             notify "SmartRoute 选路切换" "已从 $(dev_cn "${cur:-}") 切换到 $(dev_cn "$want")"
         else
-            log "失败：无法添加 default via $gw ($want)"
+            log "失败：无法添加 default via $gw ($want)，尝试恢复原默认路由"
+            if [ -n "$bak_if" ] && [ -n "$bak_gw" ] && route_add_default "$bak_if" "$bak_gw"; then
+                log "已恢复原默认路由：$bak_if via $bak_gw"
+            else
+                # 恢复也失败：这时候必须说清楚，让人立刻知道该做什么。
+                # 静默留在一个没有默认路由的状态是最糟的。
+                log "严重：无法恢复默认路由（原 ${bak_if} via ${bak_gw}）。请手动执行：sudo route add default ${bak_gw} -interface ${bak_if}"
+            fi
         fi
     else
         log "失败：目标接口没有网关信息"
@@ -940,6 +961,8 @@ cmd_status() {
 }
 
 cmd_test() {
+    # test 会探测两个接口，同样动主机路由，也要和守护进程互斥
+    acquire_lock_wait 10 || die "另一个 smartroute 操作正在进行（守护进程刚跑过一轮），请稍候再试"
     local verbose=0
     case "$1" in -v|--verbose) verbose=1 ;; esac
     if [ "$(id -u)" -ne 0 ]; then
@@ -1500,6 +1523,8 @@ cmd_stats() {   # 输出各活跃接口的累计字节（App 用来算实时速�
 
 cmd_quality() {   # 每接口 6 个包测延迟/丢包（root 强制走该接口，非 root 只能测默认路由）
     local role dev svc gw out loss rtt min avg max rest via
+    # 逐个接口加主机路由强制走指定网卡，同样要和守护进程的探测互斥
+    acquire_lock_wait 10 || die "另一个 smartroute 操作正在进行（守护进程刚跑过一轮），请稍候再试"
     find_active
     for role in eth wifi; do
         if [ "$role" = "eth" ]; then dev="$ACTIVE_ETH_DEV"; svc="$ACTIVE_ETH_SVC"
@@ -1984,31 +2009,68 @@ balance_status() {
 
 trap 'cleanup_probe_routes >/dev/null 2>&1; rm -rf "$LOCK_DIR" 2>/dev/null' EXIT INT TERM HUP
 
-acquire_lock() {
-    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-        local pid
-        pid="$(cat "$LOCK_DIR/pid" 2>/dev/null)"
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            exit 0   # 已有实例在运行
-        fi
-        rm -rf "$LOCK_DIR"
-        mkdir "$LOCK_DIR" 2>/dev/null || exit 0
+# 返回 0=拿到锁，1=被别人占着。三种抢锁方式都基于它，
+# 避免"退出码语义"在三个函数里各写一遍、各自漂移。
+_lock_try() {
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        echo $$ > "$LOCK_DIR/pid"
+        return 0
     fi
-    echo $$ > "$LOCK_DIR/pid"
+    local pid
+    pid="$(cat "$LOCK_DIR/pid" 2>/dev/null)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        return 1
+    fi
+    # 持有者已死（上次被 SIGKILL）：清残留再试
+    rm -rf "$LOCK_DIR"
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        echo $$ > "$LOCK_DIR/pid"
+        return 0
+    fi
+    return 1
+}
+
+acquire_lock() {
+    _lock_try || exit 0   # 守护进程：安静跳过这一轮，下次再来
+}
+
+# 带等待的抢锁，给交互命令用（measure now / quality / test）。
+#
+# 为什么需要它：这三个命令都会加/删主机路由（measure_latency 和 probe_dev
+# 动的是同一批目标），而守护进程每 20 秒也在动同一批路由。两个进程并发时，
+# 一方的 cleanup_probe_routes 会把另一方刚加的路由删掉——于是探测或测延迟
+# 走了默认路由，也就是**测了另一个接口**。测错的直接后果是错误的可用性判定，
+# 进而触发一次本来不该发生的切换。
+#
+# 为什么不用 acquire_lock_strict（忙就报错）：这些命令常由 App 触发，
+# 而守护进程每 20 秒占锁几秒，撞上的概率很高，每次都报错体验很差。
+# 所以等一小会儿；等不到就明说，不要硬闯。
+acquire_lock_wait() {   # $1=最多等待秒数（默认 8）
+    # 非 root 且锁目录还不存在：直接放行，不要等。
+    #
+    # 锁目录在 /var/run 下，属 root。非 root 用户**建不出**这个目录，
+    # 于是 _lock_try 永远失败、白等满超时、最后报"另一个操作正在进行"——
+    # 而真相是根本没有锁可用。这会把 App 的体检/测延迟页整个打死
+    # （App 调 quality 不带 sudo）。
+    #
+    # 而互斥的目的只是保护主机路由的增删，那件事本身就需要 root：
+    # probe_dev / measure_latency / cmd_quality 在非 root 下都走
+    # "按当前默认路由"的分支，根本不碰路由表，没有东西需要互斥。
+    # 所以非 root 放行是安全的，不是"放弃保护"。
+    if [ ! -d "$LOCK_DIR" ] && [ "$(id -u)" -ne 0 ]; then
+        return 0
+    fi
+    local deadline=$(( $(date +%s) + ${1:-8} ))
+    while :; do
+        _lock_try && return 0
+        [ "$(date +%s)" -ge "$deadline" ] && return 1
+        sleep 0.5
+    done
 }
 
 # 严格版抢锁：被其他实例占用时不静默退出，而是报错（供 balance 这类交互命令用）
 acquire_lock_strict() {
-    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-        local pid
-        pid="$(cat "$LOCK_DIR/pid" 2>/dev/null)"
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            die "另一个 smartroute 正在运行（pid ${pid}），请等它结束再试"
-        fi
-        rm -rf "$LOCK_DIR" 2>/dev/null
-        mkdir "$LOCK_DIR" 2>/dev/null || die "无法创建锁目录 $LOCK_DIR"
-    fi
-    echo $$ > "$LOCK_DIR/pid"
+    _lock_try || die "另一个 smartroute 正在运行（锁: ${LOCK_DIR}），请等它结束再试"
 }
 
 # 修复用户级配置属主：早期版本守护进程以 root 写过 /Users/Shared/smartroute.conf，
@@ -2523,6 +2585,10 @@ cmd_measure() {
         now|refresh)
             find_active
             [ "$(id -u)" -eq 0 ] || die "测速需要 root（要加静态路由才能分别测两个接口）"
+            # 测速会加/删主机路由，必须和守护进程的探测互斥——
+            # 否则两方互相删对方刚加的路由，测到的是另一个接口的数据，
+            # 进而让 speed/latency 模式做出错误的切换决策。
+            acquire_lock_wait 10 || die "另一个 smartroute 操作正在进行（守护进程刚跑过一轮），请稍候再试"
             echo "正在测量，请稍候（两边串行测，各最多 ${SPEED_TEST_TIMEOUT} 秒）…"
             # 先作废缓存，否则 ensure_* 看到"还新鲜"就跳过了
             state_set "speed_$ACTIVE_ETH_DEV" "0"

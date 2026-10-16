@@ -178,8 +178,76 @@ grep -q "ROUTE delete default" "$T/calls" && ok "确实执行了删除" || bad "
 grep -q "失败：无法添加 default via" "$T/sr.log" \
     && ok "明确记录添加失败（用户断网时可排查）" || bad "添加失败没日志，断网却无从查起: $(tail -2 "$T/sr.log")"
 grep -q "^NOTIFY" "$T/calls" && bad "失败了还发成功通知，误导用户" || ok "失败时不发成功通知"
-grep -q "^last_switch=" "$T/state/st" 2>/dev/null \
-    && bad "失败却写了 last_switch（冷却会推迟恢复，延长断网）" || ok "失败不写 last_switch"
+
+# 失败也必须落 last_switch。这条断言原来是反的（"失败不写 last_switch"），
+# 理由写的是"冷却会推迟恢复，延长断网"——那个推理是错的：
+# 失败的尝试同样执行了 route delete default。不节流的话目标持续不可用时
+# 每 20 秒就重试一次，每次都先把默认路由删掉。而现在的失败路径会尝试
+# 把原默认路由加回去，用户在这 45 秒里是**在线**的；不节流等于每 20 秒
+# 把刚恢复的路由再拆一次，那才真的在延长断网。
+grep -q "^last_switch=" "$T/state/st" \
+    && ok "失败也写 last_switch（节流重试，避免每 20 秒拆一次路由）" \
+    || bad "失败不写 last_switch，会每 20 秒重试并重复删默认路由"
+
+# 删之前必须先记下原默认路由，否则加不回来时无法恢复
+grep -q "尝试恢复原默认路由" "$T/sr.log" \
+    && ok "加失败时尝试恢复原默认路由（宁可没切成，也不能让人掉线）" \
+    || bad "加失败就撒手，系统会留在没有默认路由的状态"
+# 恢复也失败时必须给出可照抄的手动命令
+grep -q "请手动执行：sudo route add default" "$T/sr.log" \
+    && ok "恢复也失败时给出可照抄的手动命令" \
+    || bad "恢复失败时无声，用户断网却无从下手"
+
+echo "== 6b. do_switch：加不回去时能恢复原默认路由（不断网）=="
+# 这是最关键的安全属性。场景：切到 en0 失败（MOCK_ADD_RC 只让第一次 add 失败），
+# 但恢复用的 add 必须成功——验证我们真的把原默认路由加回来了。
+reset_calls
+: > "$T/sr.log"; : > "$T/state/st"
+# 自定义 route mock：必须保留 -n get default 的处理，否则 default_dev/default_gw
+# 返回空，bak_if/bak_gw 就是空的，测的就不是想测的路径了（第一版就栽在这里）。
+# 另外 route_add_default 有三个变体，要让"切换失败"必须让前三次 add 都失败，
+# 第四次（恢复原路由）才成功——用计数器实现。
+rm -f "$T/.addcnt"
+cat > "$T/bin/route" <<'EOS'
+#!/bin/bash
+printf 'ROUTE %s\n' "$*" >> "$MOCK_CALLS"
+case "${1:-}" in
+    -n) [ -f "$MOCK_DEFAULT" ] && cat "$MOCK_DEFAULT"; exit 0 ;;
+    add)
+        case "$2" in
+            default)
+                # 计数器目录从 MOCK_CALLS 推。第一版用 $MOCK_T，但 run_in
+                # 并不导出它，于是写到 /.addcnt（不可写），cat 永远拿到空、
+                # n 恒为 1、所有 add 都失败——测出来"恢复失败"是假象。
+                D="${MOCK_CALLS%/*}"
+                n="$(cat "$D/.addcnt" 2>/dev/null || echo 0)"; n=$((n+1))
+                echo "$n" > "$D/.addcnt"
+                # 前 3 次 = route_add_default 的三个变体，全失败 -> 切换失败
+                # 第 4 次 = 恢复原默认路由，成功 -> 用户不断网
+                [ "$n" -le 3 ] && exit 1
+                exit 0 ;;
+        esac
+        exit 0 ;;
+esac
+exit 0
+EOS
+chmod +x "$T/bin/route"
+out="$(run_in "$T/order" "$T/def_en1" 'export MOCK_REORDER_RC=1; do_switch en0 en1 ok ok 2 2')"
+grep -q "尝试恢复原默认路由" "$T/sr.log" \
+    && ok "走了恢复分支" || bad "没走恢复分支: $(tail -3 "$T/sr.log")"
+grep -q "已恢复原默认路由：en1 via" "$T/sr.log" \
+    && ok "原默认路由被加回来了（用户不断网）" || bad "没恢复成功: $(tail -3 "$T/sr.log")"
+# 恢复的必须是原来的接口，不能是切换目标
+grep -q "ROUTE add default.*-interface en1" "$T/calls" \
+    && ok "恢复用的是原接口 en1，不是切换目标 en0" \
+    || bad "恢复用了错误的接口: $(grep 'add default' "$T/calls")"
+grep -q "严重：无法恢复默认路由" "$T/sr.log" \
+    && bad "恢复成功却报严重错误，误导用户" || ok "恢复成功不报严重错误"
+# 删之前必须先查原参数（default_dev/default_gw），否则无从恢复
+grep -q 'bak_if="\$(default_dev)"' smartroute.sh \
+    && ok "删之前记下原接口" || bad "没记原接口"
+grep -q 'bak_gw="\$(default_gw)"' smartroute.sh \
+    && ok "删之前记下原网关" || bad "没记原网关"
 
 echo "== 7. do_switch：目标接口没有网关信息 =="
 reset_calls
