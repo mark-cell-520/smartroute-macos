@@ -53,6 +53,12 @@ common='
                   esac; }
     do_switch() { printf "SWITCH %s\n" "$1" >> "$MOCK_CALLS"; }
     default_dev() { echo "${MOCK_DEFAULT_DEV:-en1}"; }
+    # 测量必须 mock 成失败。这两条用例的意图是"没测出数据时保持现状"，
+    # 早期没 mock，真实的 measure_throughput/measure_latency 会真去跑，
+    # 网络好的时候就真测出值来、然后真切换——测试从"验证不瞎猜"
+    # 变成"看机器当前网速决定通过与否"，时通时不通。
+    measure_throughput() { return 0; }
+    measure_latency() { return 0; }
     apply_rules() { :; }
     wifi_failover_if_needed() { :; }
 '

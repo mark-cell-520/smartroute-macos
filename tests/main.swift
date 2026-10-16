@@ -160,6 +160,39 @@ eqI(NetworkModel.sanitizeConf("这一行没有等号\n").1, 1, "无等号的行�
 let (cleanAll, _) = NetworkModel.sanitizeConf("MODE=banana\nBOGUS=1\n")
 isTrue(cleanAll.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, "全非法时内容为空")
 
+print("== 8. Shell.quote：任意字符串安全进 shell ==")
+// 这是 App 拼特权命令的唯一入口。Wi-Fi 名里出现空格、单引号、$ 都很常见，
+// 不转义会被 shell 拆开或求值。历史上恶意 Wi-Fi 名就是从这里打进去执行的。
+// 关键：这里测的是**真实的 Swift 实现**，再经**真实的 bash** 往返——
+// 以前的 mock_quote.sh 是在 bash 里复刻一遍转义逻辑，Swift 真身漂移了
+// 它照样通过，属于"测试说谎"。现在两边都跑真的。
+func quoteRoundTrip(_ s: String, _ name: String) {
+    checks += 1
+    let quoted = Shell.quote(s)
+    // 用真实 bash 执行，看拿到的参数和原串是否完全一致
+    let (out, code) = Shell.run("printf '%s' " + quoted, timeout: 10)
+    if code == 0 && out == s { print("  OK \(name)") }
+    else { failures += 1; print("  XX \(name): got [\(out)] code=\(code) quoted=[\(quoted)]") }
+}
+quoteRoundTrip("Home-5G", "普通 SSID")
+quoteRoundTrip("A9 5G", "带空格（不能拆成两个参数）")
+quoteRoundTrip("it's", "带单引号（最容易打破引用）")
+quoteRoundTrip("a'b'c", "多个单引号")
+quoteRoundTrip("$(touch /tmp/PWNED)", "命令替换不能被求值")
+quoteRoundTrip("`touch /tmp/PWNED`", "反引号不能被求值")
+quoteRoundTrip("a;rm -rf /", "分号不能当命令分隔符")
+quoteRoundTrip("a|b", "管道符")
+quoteRoundTrip("a&b", "& 不能当后台任务")
+quoteRoundTrip("a>b", "重定向符")
+quoteRoundTrip("a\\b", "反斜杠")
+quoteRoundTrip("a\"b", "双引号")
+quoteRoundTrip("", "空串")
+quoteRoundTrip(" 前后空格 ", "前后空格要保留")
+quoteRoundTrip("中文网络名", "中文")
+quoteRoundTrip("网络 名 带空格", "中文带空格")
+// 恶意 Wi-Fi 名的真实 payload（历史漏洞）：双引号里嵌 do shell script
+quoteRoundTrip("x\" & (do shell script \"touch /tmp/PWNED2\") & \"", "AppleScript 注入 payload 原样往返")
+
 print("")
 print("结果: \(checks - failures) 通过, \(failures) 失败")
 exit(failures == 0 ? 0 : 1)

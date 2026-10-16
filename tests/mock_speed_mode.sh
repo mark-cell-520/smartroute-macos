@@ -85,6 +85,7 @@ run() {
         export MOCK_ROUTES='$T/routes'
         export MOCK_SPEED_en0='${MOCK_SPEED_en0:-0}' MOCK_SPEED_en1='${MOCK_SPEED_en1:-0}'
         export MOCK_LAT_en0='${MOCK_LAT_en0:-0}' MOCK_LAT_en1='${MOCK_LAT_en1:-0}'
+        export MOCK_TIMELINE='${MOCK_TIMELINE:-}' 
         . '$T/sr.sh'
         ACTIVE_ETH_DEV=en0; ACTIVE_WIFI_DEV=en1
         ACTIVE_ETH_SVC=Ethernet; ACTIVE_WIFI_SVC='Wi-Fi'
@@ -176,13 +177,39 @@ out="$(run 'SPEED_RECHECK=300
 printf '%s' "$out" | grep -q "en0=1993576" && ok "新鲜的不重测（省流量）" || bad "重测了新鲜的: $out"
 printf '%s' "$out" | grep -q "en1=1338605" && ok "过期的重测了（旧值 888888 被换掉）" || bad "没重测过期的: $out"
 
-echo "=== 7. 串行测量的约定（并行会互相抢带宽）==="
-# ensure_throughput 是 for 循环逐个测，没有 & 后台任务
-if grep -A8 '^ensure_throughput()' smartroute.sh | grep -qE '[^&] &$|^\s*&'; then
-    bad "ensure_throughput 里出现了后台任务，会并行测速互相抢带宽"
+echo "=== 7. 串行测量（并行会互相抢带宽，两个数都变小）==="
+# 行为验证，不再 grep 源码找 "&"：
+# 静态检查只能证明"现在没有 &"，证明不了测量真的不重叠——将来换成
+# DispatchQueue.concurrentPerform 之类没有 & 的并行写法，它照样通过，
+# 而带宽互相抢的问题已经发生了。
+# 现在让 measure_throughput 记录"开始/结束"时间线，断言第二次测量
+# 必须发生在第一次结束之后（严格不重叠）。
+: > "$T/timeline"
+out="$(MOCK_TIMELINE="$T/timeline" run '
+    SPEED_RECHECK=0                 # 强制当过期：前面几节留下的新鲜缓存会让它跳过测量
+    measure_throughput() {
+        echo "start $1 $(date +%s%N)" >> "$MOCK_TIMELINE"
+        sleep 0.2                      # 模拟一次测量要花点时间
+        echo "end   $1 $(date +%s%N)" >> "$MOCK_TIMELINE"
+        echo 1000000
+    }
+    ensure_throughput en0 en1
+    cat "$MOCK_TIMELINE"' 2>&1)"
+n_start=$(printf '%s' "$out" | grep -c "^start")
+n_end=$(printf '%s' "$out" | grep -c "^end")
+[ "$n_start" = "2" ] && [ "$n_end" = "2" ] && ok "两个接口都测了" || bad "测量次数不对: $out"
+# 用顺序而不是时间戳：macOS 的 date 不支持 %N，拿不到亚秒时间。
+# 而顺序已经足够——串行时时间线必然是
+#   start en0 → end en0 → start en1 → end en1
+# 一旦并行就会交错成 start en0 → start en1 → ...，一眼看出来。
+seq="$(printf '%s' "$out" | awk '/^(start|end)/{print $1, $2}' | tr '\n' ',')"
+if [ "$seq" = "start en0,end en0,start en1,end en1," ]; then
+    ok "严格串行：第二次测量在第一次结束之后才开始（没有重叠）"
 else
-    ok "ensure_throughput 串行测量"
+    bad "测量重叠了（并行测速会互相抢带宽）: $seq"
 fi
+first=$(printf '%s' "$out" | awk '/^start/{print $2; exit}')
+[ "$first" = "en0" ] && ok "先测 eth 再测 wifi（顺序可预期）" || bad "测量顺序变了: $first"
 
 echo "=== 8. 测速失败不覆盖旧值 ==="
 out="$(run 'SPEED_RECHECK=0 MOCK_SPEED_en0=0

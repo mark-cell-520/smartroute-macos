@@ -10,6 +10,13 @@
 # 这个测试不启动 App，直接把两层的转义逻辑在 bash 里复刻一遍，
 # 验证最终 bash 拿到的参数与原始 SSID 完全一致。
 #
+# ⚠️ 注意：这是**复刻版**，不是权威。它验证的是"这个算法正确"，
+# 验证不了"Swift 里的实现就是这個算法"——实现漂移了它照样通过。
+# 权威测试是 mock_swift_parse.sh 的第 8 节：那里编译真实的
+# Shell.quote，再经真实的 bash 往返，包括恶意 Wi-Fi 名的 payload。
+# 本文件保留是因为它同时覆盖了 AppleScript 那一层（as_escape 与
+# Swift 侧转义的对应关系），那一层目前只有这里验。
+#
 # 运行: bash tests/mock_quote.sh
 cd "$(dirname "$0")/.."
 PASS=0; FAIL=0
