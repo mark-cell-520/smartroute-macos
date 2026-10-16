@@ -1106,10 +1106,21 @@ final class NetworkModel: ObservableObject {
         }
     }
 
+    /// CIDR 白名单校验。addRule 和 removeRule 必须用同一套——
+    /// 以前只有 addRule 校验，removeRule 直接把 cidr 插进命令，
+    /// 而那个 cidr 来自对 rule list 输出的解析（内容可被预置的 rules 文件影响），
+    /// 点一下删除按钮就能以 App 用户身份执行注入的命令。
+    private func validCidr(_ cidr: String) -> Bool {
+        cidr.range(of: #"^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$"#, options: .regularExpression) != nil
+    }
+    private func validDev(_ dev: String) -> Bool {
+        dev.range(of: #"^[a-z][a-z0-9]*$"#, options: .regularExpression) != nil
+    }
+
     func addRule(cidr: String, dev: String) {
         // 白名单校验，防止注入
-        let cidrOK = cidr.range(of: #"^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$"#, options: .regularExpression) != nil
-        let devOK = dev.range(of: #"^[a-z][a-z0-9]*$"#, options: .regularExpression) != nil
+        let cidrOK = validCidr(cidr)
+        let devOK = validDev(dev)
         guard cidrOK, devOK else {
             ruleMessage = "格式不正确：CIDR 形如 10.0.0.0/8，接口形如 en0"
             return
@@ -1117,7 +1128,8 @@ final class NetworkModel: ObservableObject {
         ruleMessage = ""
         busy = true
         DispatchQueue.global().async {
-            let (out, code) = Shell.run("'\(ScriptLocator.scriptPath)' rule add \(cidr) \(dev)", timeout: 8)
+            // 白名单之外再加一层引号，双保险
+            let (out, code) = Shell.run("'\(ScriptLocator.scriptPath)' rule add \(Shell.quote(cidr)) \(Shell.quote(dev))", timeout: 8)
             DispatchQueue.main.async {
                 self.busy = false
                 self.ruleMessage = (code == 0) ? "已添加 \(cidr) -> \(dev)，守护进程 ≤20 秒内应用" : "添加失败：\(out)"
@@ -1127,10 +1139,17 @@ final class NetworkModel: ObservableObject {
     }
 
     func removeRule(cidr: String) {
+        // 必须和 addRule 一样校验。以前这里没有，cidr 来自对 rule list
+        // 输出的解析，而那个输出反映的是可被他人预置的 rules 文件——
+        // 点删除按钮就等于把文件内容插进 shell 命令。
+        guard validCidr(cidr) else {
+            ruleMessage = "CIDR 格式不正确：\(cidr)"
+            return
+        }
         ruleMessage = ""
         busy = true
         DispatchQueue.global().async {
-            let (out, code) = Shell.run("'\(ScriptLocator.scriptPath)' rule del \(cidr)", timeout: 8)
+            let (out, code) = Shell.run("'\(ScriptLocator.scriptPath)' rule del \(Shell.quote(cidr))", timeout: 8)
             DispatchQueue.main.async {
                 self.busy = false
                 self.ruleMessage = (code == 0) ? "已删除 \(cidr)" : "删除失败：\(out)"

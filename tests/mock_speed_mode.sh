@@ -212,5 +212,53 @@ printf '%s' "$out" | grep -q "speed:eth=未测" && ok "没测过显示未测（�
 printf '%s' "$out" | grep -q "latency:eth=未测" && ok "延迟没测也显示未测" || bad "空白: $out"
 
 echo
+echo "== 11. 0 和负数必须当「没测到」，不能当合法值 =="
+# 出过真 bug：cmd_measure 用 state_set lat_$dev 0 作废缓存，测失败不覆写，
+# 于是 state 里留着 "0"。pick_fastest 只查空串，0ms 永远赢——
+# latency 模式会钉死在那个其实很慢（甚至已死）的接口上。
+# pick_by_speed 早就处理了 <=0，两边不一致。
+_pf() {   # pick_fastest 的判定
+    bash -c "
+        . '$T/sr.sh'
+        pick_fastest $1
+    " 2>/dev/null
+}
+_ps() {   # pick_by_speed 的判定
+    bash -c "
+        . '$T/sr.sh'
+        pick_by_speed $1
+    " 2>/dev/null
+}
+[ "$(_pf 'en0 0 en1 12')" = "en1" ] && ok "pick_fastest: 0 不当合法延迟（B 赢）" || bad "pick_fastest 0 被当合法: $(_pf 'en0 0 en1 12')"
+[ "$(_pf 'en0 12 en1 0')" = "en0" ] && ok "pick_fastest: 0 在 B 侧时 A 赢" || bad "B 侧 0 处理错: $(_pf 'en0 12 en1 0')"
+[ -z "$(_pf 'en0 0 en1 0')" ] && ok "pick_fastest: 两边都是 0 时判"没测到"" || bad "两边 0 却有结论"
+[ "$(_pf 'en0 -5 en1 12')" = "en1" ] && ok "pick_fastest: 负延迟被拒" || bad "负延迟被当合法"
+[ "$(_pf 'en0 12.5 en1 10')" = "en1" ] && ok "pick_fastest: 小数正常比较" || bad "小数比较错"
+# 和 pick_by_speed 对齐：同为 <=0 都当没测到
+[ "$(_ps 'en0 0 en1 1100000')" = "en1" ] && ok "pick_by_speed: 0 不当合法吞吐" || bad "pick_by_speed 0 被当合法"
+# tie 阈值两边要一致（以前 speed 用 <、latency 用 <=，同一差距一个换一个不换）
+[ "$(_pf 'en0 10 en1 12')" = "en0" ] && ok "正好 20% 差距时判赢家（与 speed 一致）" || bad "阈值不一致: $(_pf 'en0 10 en1 12')"
+[ "$(_pf 'en0 10 en1 11')" = "tie" ] && ok "不到 20% 判平手" || bad "平手判断错: $(_pf 'en0 10 en1 11')"
+
+# _metric_val 也不能把 0 透传出去（否则界面显示"0 ms"误导用户）。
+# 用临时脚本文件而不是内联 bash -c：嵌套引号在 bash 里很容易写错，
+# 而且错了报的是外层脚本的行号，很难查。
+cat > "$T/mv.sh" <<'MVEOF'
+#!/bin/bash
+T="$1"; v="$2"
+. "$T/sr.sh"
+STATE_FILE="$T/st"; STATE_WRITABLE=1
+state_set lat_x "$v"
+printf '%s' "$(_metric_val lat_x)"
+MVEOF
+_mv() { bash "$T/mv.sh" "$T" "$1" 2>/dev/null; }
+[ "$(_mv 12.5)" = "12.5" ] && ok "_metric_val: 正常值透传" || bad "正常值被滤掉"
+[ -z "$(_mv 0)" ]     && ok "_metric_val: 0 当没测到" || bad "0 被透传了"
+[ -z "$(_mv 0.0)" ]   && ok "_metric_val: 0.0 当没测到" || bad "0.0 被透传了"
+[ -z "$(_mv -5)" ]    && ok "_metric_val: 负数当没测到" || bad "负数被透传了"
+[ -z "$(_mv abc)" ]   && ok "_metric_val: 非数字当没测到" || bad "非数字被透传了"
+[ "$(_mv 0.001)" = "0.001" ] && ok "_metric_val: 小正数仍透传" || bad "小正数被误滤"
+
+echo
 echo "结果: $PASS 通过, $FAIL 失败"
 [ "$FAIL" -eq 0 ]

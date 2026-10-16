@@ -56,7 +56,7 @@ SPEED_SWITCH_RATIO=30       # 判定"明显更快"的吞吐差阈值（百分比
                             # 避免在两条差不多的线路间来回切
 
 # 可用 set 命令修改的配置项
-VALID_KEYS="MODE OK_N FAIL_N COOLDOWN PROBE_TARGETS PING_TIMEOUT NC_TIMEOUT TLS_PROBE NOTIFY AUTO_WIFI_POWER BALANCE BALANCE_MODE FASTEST_SWITCH_RATIO WIFI_FAILOVER WIFI_PREFERRED WIFI_FAILOVER_COOLDOWN SPEED_TEST_URL SPEED_TEST_TIMEOUT SPEED_RECHECK LATENCY_RECHECK SPEED_SWITCH_RATIO"
+VALID_KEYS="MODE OK_N FAIL_N COOLDOWN PROBE_TARGETS PING_TIMEOUT NC_TIMEOUT TLS_PROBE NOTIFY AUTO_WIFI_POWER BALANCE BALANCE_MODE FASTEST_SWITCH_RATIO WIFI_FAILOVER WIFI_PREFERRED WIFI_FAILOVER_COOLDOWN SPEED_TEST_URL SPEED_TEST_TIMEOUT SPEED_RECHECK LATENCY_RECHECK SPEED_SWITCH_RATIO FASTEST_RECHECK"
 
 CONF="/etc/smartroute.conf"                     # 系统级配置（root 维护，install.sh 生成）
 USER_CONF="/Users/Shared/smartroute.conf"       # 用户级配置（App/普通用户可写，优先级更高）
@@ -70,11 +70,61 @@ PF_ANCHOR="com.apple/smartroute"              # pf 锚点名：挂在系统 pf.c
 PF_ANCHOR_FILE="/etc/pf.anchors/com.user.smartroute"   # 规则文件（路径与锚点名无关）
 PF_STATE_FILE="/var/db/smartroute/pf.state"     # 记录我们是否开启了系统 pf（用于还原）
 
-[ -r "$CONF" ] && . "$CONF"
-[ -r "$USER_CONF" ] && . "$USER_CONF"           # 用户级覆盖系统级
+[ -r "$CONF" ] && . "$CONF"                    # 系统级：root 维护，install.sh 生成，可信
+# 用户级配置的加载挪到 conf_parse_file 定义之后（bash 要求函数先定义再调用）
 
 # ---------------- 基础函数 ----------------
 ts()  { date '+%Y-%m-%d %H:%M:%S'; }
+
+# 按 key 校验单个配置值（写入和解析共用）。$1=key $2=value -> 0 合法
+conf_value_ok() {
+    local key="$1" val="$2"
+    case "$key" in
+        MODE)          case "$val" in auto|ethernet|wifi|speed|latency) ;; *) return 1 ;; esac ;;
+        BALANCE_MODE)  case "$val" in round-robin|fastest) ;; *) return 1 ;; esac ;;
+        OK_N|FAIL_N|COOLDOWN|PING_TIMEOUT|NC_TIMEOUT|FASTEST_SWITCH_RATIO|FASTEST_RECHECK|WIFI_FAILOVER_COOLDOWN|SPEED_TEST_TIMEOUT|SPEED_RECHECK|LATENCY_RECHECK|SPEED_SWITCH_RATIO)
+                       case "$val" in ''|*[!0-9]*) return 1 ;; esac ;;
+        TLS_PROBE|NOTIFY|AUTO_WIFI_POWER|BALANCE|WIFI_FAILOVER)
+                       case "$val" in 0|1) ;; *) return 1 ;; esac ;;
+        PROBE_TARGETS) case "$val" in *[!0-9.\ ]*) return 1 ;; esac ;;
+        WIFI_PREFERRED) case "$val" in *[$'\n\r']*) return 1 ;; esac ;;
+        SPEED_TEST_URL) [ -n "$val" ] || return 1 ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+# 解析配置文件：逐行读，只认白名单键，逐值校验，**绝不 source**。
+# 为什么不能用 source：USER_CONF=/Users/Shared/smartroute.conf，而 /Users/Shared
+# 是 1777（世界可写 + sticky），install.sh 又从不创建这个文件。也就是说任何本地用户
+# 都能创建它，而 root 守护进程每 20 秒会读一次配置文件——用 source 等于把
+# "任意本地用户 → root"的门敞开（写一行 touch 就能验证）。
+# 实测确认过：source 会执行文件里的任意 shell 代码。
+conf_parse_file() {   # $1=文件路径
+    local f="$1" line k v n=0
+    [ -r "$f" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        # 去掉行尾 CR（配置文件被 Windows 编辑器改过的情况）
+        line="${line%$'\r'}"
+        case "$line" in ''|\#*) continue ;; esac
+        case "$line" in *=*) ;; *) continue ;; esac
+        k="${line%%=*}"; v="${line#*=}"
+        k="${k%%[[:space:]]*}"; k="${k##[[:space:]]}"
+        # 只认白名单键
+        case " $VALID_KEYS " in
+            *" $k "*) ;;
+            *) continue ;;
+        esac
+        # 值必须过校验。过不了就忽略并计数，不要让垃圾值生效，
+        # 但也不能静默——计数留给调用方决定要不要提示。
+        if ! conf_value_ok "$k" "$v"; then
+            n=$((n+1)); continue
+        fi
+        eval "$k=\$v"
+    done < "$f"
+    return 0
+}
+conf_parse_file "$USER_CONF"                     # 用户级覆盖系统级
 
 log() {
     local msg="$*"
@@ -252,10 +302,23 @@ set_wifi_power() {  # $1=设备 $2=on/off
     networksetup -setairportpower "$1" "$2" >/dev/null 2>&1
 }
 
+# AppleScript 双引号字符串的转义：先 \ 再 "。顺序不能反，
+# 否则转义产生的 \ 会被二次转义。与 Privileged.swift 的转义保持一致。
+as_escape() {   # $1=原文 -> stdout: 可安全放进 AppleScript 双引号串的内容
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
 notify() {   # $1=标题 $2=内容
     [ "$NOTIFY" = "1" ] || return 0
     command -v osascript >/dev/null 2>&1 || return 0
-    osascript -e "display notification \"$2\" with title \"$1\"" >/dev/null 2>&1
+    # $1/$2 必须转义。故障转移成功时 $2 是**当前连上的 Wi-Fi 名**，
+    # 而 Wi-Fi 名完全由 AP 控制：SSID 可以是 foo" & (do shell script "...") & "
+    # 不转义就会逃出 AppleScript 字符串，以调用方身份执行任意代码——
+    # 守护进程是 root，于是恶意 AP + 一个保存过该网络的受害者 = root RCE。
+    # 实测确认过注入本身可以成立。
+    local t b
+    t="$(as_escape "$1")"; b="$(as_escape "$2")"
+    osascript -e "display notification \"$b\" with title \"$t\"" >/dev/null 2>&1
     return 0
 }
 
@@ -395,14 +458,23 @@ measure_latency() {   # $1=设备 $2=网关 -> stdout: 平均 RTT 毫秒（如 1
 
 # 比较两个接口的延迟，选出更快的一方。
 # 输出: 设备名；差距小于阈值时输出 tie（表示差距不明显，应继续轮询而不是单选）
-pick_fastest() {   # $1=设备A $2=延迟A $3=设备B $4=延迟B
+pick_fastest() {   # $1=设备A $2=延迟A $3=设备B $4=延迟B -> stdout: 设备名 | tie | 空
     local d1="$1" l1="$2" d2="$3" l2="$4"
-    if [ -z "$l1" ] && [ -z "$l2" ]; then echo ""; return 1; fi
-    [ -z "$l1" ] && { echo "$d2"; return 0; }     # 只有 B 测得出来
-    [ -z "$l2" ] && { echo "$d1"; return 0; }
+    # 只查空串不够：0 和负数也必须当"没测到"。
+    # cmd_measure 会用 state_set lat_$dev 0 作废缓存，而 ensure_latency 只在
+    # 测成功时覆写——测失败就留着 "0"。若把 0 当合法延迟，0ms 永远赢，
+    # latency 模式会钉死在那个其实很慢（甚至已死）的接口上。
+    # 这和 pick_by_speed 的 <=0 处理必须一致（以前不一致，是个真 bug）。
+    case "$l1" in ''|*[!0-9.]*) ;; esac
+    case "$l2" in ''|*[!0-9.]*) ;; esac
     awk -v a="$l1" -v b="$l2" -v r="$FASTEST_SWITCH_RATIO" -v d1="$d1" -v d2="$d2" 'BEGIN{
+        if (a+0 <= 0 && b+0 <= 0) { exit }              # 都没测出来
+        if (a+0 <= 0) { print d2; exit }                # 只有 B 有数
+        if (b+0 <= 0) { print d1; exit }
         lo = (a < b ? a : b); hi = (a < b ? b : a)
-        if (hi <= lo * (100 + r) / 100) { print "tie"; exit }   # 差距不够大
+        # 与 pick_by_speed 统一用严格小于：正好等于阈值时判定赢家，
+        # 不一致会让"同一个差距"在两种模式下一个换一个不换。
+        if (hi < lo * (100 + r) / 100) { print "tie"; exit }
         print (a < b ? d1 : d2)
     }'
     return 0
@@ -849,14 +921,16 @@ cmd_set() {
         *" $key "*) ;;
         *) echo "不支持的配置项: $key"; echo "可用: $VALID_KEYS"; exit 1 ;;
     esac
-    case "$key" in
-        MODE)
-            case "$val" in auto|ethernet|wifi|speed|latency) ;; *) echo "MODE 只能是 auto|ethernet|wifi|speed|latency"; exit 1 ;; esac ;;
-        OK_N|FAIL_N|COOLDOWN|PING_TIMEOUT|NC_TIMEOUT)
-            [[ "$val" =~ ^[0-9]+$ ]] || { echo "$key 必须是正整数"; exit 1; } ;;
-        TLS_PROBE|NOTIFY|AUTO_WIFI_POWER|BALANCE|WIFI_FAILOVER|WIFI_PREFERRED|WIFI_FAILOVER_COOLDOWN|SPEED_TEST_URL|SPEED_TEST_TIMEOUT|SPEED_RECHECK|LATENCY_RECHECK|SPEED_SWITCH_RATIO)
-            case "$val" in 0|1) ;; *) echo "$key 只能是 0 或 1"; exit 1 ;; esac ;;
-    esac
+    # 用和解析时同一套校验（conf_value_ok）。以前这里是另一份手写的 case，
+    # 把 WIFI_PREFERRED / SPEED_TEST_URL / SPEED_TEST_TIMEOUT / SPEED_RECHECK /
+    # LATENCY_RECHECK / SPEED_SWITCH_RATIO 全并进了"只能是 0 或 1"那一组——
+    # 于是 App 里保存优先列表、改测速地址必然失败，用户只能手改配置文件，
+    # 反而把用户往 H1（source 用户配置）那个坑里推。两处校验必须同源。
+    conf_value_ok "$key" "$val" || {
+        echo "配置值不合法: $key=$val"
+        echo "（可用键: $VALID_KEYS）"
+        exit 1
+    }
 
     # 写入目标：优先用户级配置（普通用户可写，无需 sudo）
     if [ -w "$USER_CONF" ] || [ -w "$(dirname "$USER_CONF")" ]; then
@@ -2664,11 +2738,17 @@ ensure_latency() {   # $1=eth_dev $2=eth_gw $3=wifi_dev $4=wifi_gw
     done
 }
 
-_metric_val() {   # $1=state 键 -> stdout: 数值（无记录输出空）
+_metric_val() {   # $1=state 键 -> stdout: 正数（无记录/非数字/非正数都输出空）
     local v
     v="$(_metric_get "$1")"
     v="${v%% *}"
-    case "$v" in ''|*[!0-9.]*) echo "" ;; *) echo "$v" ;; esac
+    # 非数字一律当没有
+    case "$v" in ''|*[!0-9.]*) return 0 ;; esac
+    # 0 和负数也当没测到。cmd_measure 会用 state_set ... 0 作废缓存，
+    # 测失败就留着 0；放过它界面会显示"0 ms"/"0 Mbps"，
+    # 也会让"0ms 永远赢"那类判断有更多入口。
+    awk -v x="$v" 'BEGIN{ exit (x+0 > 0) ? 0 : 1 }' || return 0
+    printf '%s' "$v"
 }
 
 # 按吞吐挑赢家：大的赢，差距不到 SPEED_SWITCH_RATIO 判 tie（保持现状）

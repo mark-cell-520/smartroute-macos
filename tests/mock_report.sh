@@ -121,16 +121,32 @@ else
         printf '%s' "$out" | grep -q "root" && ok "$c 提示了 root 相关原因" || bad "$c 没说明为什么失败"
     done
 fi
-# 但配置可写时（App 提权后）必须真的生效——不能为了防假成功而永远拒绝
-if [ -w /Users/Shared/smartroute.conf ] || [ -w /Users/Shared ]; then
-    before="$(grep -c '^WIFI_FAILOVER=' /Users/Shared/smartroute.conf 2>/dev/null || echo 0)"
-    bash smartroute.sh wifi auto on >/dev/null 2>&1
-    after="$(grep '^WIFI_FAILOVER=' /Users/Shared/smartroute.conf 2>/dev/null | head -1)"
-    [ "${after#WIFI_FAILOVER=}" = "1" ] && ok "配置可写时 wifi auto on 真的写入" || bad "可写时也没写入: $after"
-    bash smartroute.sh wifi auto off >/dev/null 2>&1
-    after2="$(grep '^WIFI_FAILOVER=' /Users/Shared/smartroute.conf 2>/dev/null | head -1)"
-    [ "${after2#WIFI_FAILOVER=}" = "0" ] && ok "wifi auto off 真的写入" || bad "off 也没写入: $after2"
-fi
+# 本文件里 $T 是 mktemp 出来的普通文件，这里要改成目录，
+# 否则往 $T/xxx.sh 写会失败。
+TD="$(mktemp -d /tmp/sr_report.XXXXXX)"
+mkdir -p "$TD"
+awk '/^# ---------------- 入口 ----------------/{exit} {print}' smartroute.sh > "$TD/sr.sh"
+# 配置可写时必须真的生效——不能为了防假成功而永远拒绝。
+# **必须用临时配置文件**：直接跑 `bash smartroute.sh wifi auto on` 会写真实的
+# /Users/Shared/smartroute.conf，测试就变成了"跑一次回归改一次用户配置"。
+# 这里 source 脚本前缀后把 USER_CONF 指到临时文件，全程不碰真实系统。
+cat > "$TD/confw.sh" <<'CWEOF'
+#!/bin/bash
+T="$1"; act="$2"
+. "$T/sr.sh"
+USER_CONF="$T/fake.conf"
+conf_set_auto WIFI_FAILOVER "$act"
+echo "rc=$?"
+grep '^WIFI_FAILOVER=' "$T/fake.conf" 2>/dev/null | head -1
+CWEOF
+out="$(bash "$TD/confw.sh" "$TD" 1 2>/dev/null)"
+[ "$(printf '%s' "$out" | head -1)" = "rc=0" ] && ok "conf_set_auto 可写时返回 0" || bad "可写时反而失败: $out"
+printf '%s' "$out" | grep -q "WIFI_FAILOVER=1" && ok "可写时真的写进去了" || bad "可写时没写入: $out"
+out="$(bash "$TD/confw.sh" "$TD" 0 2>/dev/null)"
+printf '%s' "$out" | grep -q "WIFI_FAILOVER=0" && ok "改成 0 也生效" || bad "改成 0 没生效: $out"
+# 已有同名项时要更新而不是追加（否则配置文件里出现两行 WIFI_FAILOVER）
+out="$(bash "$TD/confw.sh" "$TD" 1 2>/dev/null; bash "$TD/confw.sh" "$TD" 0 2>/dev/null | grep -c '^WIFI_FAILOVER=')"
+[ "$(printf '%s' "$out" | tail -1)" = "1" ] && ok "重复设置不产生重复行" || bad "出现重复行: $out"
 
 # 这两个不受配置权限影响，能证明 config set 真的转发给了 cmd_set
 # （以前 config 完全忽略参数，只打印一遍当前配置）
@@ -140,6 +156,76 @@ out="$(bash smartroute.sh config set BALANCE 2>&1)"; rc=$?
 printf '%s' "$out" | grep -q "KEY VALUE" && ok "config set 缺值时给用法" || bad "缺值没给用法: $out"
 out="$(bash smartroute.sh config 乱参数 2>&1)"; rc=$?
 [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "用法" && ok "config 带陌生参数时报用法错误" || bad "config 陌生参数被静默忽略"
+
+cat > "$TD/evil.conf" <<'EVEOF'
+MODE=latency
+touch /tmp/SR_TEST_PWNED_CONF
+SPEED_SWITCH_RATIO=abc
+OK_N=-3
+BOGUS_KEY=1
+WIFI_FAILOVER=1
+EVEOF
+cat > "$TD/parse.sh" <<'PREOF'
+#!/bin/bash
+T="$1"
+. "$T/sr.sh"
+USER_CONF="$T/evil.conf"
+conf_parse_file "$USER_CONF"
+printf 'MODE=%s\n'          "$MODE"
+printf 'WIFI_FAILOVER=%s\n' "$WIFI_FAILOVER"
+printf 'RATIO=%s\n'         "$SPEED_SWITCH_RATIO"
+printf 'OK_N=%s\n'          "$OK_N"
+printf 'BOGUS=%s\n'         "${BOGUS_KEY:-UNSET}"
+PREOF
+cat > "$TD/notify.sh" <<'NOOF'
+#!/bin/bash
+T="$1"
+. "$T/sr.sh"
+NOTIFY=1
+notify "SmartRoute" "已切换到可用 Wi-Fi：$(cat "$T/ssid.txt")"
+NOOF
+
+echo "=== 14. 用户配置必须解析而不是 source（防本地提权） ==="
+# 出过真漏洞：USER_CONF=/Users/Shared/smartroute.conf 被 root 守护进程 source，
+# 而 /Users/Shared 是 1777、install.sh 从不创建这个文件——
+# 任何本地用户创建它就能在 20 秒内拿到 root。实测复现成功。
+# 现在改成逐行解析 + 白名单 + 按 key 校验值，绝不执行文件里的代码。
+rm -f /tmp/SR_TEST_PWNED_CONF
+out="$(bash "$TD/parse.sh" "$TD" 2>&1)"
+printf '%s' "$out" | grep -q "MODE=latency"     && ok "合法键生效（MODE）" || bad "合法键没生效: $out"
+printf '%s' "$out" | grep -q "WIFI_FAILOVER=1"  && ok "合法键生效（WIFI_FAILOVER）" || bad "布尔键没生效"
+printf '%s' "$out" | grep -q "RATIO=30"         && ok "非法值被拒（回落默认 30）" || bad "非法值生效了: $out"
+printf '%s' "$out" | grep -q "OK_N=2"           && ok "负数被拒（回落默认 2）" || bad "负数生效了"
+printf '%s' "$out" | grep -q "BOGUS=UNSET"      && ok "白名单外的键被拒" || bad "白名单外的键生效了"
+[ ! -e /tmp/SR_TEST_PWNED_CONF ] && ok "配置文件里的任意代码没有执行" || bad "配置文件被 source 了，任意代码已执行"
+rm -f /tmp/SR_TEST_PWNED_CONF
+# 函数必须先定义再调用（bash 的硬性要求，改错过一次）
+_call="$(grep -n '^conf_parse_file "\$USER_CONF"' smartroute.sh | head -1 | cut -d: -f1)"
+_def="$(grep -n '^conf_parse_file() {' smartroute.sh | head -1 | cut -d: -f1)"
+[ -n "$_call" ] && [ -n "$_def" ] && [ "$_call" -gt "$_def" ] \
+    && ok "conf_parse_file 调用点在定义之后" || bad "调用点在定义之前（bash 会 command not found）"
+
+echo "=== 15. notify() 必须转义 AppleScript（防恶意 Wi-Fi 名 RCE） ==="
+# 出过真漏洞：$2 未转义就插进 osascript，而故障转移成功时 $2 是当前 Wi-Fi 名，
+# Wi-Fi 名完全由 AP 控制。实测：不转义时恶意 SSID 能逃逸执行 do shell script
+# （守护进程是 root，于是恶意 AP + 保存过该网络的受害者 = root RCE）。
+rm -f /tmp/SR_TEST_PWNED_NOTIFY
+printf '%s' 'foo" & (do shell script "touch /tmp/SR_TEST_PWNED_NOTIFY") & "' > "$TD/ssid.txt"
+bash "$TD/notify.sh" "$TD" >/dev/null 2>&1
+sleep 1
+[ ! -e /tmp/SR_TEST_PWNED_NOTIFY ] && ok "恶意 SSID 的 payload 没有执行" || bad "notify 注入成功，payload 执行了"
+rm -f /tmp/SR_TEST_PWNED_NOTIFY
+# 转义本身要正确：先 \ 再 "（顺序反了会二次转义）。
+# 用 grep 而不是精确比较——精确比较要在测试文件里再套一层引号转义，
+# 很容易把期望值写错（刚才就连错两次，断言报红但功能其实是对的）。
+_q() { bash -c ". '$TD/sr.sh'; as_escape '$1'" 2>/dev/null; }
+printf '%s' "$(_q 'a"b')" | grep -F 'a\"b' >/dev/null && ok "双引号被转义成 \\\"" || bad "双引号没转义: $(_q 'a"b')"
+printf '%s' "$(_q 'a"b')" | grep -q '^a\\"b$'      && ok "转义位置正确（行首行尾）" || bad "转义位置不对"
+printf '%s' "$(_q 'a\b')" | grep -F 'a\\b' >/dev/null && ok "反斜杠被转义成 \\\\" || bad "反斜杠没转义: $(_q 'a\b')"
+[ "$(_q '普通中文')" = "普通中文" ] && ok "普通内容不被破坏" || bad "普通内容被改坏了: $(_q '普通中文')"
+# 正常通知不能因此坏掉
+bash -c ". '$TD/sr.sh'; NOTIFY=1; notify 'T' '普通中文通知'" >/dev/null 2>&1 \
+    && ok "正常通知仍然可用" || bad "正常通知坏了"
 
 echo
 echo "结果: $PASS 通过, $FAIL 失败"
