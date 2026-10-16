@@ -94,6 +94,23 @@ conf_value_ok() {
     return 0
 }
 
+# 每个键的取值说明（错误提示用）。校验本身在 conf_value_ok，
+# 这里只负责"说清楚该填什么"——两者分开，免得改提示时不小心改松了校验。
+conf_value_hint() {   # $1=key -> stdout: 说明
+    case "$1" in
+        MODE)          echo "MODE 只能是 auto|ethernet|wifi|speed|latency" ;;
+        BALANCE_MODE)  echo "BALANCE_MODE 只能是 round-robin|fastest" ;;
+        OK_N|FAIL_N|COOLDOWN|PING_TIMEOUT|NC_TIMEOUT|FASTEST_SWITCH_RATIO|FASTEST_RECHECK|WIFI_FAILOVER_COOLDOWN|SPEED_TEST_TIMEOUT|SPEED_RECHECK|LATENCY_RECHECK|SPEED_SWITCH_RATIO)
+                       echo "$1 必须是非负整数" ;;
+        TLS_PROBE|NOTIFY|AUTO_WIFI_POWER|BALANCE|WIFI_FAILOVER)
+                       echo "$1 只能是 0 或 1" ;;
+        PROBE_TARGETS) echo "PROBE_TARGETS 只能是空格分隔的 IP" ;;
+        WIFI_PREFERRED) echo "WIFI_PREFERRED 不能含换行" ;;
+        SPEED_TEST_URL) echo "SPEED_TEST_URL 不能为空" ;;
+        *) echo "不支持的配置项: $1" ;;
+    esac
+}
+
 # 解析配置文件：逐行读，只认白名单键，逐值校验，**绝不 source**。
 # 为什么不能用 source：USER_CONF=/Users/Shared/smartroute.conf，而 /Users/Shared
 # 是 1777（世界可写 + sticky），install.sh 又从不创建这个文件。也就是说任何本地用户
@@ -927,8 +944,7 @@ cmd_set() {
     # 于是 App 里保存优先列表、改测速地址必然失败，用户只能手改配置文件，
     # 反而把用户往 H1（source 用户配置）那个坑里推。两处校验必须同源。
     conf_value_ok "$key" "$val" || {
-        echo "配置值不合法: $key=$val"
-        echo "（可用键: $VALID_KEYS）"
+        conf_value_hint "$key"
         exit 1
     }
 
