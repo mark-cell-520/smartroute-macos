@@ -56,7 +56,10 @@ enum WifiParsing {
 
     /// 附近网络的一条记录
     struct Nearby: Identifiable, Equatable {
-        let id = UUID()
+        // 身份用 SSID 而不是 UUID()：每次扫描重建数组都是全新 UUID，
+        // ForEach 就没法做行复用/差分，每次刷新整块重建。
+        // 一次扫描里 SSID 不会重复，用它当 id 是稳定的。
+        var id: String { name }
         var name: String
         var rssi: Int
         var bars: Int

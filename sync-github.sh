@@ -34,7 +34,7 @@ die() { printf '\033[1;31m错误: %s\033[0m\n' "$*" >&2; exit 1; }
 # ---------- release 模式：推送代码 + 建 Release 上传产物 ----------
 if [ "${1:-}" = "release" ]; then
     shift
-    VERSION="${1:-2.2}"
+    VERSION="${1:-$(cat VERSION 2>/dev/null | tr -d '[:space:]')}"
     say "发布模式 v$VERSION"
     command -v git >/dev/null 2>&1 || die "没有安装 git"
     [ -d .git ] || die "还没有 git 仓库，请先运行: bash sync-github.sh"
@@ -143,8 +143,10 @@ if [ -z "$AUTH_MODE" ]; then
     echo "       gh auth login"
     echo "       bash sync-github.sh"
     echo
-    printf "粘贴令牌（直接回车则改为手动模式）: "
-    read -r TOKEN
+    printf "粘贴令牌（直接回车则改为手动模式，输入不显示）: "
+    # -s 不回显：令牌打在终端里会被录屏/终端历史/旁人看到
+    read -rs TOKEN
+    echo
     if [ -n "$TOKEN" ]; then
         AUTH_MODE="token"
     fi
@@ -177,9 +179,17 @@ elif [ "$AUTH_MODE" = "token" ]; then
         die "创建仓库失败（HTTP ${CODE}）"
     fi
 
+    # 不要把令牌写进 remote URL——那样它会以明文长期驻留 .git/config，
+    # 任何能读到这个仓库的人（包括备份、CI 缓存、误分享的 tar 包）都拿到了令牌。
+    # 改用推送时一次性提供：git push 支持从环境变量/ stdin 拿凭据，
+    # 这里用 -c http.extraHeader 传 Authorization，remote URL 保持干净。
     git remote remove origin 2>/dev/null
-    git remote add origin "https://x-access-token:$TOKEN@github.com/$USER/$REPO.git"
-    git push -u origin main
+    git remote add origin "https://github.com/$USER/$REPO.git"
+    # 凭据只对这一条命令生效，不落盘
+    git -c "http.extraHeader=Authorization: Basic $(printf 'x-access-token:%s' "$TOKEN" | base64 | tr -d '\n')" \
+        push -u origin main
+    # base64 不是加密，只是让令牌不出现在进程列表/终端里；
+    # 真正长期有效的凭据请用 gh auth login（存系统钥匙串）。
 
 else
     say "手动模式（不推送）"
@@ -196,12 +206,18 @@ else
 fi
 
 say "完成"
-git remote -v | head -2
+# 只显示 remote 名字，不显示 URL——URL 里若带令牌就直接打到终端了
+git remote | sed 's/^/  remote: /' | head -2
 echo
+# 版本号从 VERSION 文件读，不再写死。以前这里印的是 2.1，而 build_release.sh
+# 里是 2.2——照提示敲 gh release create v2.1 ... 必然失败（文件不存在）。
+V="$(cat VERSION 2>/dev/null | tr -d '[:space:]')"
+[ -n "$V" ] || V="2.2"
 echo "接下来（可选）：把构建产物作为 Release 发布："
-echo "  bash build_release.sh        # 生成 dist/SmartRoute-2.1-macOS.zip"
-echo "  bash build_dmg.sh            # 生成 dist/SmartRoute-2.1-macOS.dmg（需普通终端）"
+echo "  bash build_release.sh        # 生成 dist/SmartRoute-${V}-macOS.zip"
+echo "  bash build_dmg.sh            # 生成 dist/SmartRoute-${V}-macOS.dmg（需普通终端）"
 if [ "$AUTH_MODE" = "gh" ]; then
-    echo "  gh release create v2.1 dist/SmartRoute-2.1-macOS.zip dist/SmartRoute-2.1-macOS.dmg \\"
-    echo "      --title \"SmartRoute v2.1\" --notes-file INSTALL.md"
+    echo "  gh release create v${V} dist/SmartRoute-${V}-macOS.zip dist/SmartRoute-${V}-macOS.dmg \\"
+    echo "      --title \"SmartRoute v${V}\" --notes-file INSTALL.md"
+    echo "  （release 已存在时先 gh release delete v${V} 再建，create 不能重跑）"
 fi

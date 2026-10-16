@@ -7,7 +7,11 @@ APP="SmartRoute.app"
 DIST="dist"
 MC="$PWD/.build/module-cache"
 MIN_OS="13.0"
-VERSION="2.2"          # 改版本号只改这一行（Info.plist / ZIP / DMG 都跟着变）
+# 版本号唯一来源：仓库根目录的 VERSION 文件。以前这里、build_dmg.sh、
+# sync-github.sh、make_dmg_bg.swift 各写一份，改漏一个就出现
+# "ZIP 是 2.2、DMG 背景图还是 2.1、文档说 2.1"这种漂移。
+VERSION="$(cat VERSION 2>/dev/null | tr -d '[:space:]')"
+[ -n "$VERSION" ] || { echo "!! 读不到 VERSION 文件"; exit 1; }
 
 echo "==> 清理"
 # 只清自己生产的 ZIP 和暂存目录；*.dmg 是 build_dmg.sh 的产物，要留着，
@@ -17,10 +21,18 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$DIST" "$MC"
 
 # ---------- 1. 生成图标 ----------
 echo "==> 生成应用图标"
-swiftc -O -o "$PWD/.build/make_icon" SmartRouteApp/make_icon.swift -module-cache-path "$MC" 2>/dev/null
-for sz in 16 32 48 128 256 512 1024; do
-    "$PWD/.build/make_icon" "$PWD/.build/icon_$sz.png" "$sz" >/dev/null
-done
+# 图标编译失败不能一票否决整个发布（set -e 下会）：App 没有图标照样能跑，
+# 顶多 Dock 里是默认图标。以前这里失败会让 build_release.sh 整体退出，
+# 用户以为发布失败了，其实只差一张图。
+if swiftc -O -o "$PWD/.build/make_icon" SmartRouteApp/make_icon.swift -module-cache-path "$MC" 2>/dev/null; then
+    for sz in 16 32 48 128 256 512 1024; do
+        "$PWD/.build/make_icon" "$PWD/.build/icon_$sz.png" "$sz" >/dev/null
+    done
+    HAVE_ICON=1
+else
+    echo "    ⚠️  图标工具编译失败，将使用默认图标（不影响功能）"
+    HAVE_ICON=0
+fi
 python3 - "$PWD/.build" <<'PYEOF'
 import struct, sys
 d = sys.argv[1]
@@ -34,7 +46,12 @@ for t, f in elems:
     body += t + struct.pack('>I', len(data) + 8) + data
 open(f'{d}/AppIcon.icns', 'wb').write(b'icns' + struct.pack('>I', len(body) + 8) + body)
 PYEOF
-cp "$PWD/.build/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+# 图标没生成成功就别复制（复制半个文件会让 App 起不来）
+if [ "${HAVE_ICON:-0}" = "1" ] && [ -s "$PWD/.build/AppIcon.icns" ]; then
+    cp "$PWD/.build/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+else
+    echo "    (i) 跳过图标（用系统默认）"
+fi
 
 # ---------- 2. 编译两个架构 ----------
 # 源码用 glob，和 build_app.sh 用同一套规则。
@@ -202,14 +219,16 @@ assert any(n.endswith(".txt") for n in names), "缺少安装说明"
 print("    ZIP 校验通过：%d 个条目" % len(names))
 PYEOF2
 
-echo "==> 生成 DMG（需要磁盘镜像权限；被系统策略阻止时用 ZIP 代替）"
-if hdiutil create -volname "SmartRoute" -srcfolder "$STAGE" -ov -format UDZO \
-        "$DIST/SmartRoute-$VERSION-macOS.dmg" >/tmp/hdi.log 2>&1; then
+# DMG 交给 build_dmg.sh 做（它带背景图、Applications 快捷方式、布局图标位置）。
+# 以前这里也生成一个 -ov 的 DMG，结果把 build_dmg.sh 的成果覆盖成没有背景/布局的
+# 朴素镜像——两个脚本争同一个路径，谁后跑谁赢，用户拿到哪个全看运气。
+if [ -f "$DIST/SmartRoute-$VERSION-macOS.dmg" ]; then
+    echo "==> 已有 DMG（build_dmg.sh 的产物），不覆盖"
     ls -la "$DIST/SmartRoute-$VERSION-macOS.dmg"
-    echo "    DMG 创建成功"
+    echo "    要重新打 DMG：bash build_dmg.sh"
 else
-    echo "    ℹ️  当前环境不允许创建 DMG（沙箱/权限限制）"
-    echo "    → 请使用 ZIP 分发；在普通终端里运行本脚本即可生成 DMG"
+    echo "==> 未生成 DMG（本脚本只出 ZIP）"
+    echo "    需要 DMG：bash build_dmg.sh（需在普通终端运行）"
 fi
 
 echo

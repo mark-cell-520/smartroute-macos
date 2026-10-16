@@ -237,11 +237,10 @@ macOS 睡眠唤醒可能重建默认路由。守护进程 20 秒内会自动修�
 git clone <你的仓库地址>
 cd smartroute
 
-bash build_app.sh      # 编译通用二进制 App（arm64 + x86_64，macOS 13+）
-bash build_release.sh  # 打 ZIP
+bash build_release.sh  # 编译通用二进制 App（arm64 + x86_64）+ 校验 + 打 ZIP
 bash build_dmg.sh      # 打 DMG（需在普通终端运行，沙箱内无法创建设备映像）
 
-bash tests/mock_balance_rules.sh   # 跑测试（共 6 个测试文件，90+ 项断言）
+bash tests/mock_balance_rules.sh   # 跑测试（共 14 个测试文件，395+ 项断言）
 ```
 
 > `build_dmg.sh` 需要在有设备访问权限的普通终端运行；在沙箱/CI 里会报

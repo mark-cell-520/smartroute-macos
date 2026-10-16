@@ -248,7 +248,9 @@ struct InterfaceCard: View {
                     KeyValueRow(key: "IP", value: iface.ip, monospaced: true)
                     KeyValueRow(key: "网关", value: iface.gateway, monospaced: true)
                     KeyValueRow(key: "服务", value: iface.service)
-                    KeyValueRow(key: "连续探测", value: "\(streak) 次")
+                    // 脚本的 streak 是带符号的：ok 正、fail 负、未知=0。
+                    // 以前原样显示，负数会印出"连续探测 -3 次"——读起来像 bug。
+                    KeyValueRow(key: "连续探测", value: streakText(streak))
                 } else {
                     EmptyState(icon: "cable.connector.slash",
                                title: "未连接",
@@ -257,6 +259,17 @@ struct InterfaceCard: View {
             }
         }
     }
+}
+
+/// streak 的展示：脚本语义是"ok 正数 / fail 负数 / 未知 0"。
+/// 负数要显示成"连续失败 N 次"而不是 "-3 次"。
+func streakText(_ streak: String) -> String {
+    if streak == "0" || streak.isEmpty { return "未知" }
+    if streak.hasPrefix("-") {
+        let n = String(streak.dropFirst())
+        return "连续失败 \(n) 次"
+    }
+    return "连续成功 \(streak) 次"
 }
 
 struct ProbePill: View {
@@ -783,6 +796,12 @@ struct RoutingView: View {
                         Text("固定/自动模式下不会自动测量，这里是上次的结果。")
                             .font(.caption2).foregroundStyle(.secondary)
                     }
+                }
+                // 读取失败要单独说。以前失败时显示"未测"，跟没测过一模一样，
+                // 用户不知道该重试还是该等——而这是个命令失败，重试通常就好了。
+                if !model.measurementsNote.isEmpty {
+                    Text(model.measurementsNote)
+                        .font(.caption2).foregroundStyle(.orange)
                 }
                 Button(model.remeasuring ? "测量中…" : "立即重新测量") { model.remeasureNow() }
                     .controlSize(.small)

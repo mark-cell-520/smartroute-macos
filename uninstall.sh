@@ -85,16 +85,33 @@ else
 fi
 run "锚点文件 /etc/pf.anchors/com.user.smartroute" rm -f /etc/pf.anchors/com.user.smartroute
 
-# ---------- 2. 探测用的临时主机路由 ----------
-say "清理临时主机路由"
+# ---------- 2. 路由清理 ----------
+say "清理路由"
 if [ "$DRY" = "0" ]; then
     n=0
     for t in 1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4 9.9.9.9 208.67.222.222 223.5.5.5 114.114.114.114; do
         route delete -host "$t" >/dev/null 2>&1 && n=$((n+1))
     done
     [ "$n" -gt 0 ] && ok "删了 $n 条探测主机路由" || skip "没有残留的探测路由"
+    # 分流规则落地成的是 -net 静态路由（守护进程照 smartroute.rules 加的）。
+    # 以前只删 -host 那 8 个探测目标，这些 -net 路由一个都没清——
+    # 卸完软件路由表里还留着"某网段走某接口"，用户完全不知道是哪来的。
+    # 必须在删规则文件**之前**读，否则就不知道要删什么了。
+    n2=0
+    if [ -f /Users/Shared/smartroute.rules ]; then
+        while read -r cidr dev _rest; do
+            case "$cidr" in ""|\#*) continue ;; esac
+            [ -n "$dev" ] || continue
+            if route delete -net "$cidr" -interface "$dev" >/dev/null 2>&1 || \
+               route delete -net "$cidr" >/dev/null 2>&1; then
+                n2=$((n2+1))
+                printf '    %s·%s 删除网段路由 %s via %s\n' "$C_0" "$C_0" "$cidr" "$dev"
+            fi
+        done < /Users/Shared/smartroute.rules
+    fi
+    [ "$n2" -gt 0 ] && ok "删了 $n2 条分流网段路由" || skip "没有分流网段路由"
 else
-    printf '    %s·%s 将删除探测用的 -host 路由（若存在）\n' "$C_0" "$C_0"
+    printf '    %s·%s 将删除探测 -host 路由和分流 -net 路由（若存在）\n' "$C_0" "$C_0"
 fi
 
 # ---------- 3. 程序与配置 ----------
@@ -110,11 +127,28 @@ run "分流规则 /Users/Shared/smartroute.rules"    rm -f /Users/Shared/smartro
 run "状态目录 /var/db/smartroute"                rm -rf /var/db/smartroute
 run "锁目录 /var/run/smartroute.lock"            rm -rf /var/run/smartroute.lock
 run "/tmp 探测残留"                              bash -c 'rm -f /tmp/.smartroute.probe.*'
-run "登录自启 plist（App 开机自启）"            bash -c 'rm -f "$HOME/Library/LaunchAgents/com.user.smartroute.app.plist"' 
+# App 开机自启的 plist。注意：从 App 里点卸载时这个脚本是以 root 跑的，
+# $HOME 是 /var/root——只删 "$HOME/..." 会删错地方，真正的用户 plist 留在
+# /Users/<user>/Library/LaunchAgents/ 里，校验却查同一个错路径，照样打印"✅ 零残留"。
+# 所以要：bootout 掉已加载的 job（只 rm plist 不 bootout，job 活到重启），
+# 并遍历所有真实用户主目录删 plist。
+if [ "$DRY" = "0" ]; then
+    for _h in "$HOME" /Users/*; do
+        [ -d "$_h/Library/LaunchAgents" ] || continue
+        _p="$_h/Library/LaunchAgents/com.user.smartroute.app.plist"
+        [ -f "$_p" ] || continue
+        launchctl bootout "gui/$(stat -f '%u' "$_h")/com.user.smartroute.app" >/dev/null 2>&1 || true
+        rm -f "$_p" && printf '    %s·%s 删除 %s\n' "$C_0" "$C_0" "$_p"
+    done
+fi
+run "登录自启 plist（App 开机自启）"            bash -c 'for h in "$HOME" /Users/*; do [ -d "$h/Library/LaunchAgents" ] && rm -f "$h/Library/LaunchAgents/com.user.smartroute.app.plist"; done; true' 
 if [ "$KEEP_LOGS" = "1" ]; then
     warn "按要求保留日志：/var/log/smartroute.{log,out,err}"
 else
     run "日志 /var/log/smartroute.log"            rm -f /var/log/smartroute.log
+    # 日志超 1MB 会轮转成 .log.1（smartroute.sh 里做的），以前不删这个，
+    # 卸完 /var/log 里还躺着上一代日志。
+    run "日志轮转 /var/log/smartroute.log.*"      bash -c 'rm -f /var/log/smartroute.log.*' 
     run "守护进程 stdout /var/log/smartroute.out" rm -f /var/log/smartroute.out
     run "守护进程 stderr /var/log/smartroute.err" rm -f /var/log/smartroute.err
 fi
@@ -146,11 +180,14 @@ if [ "$DRY" = "0" ]; then
     echo
     say "校验残留"
     left=0
-    for f in /usr/local/bin/smartroute /Library/LaunchDaemons/com.user.smartroute.plist \
+    for f in /usr/local/bin/smartroute /usr/local/bin/smartroute-wifiscan \
+             /Users/Shared/smartroute.rules.tmp \
+             /Library/LaunchDaemons/com.user.smartroute.plist \
              /etc/smartroute.conf /Users/Shared/smartroute.conf /Users/Shared/smartroute.conf.bak \
              /Users/Shared/smartroute.rules \
              /etc/pf.anchors/com.user.smartroute /var/db/smartroute /var/run/smartroute.lock \
              "$HOME/Library/LaunchAgents/com.user.smartroute.app.plist" \
+             /Users/*/Library/LaunchAgents/com.user.smartroute.app.plist \
              "$APP"; do
         if [ -e "$f" ] || [ -L "$f" ]; then printf '    %s✗%s 仍在: %s\n' "$C_R" "$C_0" "$f"; left=$((left+1)); fi
     done
@@ -162,6 +199,19 @@ if [ "$DRY" = "0" ]; then
     if ls /tmp/.smartroute.probe.* >/dev/null 2>&1; then
         printf '    %s✗%s /tmp 仍有探测残留\n' "$C_R" "$C_0"; left=$((left+1))
     fi
+    # App 的偏好和 Saved State。这些在用户自己的 Library 里，不属于"程序装到哪里"，
+    # 但"零残留"这句话得兜得住——所以要么删，要么明说不删。
+    for _h in /Users/*; do
+        [ -d "$_h/Library" ] || continue
+        _pb="$_h/Library/Preferences/com.user.smartroute.app.plist"
+        _sb="$_h/Library/Saved Application State/com.user.smartroute.app.savedState"
+        if [ -f "$_pb" ]; then
+            printf '    %s·%s App 偏好仍在: %s（未删，属用户数据）\n' "$C_0" "$C_0" "$_pb"
+        fi
+        if [ -e "$_sb" ]; then
+            printf '    %s·%s App 窗口状态仍在: %s（未删，属用户数据）\n' "$C_0" "$C_0" "$_sb"
+        fi
+    done
     if pfctl -a "$ANCHOR" -s rules 2>/dev/null | grep -q .; then
         printf '    %s✗%s pf 锚点里仍有规则\n' "$C_R" "$C_0"; left=$((left+1))
     fi
@@ -170,7 +220,10 @@ if [ "$DRY" = "0" ]; then
     fi
 
     if [ "$left" -eq 0 ]; then
-        printf '    %s✅ 零残留：所有文件、规则、路由、进程都已清干净%s\n' "$C_G" "$C_0"
+        # 措辞要兜得住。App 偏好和窗口状态在用户自己的 Library 里，属用户数据，
+        # 上面只提示不删——所以不能说"所有东西都清干净了"。
+        printf '    %s✅ 程序、配置、规则、路由、进程都已清干净%s\n' "$C_G" "$C_0"
+        printf '    %s   （App 偏好与窗口状态属用户数据，未删；上面已列出路径）%s\n' "$C_0" "$C_0"
     else
         printf '    %s还有 %d 项残留（见上），可重跑一次或手动处理%s\n' "$C_Y" "$left" "$C_0"
     fi

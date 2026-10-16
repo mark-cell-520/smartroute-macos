@@ -211,6 +211,9 @@ final class NetworkModel: ObservableObject {
     /// 两个接口网关相同（同一台路由器）——不是两条 WAN，分流没有带宽收益。
     /// 从 balance status 的警告行解析出来，让 App 在用户最常看的地方提示。
     @Published var balanceSameGateway = ""
+    /// measurements 读取失败时的说明（空=正常）。区别于"未测"——
+    /// 未测是"还没测过"，这个是"命令失败了"。
+    @Published var measurementsNote = ""
     @Published var pendingBalanceMode = "round-robin"   // 用户在下拉里选的、尚未生效的策略
     @Published var balanceLatency: [String: String] = [:]   // 设备名 -> "14.3 ms"
     @Published var balanceLoading = false
@@ -541,24 +544,78 @@ final class NetworkModel: ObservableObject {
                         self.configIOError = "文件里没找到配置区段（\(Self.confHeader)）"
                         return
                     }
+                    // 导入前先校验每一行。以前原样写入然后无条件提示"已导入并生效"，
+                    // 而脚本侧只认白名单键、非法值会被忽略——于是用户以为导入成功了，
+                    // 守护进程却静默跳过那些键。至少要把被拒的行数说清楚。
+                    let (cleanConf, rejected) = Self.sanitizeConf(conf)
+                    guard !cleanConf.isEmpty else {
+                        self.configIOError = "配置区段里没有合法条目（\(rejected) 行被拒）"
+                        return
+                    }
+                    var rejNote = ""
+                    if rejected > 0 {
+                        rejNote = "（\(rejected) 行不合法已丢弃）"
+                    }
                     // 先备份再覆盖：导入是破坏性操作，留个后悔药
                     let backup = ScriptLocator.userConf + ".bak"
                     if FileManager.default.fileExists(atPath: ScriptLocator.userConf) {
                         try? FileManager.default.copyItem(atPath: ScriptLocator.userConf, toPath: backup)
                     }
-                    try conf.write(toFile: ScriptLocator.userConf, atomically: true, encoding: .utf8)
+                    try cleanConf.write(toFile: ScriptLocator.userConf, atomically: true, encoding: .utf8)
                     if !rules.isEmpty {
                         try rules.write(toFile: ScriptLocator.userRules, atomically: true, encoding: .utf8)
                     }
                     self.loadRoutingConfig()
                     self.loadRules()
                     self.refresh()
-                    self.configIOError = "✅ 已导入并生效（原配置备份为 \(URL(fileURLWithPath: backup).lastPathComponent)）"
+                    self.configIOError = "✅ 已导入并生效\(rejNote)（原配置备份为 \(URL(fileURLWithPath: backup).lastPathComponent)）"
                 } catch {
                     self.configIOError = "导入失败：\(error.localizedDescription)"
                 }
             }
         }
+    }
+
+    /// 校验导入的配置：只留白名单键 + 合法值。与 smartroute.sh 的
+    /// conf_value_ok / VALID_KEYS 保持一致（脚本侧最终还会再校验一遍，
+    /// 但 App 要先说清楚哪些行被丢了，不能假报"已导入并生效"）。
+    /// - Returns: (干净内容, 被拒行数)
+    static func sanitizeConf(_ raw: String) -> (String, Int) {
+        let validKeys: Set<String> = [
+            "MODE","OK_N","FAIL_N","COOLDOWN","PROBE_TARGETS","PING_TIMEOUT","NC_TIMEOUT",
+            "TLS_PROBE","NOTIFY","AUTO_WIFI_POWER","BALANCE","BALANCE_MODE",
+            "FASTEST_SWITCH_RATIO","FASTEST_RECHECK","WIFI_FAILOVER","WIFI_PREFERRED",
+            "WIFI_FAILOVER_COOLDOWN","SPEED_TEST_URL","SPEED_TEST_TIMEOUT",
+            "SPEED_RECHECK","LATENCY_RECHECK","SPEED_SWITCH_RATIO",
+        ]
+        let modes: Set<String> = ["auto","ethernet","wifi","speed","latency"]
+        let boolKeys: Set<String> = ["TLS_PROBE","NOTIFY","AUTO_WIFI_POWER","BALANCE","WIFI_FAILOVER"]
+        let intKeys: Set<String> = ["OK_N","FAIL_N","COOLDOWN","PING_TIMEOUT","NC_TIMEOUT",
+            "FASTEST_SWITCH_RATIO","FASTEST_RECHECK","WIFI_FAILOVER_COOLDOWN",
+            "SPEED_TEST_TIMEOUT","SPEED_RECHECK","LATENCY_RECHECK","SPEED_SWITCH_RATIO"]
+        var out = ""
+        var rejected = 0
+        for line in raw.components(separatedBy: "\n") {
+            let t = line.trimmingCharacters(in: .whitespaces)
+            if t.isEmpty || t.hasPrefix("#") { continue }
+            guard let eq = t.firstIndex(of: "=") else { rejected += 1; continue }
+            let key = String(t[t.startIndex..<eq]).trimmingCharacters(in: .whitespaces)
+            let val = String(t[t.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
+            guard validKeys.contains(key) else { rejected += 1; continue }
+            var ok = true
+            switch key {
+            case "MODE":        ok = modes.contains(val)
+            case "BALANCE_MODE": ok = (val == "round-robin" || val == "fastest")
+            case _ where boolKeys.contains(key): ok = (val == "0" || val == "1")
+            case _ where intKeys.contains(key):  ok = !val.isEmpty && val.allSatisfy { $0.isNumber }
+            case "SPEED_TEST_URL": ok = !val.isEmpty
+            case "WIFI_PREFERRED": ok = !val.contains("\n")
+            case "PROBE_TARGETS":  ok = val.allSatisfy { $0.isNumber || $0 == "." || $0 == " " }
+            default: break
+            }
+            if ok { out += "\(key)=\(val)\n" } else { rejected += 1 }
+        }
+        return (out, rejected)
     }
 
     func loadRoutingConfig() {
@@ -888,6 +945,10 @@ final class NetworkModel: ObservableObject {
 
     /// 读已保存网络 + 当前信号。免权限，普通 Shell 就够。
     func loadWifi() {
+        // in-flight 守卫：Wi-Fi 页每 5 秒轮询一次，加上 onAppear、定时器、
+        // "刷新列表"按钮、join 成功回调，很容易并发跑多份。
+        // 两个实例的完成顺序不保证，旧结果可能覆盖新结果（显示过期信号）。
+        guard beginOp("wifi") else { return }
         let script = ScriptLocator.scriptPath
         DispatchQueue.global().async {
             // 用 --raw：一行一个 SSID，不带序号。带序号的格式人看着舒服，
@@ -904,6 +965,7 @@ final class NetworkModel: ObservableObject {
             }
             if let r = WifiParsing.capture(curOut, pattern: "rate=([0-9]+)") { rate = r }
             if let n = WifiParsing.capture(curOut, pattern: "noise=(-?[0-9]+)") { noise = n }
+            defer { self.endOp("wifi") }
             DispatchQueue.main.async {
                 self.wifiSaved = saved
                 self.wifiSignal = signal
@@ -930,18 +992,25 @@ final class NetworkModel: ObservableObject {
             let cmd = thorough
                 ? "'\(script)' wifi scan"
                 : "'\(script)' wifi scan --quick"
-            let out = Shell.run(cmd, timeout: thorough ? 40 : 15).out
+            // 退出码也要看：超时时 out 只有"(命令超时 15 秒)"，
+            // 解析出空列表，界面会显示"附近没有已保存的网络在范围"——
+            // 一个确定性的结论，而实际只是没扫到。而且 wifiScanAt 照写，
+            // 30 秒内不会重试，用户盯着错误结论干等。
+            let (out, code) = Shell.run(cmd, timeout: thorough ? 40 : 15)
 
             let list = WifiParsing.nearbyNetworks(out)
             var note = ""
-            if let n = WifiParsing.scanUnknownCount(out) {
+            if code != 0 {
+                note = "扫描失败（退出码 \(code)），不是「附近没有网络」。稍后重试，或点「完整扫描」。"
+            } else if let n = WifiParsing.scanUnknownCount(out) {
                 note = "有 \(n) 个网络未能确认（系统扫描有冷却）"
             }
             DispatchQueue.main.async {
                 self.wifiNearby = list
                 self.wifiScanNote = note
                 self.wifiScanning = false
-                self.wifiScanAt = Date()
+                // 失败时不写时间戳，让用户能立刻重试
+                if code == 0 { self.wifiScanAt = Date() }
             }
         }
     }
@@ -1020,11 +1089,12 @@ final class NetworkModel: ObservableObject {
 
     /// 读守护进程缓存的实测结果（state 文件里的 speed_<dev> / lat_<dev>）
     func loadMeasurements() {
+        guard beginOp("measurements") else { return }
         let script = ScriptLocator.scriptPath
         DispatchQueue.global().async {
             // 直接读 state 文件比再起一个进程快；App 已在轮询里调这个，要省着点
             var es = "未测", ws = "未测", el = "未测", wl = "未测"
-            let st = Shell.run("'\(script)' measurements", timeout: 6).out
+            let (st, code) = Shell.run("'\(script)' measurements", timeout: 6)
             for line in st.components(separatedBy: "\n") {
                 if line.hasPrefix("speed:") {
                     let p = line.dropFirst(6).components(separatedBy: "=")
@@ -1042,9 +1112,20 @@ final class NetworkModel: ObservableObject {
                     }
                 }
             }
+            defer { self.endOp("measurements") }
             DispatchQueue.main.async {
-                self.ethSpeed = es; self.wifiSpeed = ws
-                self.ethLatency = el; self.wifiLatency = wl
+                // 读取失败要和"真的没测过"区分开。以前失败时四项都是初值"未测"，
+                // 界面看着跟没测过一模一样——用户不知道该不该点"重新测量"。
+                if code != 0 {
+                    let m = "读取失败"
+                    self.ethSpeed = m; self.wifiSpeed = m
+                    self.ethLatency = m; self.wifiLatency = m
+                    self.measurementsNote = "measurements 命令失败（退出码 \(code)），可能是脚本被占用"
+                } else {
+                    self.ethSpeed = es; self.wifiSpeed = ws
+                    self.ethLatency = el; self.wifiLatency = wl
+                    self.measurementsNote = ""
+                }
             }
         }
     }
@@ -1070,11 +1151,17 @@ final class NetworkModel: ObservableObject {
 
     /// 保存优先尝试列表（逗号分隔）
     func saveWifiPreferred() {
-        // 用户多半会习惯打中文逗号或带空格，先规整成半角逗号+去空格，
-        // 否则脚本那边 tr ',' ' ' 拆不开，列表看着设了其实没生效
-        let normalized = wifiPreferred
-            .replacingOccurrences(of: "，", with: ",")
-            .replacingOccurrences(of: " ", with: "")
+        // 用户多半会习惯打中文逗号，先规整成半角逗号。
+        // 但**空格不能静默去掉**：脚本侧用空白拆分（for ssid in $pref $saved），
+        // 格式本身表达不了带空格的 SSID。以前这里直接 replace(" ", "")，
+        // 于是 "A9 5G" 被静默改成 "A95G"——保存成功、列表也显示 A95G，
+        // 但永远匹配不上系统里存的 "A9 5G"，"优先列表已保存"是假成功。
+        // 现在：含空格就明确拒绝，让用户知道这个网络名进不了优先列表。
+        let normalized = wifiPreferred.replacingOccurrences(of: "，", with: ",")
+        if normalized.contains(" ") {
+            wifiMessage = "网络名里含空格，无法加入优先列表（脚本用空格分隔多项）。可改用系统菜单栏 Wi-Fi 调整顺序。"
+            return
+        }
         wifiPreferred = normalized
         wifiMessage = ""
         setConfigBatch([("WIFI_PREFERRED", Shell.quote(normalized))]) { ok, msg in
@@ -1087,6 +1174,7 @@ final class NetworkModel: ObservableObject {
 
     /// 读自动故障转移开关与优先列表
     func loadWifiFailover() {
+        guard beginOp("wififailover") else { return }
         let script = ScriptLocator.scriptPath
         DispatchQueue.global().async {
             var on = false, preferred = ""
@@ -1101,6 +1189,7 @@ final class NetworkModel: ObservableObject {
                     }
                 }
             }
+            defer { self.endOp("wififailover") }
             DispatchQueue.main.async {
                 self.wifiFailoverOn = on
                 self.wifiPreferred = preferred

@@ -9,11 +9,28 @@ sudo install -m 0755 smartroute.sh /usr/local/bin/smartroute
 # Wi-Fi 扫描组件（免权限，按指定 SSID 扫）。装到 /usr/local/bin 下，
 # 这样 /usr/local/bin/smartroute 同目录就能找到它——守护进程和命令行都用得到。
 # 少了它只是退化：wifi scan 查不到附近网络，候选排序退回按保存顺序。
-if [ -f wifiscan ]; then
-    sudo install -m 0755 wifiscan /usr/local/bin/smartroute-wifiscan
-    echo "==> 已安装 Wi-Fi 扫描组件"
+#
+# 为什么要多位置找：这个脚本有两种跑法——从源码目录跑（helper 就在旁边），
+# 和从 App bundle 里跑（App 内「安装守护进程」按钮触发，此时本脚本位于
+# Contents/Resources/，而 helper 在 Contents/MacOS/，不在同一目录）。
+# 以前只看 CWD，于是从 App 里安装时永远找不到 helper，
+# 而提示是"重新构建即可"——指向完全错误的方向，用户怎么重建都没用。
+_wifiscan=""
+for _cand in \
+    "$(dirname "$0")/wifiscan" \
+    "$(dirname "$0")/../MacOS/wifiscan" \
+    "$(dirname "$0")/tools/wifiscan" \
+    "$(dirname "$0")/../tools/wifiscan"; do
+    if [ -x "$_cand" ]; then _wifiscan="$_cand"; break; fi
+done
+if [ -n "$_wifiscan" ]; then
+    sudo install -m 0755 "$_wifiscan" /usr/local/bin/smartroute-wifiscan
+    echo "==> 已安装 Wi-Fi 扫描组件（来自 ${_wifiscan}）"
 else
-    echo "!! 没找到 wifiscan（附近网络扫描不可用，重新构建即可）"
+    echo "!! 没找到 wifiscan 可执行文件（附近网络扫描不可用）"
+    echo "   已找过：本目录、../MacOS/、tools/、../tools/"
+    echo "   若从 App 里点的安装：请先跑一次 bash build_app.sh 生成 helper"
+    echo "   若从源码目录跑的：helper 由 build_app.sh / build_release.sh 产出"
 fi
 
 echo "==> 写入默认配置 /etc/smartroute.conf"

@@ -30,7 +30,7 @@ func text(_ s: String, _ size: CGFloat, _ color: NSColor, _ x: CGFloat, _ y: CGF
     (s as NSString).draw(in: NSRect(x: x, y: y, width: w, height: size * 2), withAttributes: attrs)
 }
 
-text("SmartRoute 2.1", 44, .white, 48, H - barH + 28)
+text("SmartRoute \(ProcessInfo.processInfo.environment["SR_VERSION"] ?? "2.2")", 44, .white, 48, H - barH + 28)
 text("Mac 双网智能选路工具", 20, NSColor.white.withAlphaComponent(0.85), 48, H - barH + 4, bold: false)
 
 // ---- 中部提示：把 App 拖到 Applications ----

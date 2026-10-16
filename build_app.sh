@@ -37,6 +37,13 @@ else
     echo "    警告: 图标生成失败（不影响功能）"
 fi
 
+# ⚠️ 这个脚本只编**主机架构**，产物不能直接发布。
+# 以前 README/INSTALL 教用户用它打发布包，Intel 用户拿到的是 arm64-only，
+# 一打开就是"已损坏"。发布必须用 build_release.sh（通用二进制 + 校验 + 打包），
+# 需要 DMG 时再跑 build_dmg.sh。
+echo "==> 注意：本脚本只编主机架构（$(uname -m)），仅用于本地开发调试"
+echo "          发布请用: bash build_release.sh"
+
 echo "==> 编译 Swift 源码（SwiftUI + AppKit）"
 # 源码用 glob，不手写清单：手写过两份（本文件和 build_release.sh 各一份），
 # 两次新增 .swift 都只改了一处，另一处漏掉直接编译失败。glob 从根上消除这个问题。

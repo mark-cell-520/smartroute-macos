@@ -153,6 +153,15 @@ log() {
         sz=$(stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)
         [ "$sz" -gt 1048576 ] && mv "$LOG_FILE" "$LOG_FILE.1" 2>/dev/null
     fi
+    # launchd 的 StandardOutPath/StandardErrorPath（.out/.err）不归我们管，
+    # 也没有任何轮转机制——守护进程每 20 秒写一行，实测几天就长到几百 KB 且只增不减。
+    # 顺手在这里一起轮转（只有 root 能写，普通用户静默跳过）。
+    local lf
+    for lf in /var/log/smartroute.out /var/log/smartroute.err; do
+        [ -f "$lf" ] || continue
+        sz=$(stat -f%z "$lf" 2>/dev/null || echo 0)
+        [ "$sz" -gt 1048576 ] && mv "$lf" "$lf.1" 2>/dev/null
+    done
     return 0
 }
 

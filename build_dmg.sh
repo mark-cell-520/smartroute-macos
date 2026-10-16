@@ -8,7 +8,8 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION="2.2"
+VERSION="$(cat VERSION 2>/dev/null | tr -d '[:space:]')"
+[ -n "$VERSION" ] || { echo "!! 读不到 VERSION 文件"; exit 1; }
 VOL="SmartRoute ${VERSION}"
 APP="SmartRoute.app"
 DMG="dist/SmartRoute-${VERSION}-macOS.dmg"
@@ -41,7 +42,9 @@ if [ ! -x tools/make_dmg_bg ]; then
     swiftc -O tools/make_dmg_bg.swift -o tools/make_dmg_bg 2>/dev/null \
         || die "背景图编译失败（需要 Xcode 命令行工具: xcode-select --install）"
 fi
-tools/make_dmg_bg "$BG" >/dev/null
+# 版本号通过环境变量传给背景图工具——背景图上印的版本号以前写死在
+# Swift 源码里（2.1），改版本时漏一个，DMG 上就显示旧版本号。
+SR_VERSION="$VERSION" tools/make_dmg_bg "$BG" >/dev/null
 
 # ---------- 2. 装配暂存目录 ----------
 say "装配安装目录（App + Applications 快捷方式 + 安装说明）"

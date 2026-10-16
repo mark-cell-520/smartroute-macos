@@ -231,10 +231,13 @@ sudo bash ~/Pictures/smartroute/uninstall.sh
 ### 分发给别人安装（一键 DMG）
 
 ```bash
-bash build_app.sh      # 编译 App（arm64 + x86_64 通用二进制，macOS 13+）
-bash build_release.sh  # 打 ZIP
+bash build_release.sh  # 编译通用二进制（arm64 + x86_64）+ 校验 + 打 ZIP
 bash build_dmg.sh      # 打 DMG（内含 App + Applications 快捷方式 + 背景图 + 安装说明）
 ```
+
+> ⚠️ 发布**不要**用 `build_app.sh`——它只编译主机架构（在 Apple Silicon 机器上
+> 产出 arm64-only），Intel 用户拿到会直接报"已损坏"。它仅用于本地开发调试。
+> 正确顺序就是上面这两条；`build_dmg.sh` 依赖 `build_release.sh` 的产物。
 
 DMG 里已带 `安装说明.txt`（内容同 [INSTALL.md](INSTALL.md)），用户双击 → 拖到
 Applications → 右键打开（绕过 Gatekeeper）即可。**给用户的完整安装/使用/排障文档看
@@ -257,7 +260,7 @@ bash sync-github.sh release 2.1  # 之后每次发版：构建 ZIP+DMG、推代�
 **重新构建**（改了源码后）：
 
 ```bash
-cd ~/Pictures/smartroute && bash build_app.sh
+cd ~/Pictures/smartroute && bash build_release.sh
 ```
 
 **使用建议**：把 `SmartRoute.app` 拖到 `/Applications` 或 `~/Applications`，以后从 Dock/启动台打开。
@@ -419,7 +422,8 @@ echo 'NOTIFY=1' | sudo tee -a /etc/smartroute.conf
 |---|---|
 | `smartroute.sh` | 主脚本（bash 3.2 兼容，无第三方依赖） |
 | `SmartRouteApp/` | SwiftUI App 源码（含 make_icon.swift 图标生成器） |
-| `build_app.sh` | 一键编译打包成 `SmartRoute.app`（含图标） |
+| `build_app.sh` | 一键编译打包成 `SmartRoute.app`（含图标，**仅主机架构**，本地调试用） |
+| `build_release.sh` | 编译**通用二进制** + 架构/签名校验 + 打 ZIP（发布用这个） |
 | `com.user.smartroute.plist` | launchd 守护进程配置（每 20 秒） |
 | `install.sh` / `uninstall.sh` | 安装 / 卸载 |
 | `/Users/Shared/smartroute.conf` | 用户级配置（免密修改） |

@@ -23,4 +23,10 @@ tools/make_dmg_bg
 .dmgstage/
 .dmgbg.png
 # 编译产物：tools/wifiscan.swift 构建出来的二进制（源码要提交，二进制不要）
-/wifiscan
+# 不写 / 前缀：否则只挡根目录，别处（比如 tests/ 下）的同名文件会被误提交
+wifiscan
+wifiscan_arm64
+wifiscan_x86_64
+.build/
+# DMG 暂存目录
+.tmpdmg/
