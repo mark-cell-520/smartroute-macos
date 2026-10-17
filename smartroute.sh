@@ -870,7 +870,11 @@ do_switch() {   # $1=目标设备 $2=原默认设备 $3=eth探测 $4=wifi探测 
 # ---------------- 命令实现 ----------------
 cmd_watch() {
     find_active
-    local eth_res="na" wifi_res="na" _p
+    # now 必须在函数作用域声明。原来它只在 if 分支里 local now last，
+    # 于是走 elif（本轮无需切换）分支时 now 从未赋值——算术表达式里
+    # 未初始化变量按 0 算，"距上次切换 $((now - _last))" 永远是个大负数，
+    # 抖动计数的清零永远不触发。这个分支恰恰是修 flap 振荡的关键路径。
+    local eth_res="na" wifi_res="na" _p _last now
     # probe_dev 输出两行：第 1 行判定，第 2 行明细。这里只取判定行。
     if [ -n "$ACTIVE_ETH_DEV" ]; then
         eth_res="$(probe_dev "$ACTIVE_ETH_DEV" "$(svc_router "$ACTIVE_ETH_SVC")" | sed -n 1p)"
@@ -1116,10 +1120,14 @@ cmd_watch() {
 
     echo "$(ts) eth=${ACTIVE_ETH_DEV:-无}($eth_res) wifi=${ACTIVE_WIFI_DEV:-无}($wifi_res) default=${cur:-无} want=${want:-保持} mode=$MODE"
 
+    # now 在 if 之前取一次，两个分支共用同一个时间基准。
+    # 只在 if 分支里赋值是不够的：want==cur（本轮无需切换）时走 elif，
+    # 那时 now 还是空，算术里按 0 算，抖动计数的清零永远不触发——
+    # 而那正是修 flap 振荡的唯一路径。
+    now=$(date +%s)
     if [ -n "$want" ] && [ "$want" != "$cur" ]; then
         # 冷却期，防止在两个接口间反复横跳
-        local now last
-        now=$(date +%s)
+        local last
         last="$(state_get last_switch)"
         [[ "$last" =~ ^[0-9]+$ ]] || last=0
         if [ $((now - last)) -lt "$COOLDOWN" ]; then
@@ -1135,13 +1143,26 @@ cmd_watch() {
         # 一个永不消失的假警报比没有警报更糟——它会让人怀疑工具在说谎，
         # 然后不再看任何提示。
         #
-        # 判定"没在抖"的标准：这一轮不需要切换。要么没有倾向（want 空），
-        # 要么想要的就是当前的（我们上一次的选择守住了）。
-        # 注意不能写成"没调用 do_switch 就重置"——冷却期里也不切换，
-        # 但那正是抖得最厉害的时候，清了就等于把证据擦掉。
-        state_set flap_count 0
-        state_set flap_target ""
-        log "默认路由已稳定，清除选路不稳定计数"
+        # 但"这一轮不需要切换"**不能**作为"没在抖"的证据。
+        #
+        # 实测踩过：MODE=wifi 时 daemon 把默认路由切到 en1，下一轮
+        # cur==want 走进这个分支清零；紧接着 macOS 又判回 en0，再下一轮
+        # do_switch 把 flap_n 从 0 加到 1。于是 flap_count 永远在 0 和 1
+        # 之间振荡，永远到不了 3，警报永远不响。真实症状是
+        # switch_count 已经 105 次，而 flap_count 始终是空的——
+        # 界面一片安静，用户完全不知道系统在反复改路由。
+        #
+        # 正确的 staleness 判据和 do_switch 里保持同一个：距上次切换超过
+        # 抖动窗口（1800s）才算真的久了。真抖时每次间隔都远小于窗口，
+        # 计数累加上去、警报会响；真修好之后半小时没有切换，计数自动清掉、
+        # 警报会消失。两条路径用同一个时间尺度，才不会一边清零一边累加。
+        _last="$(state_get last_switch)"
+        [[ "$_last" =~ ^[0-9]+$ ]] || _last=0
+        if [ $((now - _last)) -gt 1800 ]; then
+            state_set flap_count 0
+            state_set flap_target ""
+            log "默认路由已稳定，清除选路不稳定计数"
+        fi
     fi
 }
 

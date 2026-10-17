@@ -216,7 +216,7 @@ case "${1:-}" in
     add)
         case "$2" in
             default)
-                # 计数器目录从 MOCK_CALLS 推。第一版用 $MOCK_T，但 run_in
+                # 计数器目录从 MOCK_CALLS 推。第一版用 ${MOCK_T}，但 run_in
                 # 并不导出它，于是写到 /.addcnt（不可写），cat 永远拿到空、
                 # n 恒为 1、所有 add 都失败——测出来"恢复失败"是假象。
                 D="${MOCK_CALLS%/*}"
@@ -383,11 +383,30 @@ _fc3="$(awk -F= '$1=="flap_count"{print $2}' "$T/state/st")"
 [ "${_fc3:-0}" -ge 3 ] 2>/dev/null \
     && ok "cmd_watch 连续抖之后 flap_count=$_fc3" \
     || bad "cmd_watch 没能累计 flap，实际 ${_fc3:-空}"
-# 现在系统不再改回了：默认路由守住 en1，want==cur，不需要切换
+# 现在系统不再改回了：默认路由守住 en1，want==cur，不需要切换。
+#
+# 这里要分两种情况，以前只测了第一种，于是把 bug 固化了：
+#
+#   A) 刚修好（last_switch 是几十秒前）→ 计数**必须保留**。
+#      清零条件原先是"这一轮不需要切换"，而抖动过程中每一轮之间
+#      恰好都有这种轮次（切完的那轮之后，cur==want），计数被反复擦掉，
+#      永远到不了 3，警报永远不响。真实症状：switch_count 已上百次，
+#      flap_count 始终是空的，用户完全不知道系统在反复改路由。
+#   B) 早就修好了（last_switch 超过 1800s 抖动窗口）→ 计数归零 + 留痕。
+#      否则提示会永久挂在状态页，用户以为工具在说谎。
 _wf "$T/def_en1"
 _fc4="$(awk -F= '$1=="flap_count"{print $2}' "$T/state/st")"
-[ "${_fc4:-x}" = "0" ] && ok "不需要切换时归零（假警报会消失）" \
-    || bad "应归零，实际 ${_fc4:-空}"
+[ "${_fc4:-x}" != "0" ] && ok "刚修好时保留计数（不擦掉证据，${_fc4}）" \
+    || bad "刚修好就归零，警报永远响不起来"
+grep -q "默认路由已稳定" "$T/sr.log" && bad "刚修好却报'已稳定'" || ok "刚修好不谎报稳定"
+
+# B) 把 last_switch 推到 1 小时前，模拟"半小时没再被改回"
+sed -i '' "s/^last_switch=.*/last_switch=$(( $(date +%s) - 3600 ))/" "$T/state/st" 2>/dev/null
+: > "$T/sr.log"
+_wf "$T/def_en1"
+_fc5="$(awk -F= '$1=="flap_count"{print $2}' "$T/state/st")"
+[ "${_fc5:-x}" = "0" ] && ok "超过抖动窗口后归零（假警报会消失）" \
+    || bad "应归零，实际 ${_fc5:-空}"
 grep -q "默认路由已稳定" "$T/sr.log" && ok "归零时记了日志" || bad "归零没留痕"
 rm -rf "$T"
 

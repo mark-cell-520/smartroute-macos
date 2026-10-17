@@ -207,6 +207,69 @@ bash -c "
 _s="$(sed -n "s/^last_switch=//p" "$T/state/state" 2>/dev/null)"
 [[ "$_s" =~ ^[0-9]+$ ]] && ok "切换后记录了 last_switch（${_s}）" || bad "没记录 last_switch（${_s:-空}）"
 
+echo "== 7. 抖动计数不能被「本轮无需切换」清零（实测踩过）=="
+# 真实症状：MODE=wifi 时 daemon 把默认路由切到 en1，下一轮 cur==want
+# 走进清零分支；紧接着 macOS 又判回 en0，再下一轮 do_switch 把 flap_n
+# 从 0 加到 1。于是 flap_count 永远在 0/1 之间振荡，永远到不了 3，
+# 警报永远不响——switch_count 已 105 次而 flap_count 是空的。
+# 用户完全不知道系统在反复改默认路由。
+# 判据改成"距上次切换超过 1800s 才清零"，和 do_switch 的累加条件同尺度。
+# 先删同键旧行再写入。用 >> 直接追会产生重复键，sed -n 'p' 于是输出
+# 多行，"= 2" 这种字符串比较必然失败——看着像被测代码错了，其实是
+# 夹具自己把状态文件写脏了。
+seed_state() {
+    local _k="${1%%=*}"
+    if [ -f "$T/state/state" ]; then
+        # grep -v 无行选中时返回 1（正是"该键本来不存在"），
+        # 不能让它把 && 链短路，否则旧行删不掉、新行又追进去。
+        local _t="$T/state/state.t" _rc=0
+        grep -v "^$_k=" "$T/state/state" > "$_t" 2>/dev/null || _rc=$?
+        [ "$_rc" -le 1 ] && mv "$_t" "$T/state/state" 2>/dev/null
+        rm -f "$_t" 2>/dev/null
+    fi
+    printf '%s\n' "$1" >> "$T/state/state"
+}
+# 读单个键：只取第一行，防止夹具意外写出重复键时误判
+sget() { sed -n "s/^$1=//p" "$T/state/state" 2>/dev/null | head -1; }
+
+# 构造"刚抖过"的状态：last_switch 是 60 秒前，flap_count=2
+now_s="$(date +%s)"
+seed_state "last_switch=$((now_s-60))"
+seed_state "flap_count=2"
+seed_state "flap_target=en1"
+out="$(MODE_V=wifi CUR_DEV=en1 runwatch 2>&1)"
+[ "$(sget flap_count)" = "2" ] \
+    && ok "刚抖过（60s 前）不清零，证据保留" || bad "刚抖过就被清零，警报永远不响"
+echo "$out" | grep -q "默认路由已稳定" && bad "刚抖过却报'已稳定'" || ok "刚抖过不谎报稳定"
+
+# 构造"真修好了"的状态：last_switch 是 1 小时前
+seed_state "last_switch=$((now_s-3600))"
+seed_state "flap_count=2"
+out="$(MODE_V=wifi CUR_DEV=en1 runwatch 2>&1)"
+[ "$(sget flap_count)" = "0" ] \
+    && ok "1 小时没切换则清零（警报会自动消失）" || bad "真稳定了却不清零，警报永驻"
+# 不查 log 输出：runwatch 把 log() mock 成 :，根本没有 stdout 可查
+# （查了永远是失败，等于用夹具的限制惩罚被测代码）。改为代码级锁定
+# 这行提示确实存在——用户需要知道警报为什么消失了。
+grep -q 'log "默认路由已稳定，清除选路不稳定计数"' "$SRC" \
+    && ok "真稳定时有 log 提示（代码级）" || bad "清零了却不告诉用户"
+
+# 窗口内（1700s，离 1800 有足够余量，不受 seed→运行之间那几秒影响）
+seed_state "last_switch=$((now_s-1700))"
+seed_state "flap_count=2"
+out="$(MODE_V=wifi CUR_DEV=en1 runwatch 2>&1)"
+[ "$(sget flap_count)" = "2" ] \
+    && ok "1700s 前刚抖过，计数保留" || bad "窗口内却被清零，会漏计"
+echo "$out" | grep -q "默认路由已稳定" && bad "窗口内却报'已稳定'" || ok "窗口内不谎报稳定"
+
+# 代码级锁定：清零用 -gt 1800，do_switch 累加用 -le 1800，两者必须互补。
+# 不锁的话将来一边改成 1800/900，就会出现"累加了却立刻被清零"或
+# "永远不清零"——而行为测试测不出这种数值漂移。
+_sw="$(grep -n 'flap_gap.*-le 1800' "$SRC")"
+_rs="$(grep -n '_last.*-gt 1800' "$SRC")"
+[ -n "$_sw" ] && ok "do_switch 累加门槛是 -le 1800" || bad "do_switch 门槛被改了"
+[ -n "$_rs" ] && ok "清零门槛是 -gt 1800（与累加互补）" || bad "清零门槛与累加不互补"
+
 echo ""
 echo "结果: $PASS 通过, $FAIL 失败"
 [ "$FAIL" -eq 0 ]
