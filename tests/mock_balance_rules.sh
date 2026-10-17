@@ -225,10 +225,16 @@ printf 'Name  Mtu  Network  Address  Ipkts Ierrs  Ibytes  Opkts Oerrs  Obytes  C
 printf '%-6s 1500  <Link>  aa:bb   100  0  %s  50  0  %s  0\n' "$2" "$((b*2))" "$b"
 SMALL
 chmod +x "$T/bin/netstat_small"
-mkdir -p "$T/bytes_small"; rm -f "$T/bytes_small"/* 2>/dev/null
-out="$(MOCK_BYTES_DIR="$T/bytes_small" PATH="$T/bin_small:$PATH" \
-      bash -c "cp '$T/bin/netstat_small' '$T/bin_small/netstat'; chmod +x '$T/bin_small/netstat'
-        export PATH='$T/bin_small:/usr/bin:/bin:/usr/sbin:/sbin'
+# bin_small 必须先建出来。以前漏了 mkdir -p，cp 到不存在的目录静默失败，
+# 内层 PATH 里的 $T/bin_small/netstat 不存在 → 回退到**真实 netstat**，
+# 读真实网卡计数器。同时 nc/curl 也是真的，真的发了 10 次外网连接。
+# 于是这一节变成"碰运气"：真实流量恰好超过 64KB 时验证通过，
+# 两条断言一起挂（实测约 8% 概率），流量低时又通过——典型的 flaky。
+mkdir -p "$T/bin_small"; rm -f "$T/bin_small"/* 2>/dev/null
+cp "$T/bin/netstat_small" "$T/bin_small/netstat"; chmod +x "$T/bin_small/netstat"
+out="$(MOCK_BYTES_DIR="$T/bytes_small" PATH="$T/bin:$PATH" \
+      bash -c "
+        export PATH='$T/bin_small:$T/bin:/usr/bin:/bin:/usr/sbin:/sbin'
         export LOCK_DIR='$T/lock' STATE_FILE='$T/state/st' PF_ANCHOR_FILE='$T/none'
         . '$T/sr.sh'; trap - EXIT INT TERM HUP
         export MOCK_BYTES_DIR='$T/bytes_small'

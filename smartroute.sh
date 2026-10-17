@@ -486,11 +486,19 @@ route_add_host() {   # $1=目标IP $2=设备 $3=网关
     if route add -host "$1" "$3" >/dev/null 2>&1; then
         PROBE_ROUTES_ADDED=1; return 0
     fi
-    # 目标路由已存在（同网段双宿主、残留路由，或与守护进程的探测并发时会出现）：
-    # 已有路由的网关与本次一致，说明就是同一条上网路径，复用即可
-    local cur
+    # 目标路由已存在（同网段双宿主、残留路由，或与守护进程的探测并发时会出现）。
+    # 复用已有路由的前提是它真的是"同一条上网路径"——**网关和接口都必须一致**。
+    #
+    # 以前只比网关，这是个坑：两个口接同一台路由器时网关本来就相同
+    # （这台机器就是 192.168.1.1），于是已存在的、指向另一个接口的路由
+    # 也被判定为"可复用"。调用方以为探测会走指定网卡，实际走了另一条，
+    # 测出来的延迟/吞吐全是对的接口的错数据。
+    local cur curif
     cur="$(route -n get "$1" 2>/dev/null | sed -n 's/^[[:space:]]*gateway:[[:space:]]*//p' | head -1)"
-    [ -n "$cur" ] && [ "$cur" = "$3" ] && return 0
+    curif="$(route -n get "$1" 2>/dev/null | sed -n 's/^[[:space:]]*interface:[[:space:]]*//p' | head -1)"
+    if [ -n "$cur" ] && [ "$cur" = "$3" ] && [ "$curif" = "$2" ]; then
+        return 0
+    fi
     return 1
 }
 
@@ -547,9 +555,31 @@ measure_latency() {   # $1=设备 $2=网关 -> stdout: 平均 RTT 毫秒（如 1
     done
     if [ "$(id -u)" -eq 0 ] && [ -n "$gw" ]; then
         cleanup_probe_routes
+        # 每个目标都要**验证包真的会从 $dev 出去**，不能只信 route_add_host
+        # 的返回值。它的兜底分支是"已存在同网关的路由就复用"，而这台机器
+        # 两个口接同一台路由器（同网关 192.168.1.1）——那条已存在的路由
+        # 很可能指向另一个接口。复用之后 ping 走错口，测到的是另一条线的
+        # 延迟，latency/fastest 模式会据此选错线。
+        #
+        # 宁可少测几个目标，也不能拿假数据做决策。全部目标都指不进去时
+        # 返回空（调用方按"测不出"处理，保持现状），而不是返回一个
+        # 属于别的接口的数字。
+        local _ok="" _nok=0 _via
         for t in $seen; do
-            route_add_host "$t" "$dev" "$gw" >/dev/null 2>&1
+            route_add_host "$t" "$dev" "$gw" >/dev/null 2>&1 || continue
+            _via="$(route -n get "$t" 2>/dev/null | sed -n 's/^[[:space:]]*interface:[[:space:]]*//p' | head -1)"
+            # _via 为空说明没探到出口，交给 route_add_host 的判断；
+            # 非空且不是目标设备，才是确凿的走错口。
+            if [ -n "$_via" ] && [ "$_via" != "$dev" ]; then
+                continue
+            fi
+            _ok="$_ok $t"; _nok=$((_nok+1))
         done
+        if [ "$_nok" -eq 0 ]; then
+            cleanup_probe_routes >/dev/null 2>&1
+            return 1
+        fi
+        seen="$_ok"
     fi
     n=0
     for t in $seen; do
@@ -4397,6 +4427,20 @@ ensure_throughput() {   # $1=eth_dev $2=wifi_dev [$3=force 非空则忽略缓存
 
 ensure_latency() {   # $1=eth_dev $2=eth_gw $3=wifi_dev $4=wifi_gw
     local pair d gw v
+    # 非 root 时根本没法分别测两个接口：measure_latency 的探测路由只在 root 下加，
+    # 于是两次调用测的都是**默认路由**，得到同一个数。
+    #
+    # 原来会把这两个相同的数分别存成 lat_en0 / lat_en1，状态页接着显示
+    # "以太网 24.5ms / Wi-Fi 24.5ms"——看上去两条线都认真测过，实际只测了
+    # 默认路由那一条。选路判断倒是安全的（两边相等 → pick_fastest 判 tie →
+    # 保持现状），但展示是假的。
+    #
+    # 所以非 root 直接不写缓存，让上层看到"没有数据"，而不是看到一份
+    # 以假乱真的对称数据。守护进程由 launchd 以 root 跑，正常不受影响；
+    # 手动 bash smartroute watch 跑时才会走到这里。
+    if [ "$(id -u)" -ne 0 ]; then
+        return 0
+    fi
     for pair in "$1:$2:eth" "$3:$4:wifi"; do
         d="${pair%%:*}"
         gw="${pair#*:}"; gw="${gw%:*}"
