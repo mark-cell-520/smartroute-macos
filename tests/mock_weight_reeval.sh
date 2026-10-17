@@ -106,5 +106,44 @@ echo "== 6. write_pf_rules 只收 8 个参数，不该多传 same =="
 grep -q 'write_pf_rules "\$ACTIVE_ETH_DEV" "\$eth_gw" "\$ACTIVE_WIFI_DEV" "\$wifi_gw" "\$excl" "" "\$w1" "\$w2" || return 1' smartroute.sh \
     && ok "按 8 参调用，没有多传 same" || bad "多传了参数或调用形式不对"
 
+echo "== 7. balance_status 必须显示当前配比 =="
+# 以前只打"轮询（两个接口交替）"，而 weighted 根本不是轮询——它把快的网关
+# 在 route-to 列表里重复多次。显示成轮询会让用户以为两边一样多，
+# 实际可能是 1:4，排查时完全对不上。而且配比是周期重测的，
+# 用户需要看到当前值才知道守护进程有没有在工作。
+state_set balance_mode weighted
+state_set balance_weight '1:4'
+state_set balance_winner ''
+out="$(balance_status 2>/dev/null)"
+echo "$out" | grep -q "按容量配比 1:4" \
+    && ok "weighted 显示配比 1:4" || bad "weighted 没显示配比"
+echo "$out" | grep -q "以太网 x1 / Wi-Fi x4" \
+    && ok "配比拆解到两个接口" || bad "配比没拆解"
+echo "$out" | grep -q "约每 10 分钟重测" \
+    && ok "说明了配比会自动更新" || bad "没说配比会更新"
+# 没有缓存配比时不能报错，要说明在等重测
+state_del_balance_weight() { del_key balance_weight; }
+del_key balance_weight
+out="$(balance_status 2>/dev/null)"
+echo "$out" | grep -q "等待守护进程重测后显示" \
+    && ok "无缓存配比时说明在等待" || bad "无缓存配比时报了错或显示错"
+# fastest 模式不能被显示成配比
+state_set balance_mode fastest
+out="$(balance_status 2>/dev/null)"
+echo "$out" | grep -q "最快线路" && ok "fastest 仍显示最快线路" || bad "fastest 显示错"
+
+echo "== 8. App 侧不能把 weighted 显示成轮询 =="
+grep -q 'balanceStrategyLabel' SmartRouteApp/NetworkModel.swift \
+    && ok "App 有策略显示名计算属性" || bad "App 缺策略显示名"
+grep -q 'case "weighted":' SmartRouteApp/NetworkModel.swift \
+    && ok "App 认 weighted 模式" || bad "App 不认 weighted"
+grep -q '按容量配比' SmartRouteApp/NetworkModel.swift \
+    && ok "App 显示配比" || bad "App 不显示配比"
+grep -q 'out.contains("分流策略       : 按容量配比")' SmartRouteApp/NetworkModel.swift \
+    && ok "App 解析 bash 输出的配比行" || bad "App 没解析配比行"
+# 旧的二值判断必须去掉，否则 weighted 掉进 else 被显示成"轮询两条"
+grep -q 'out.contains("分流策略       : 最快线路") { self.balanceMode = "fastest" }$' SmartRouteApp/NetworkModel.swift \
+    && bad "还是二值判断，weighted 会被显示成轮询" || ok "没有残留的二值判断"
+
 echo ""
 echo "结果: $PASS 通过, $FAIL 失败"

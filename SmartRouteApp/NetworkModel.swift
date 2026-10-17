@@ -263,7 +263,39 @@ final class NetworkModel: ObservableObject {
     // MARK: 双网并发
     @Published var balanceStatusText = "（读取中…）"
     @Published var balanceOn = false
-    @Published var balanceMode = "round-robin"   // round-robin | fastest
+    @Published var balanceMode = "round-robin"   // round-robin | fastest | weighted
+    /// weighted 模式下的当前配比，形如 "1:4"（以太网 x1 / Wi-Fi x4）。
+    /// 守护进程约每 10 分钟重测更新，用户需要看到当前值——
+    /// 只显示"轮询两条"会让用户以为两边一样多，实际可能是 1:4，
+    /// 排查时完全对不上。
+    @Published var balanceWeight = ""
+    /// 分流策略的显示名。weighted 不能显示成"轮询两条"——容量配比下
+    /// 两边连接数可能差 4 倍，说成轮询会让用户排查时完全对不上。
+    var balanceStrategyLabel: String {
+        switch balanceMode {
+        case "fastest": return "最快线路"
+        case "weighted":
+            if balanceWeight.contains(":") {
+                let p = balanceWeight.split(separator: ":")
+                if p.count == 2 { return "按容量配比 \(balanceWeight)（以太网 x\(p[0]) / Wi-Fi x\(p[1])）" }
+            }
+            return "按容量配比"
+        default: return "轮询两条"
+        }
+    }
+
+    /// 分流策略的一句话说明。
+    var balanceStrategyBlurb: String {
+        switch balanceMode {
+        case "fastest": return "正在把新连接全部送到延迟更低的那条线路。"
+        case "weighted":
+            return balanceWeight.contains(":")
+                ? "正在按实测吞吐分配新连接：以太网 x\(balanceWeight.split(separator: ":")[0]) / Wi-Fi x\(balanceWeight.split(separator: ":")[1])。"
+                : "正在按实测吞吐把新连接分配到两条线，快的多扛。"
+        default: return "正在把新连接轮询分发到两个接口。"
+        }
+    }
+
     /// 两个接口网关相同（同一台路由器）——不是两条 WAN，分流没有带宽收益。
     /// 从 balance status 的警告行解析出来，让 App 在用户最常看的地方提示。
     @Published var balanceSameGateway = ""
@@ -1126,8 +1158,25 @@ final class NetworkModel: ObservableObject {
                         break
                     }
                 }
-                if out.contains("分流策略       : 最快线路") { self.balanceMode = "fastest" }
-                else { self.balanceMode = "round-robin" }
+                // 三种模式都要认。以前只有 fastest / round-robin 两档，
+                // weighted 会掉进 else 被显示成"轮询两条"——而容量配比
+                // 根本不是轮询，两边连接数可能差 4 倍。
+                if out.contains("分流策略       : 最快线路") {
+                    self.balanceMode = "fastest"
+                    self.balanceWeight = ""
+                } else if out.contains("分流策略       : 按容量配比") {
+                    self.balanceMode = "weighted"
+                    // 从 "按容量配比 1:4（以太网 x1 / Wi-Fi x4）" 里取 "1:4"
+                    let parts = out.components(separatedBy: "按容量配比 ")
+                    if parts.count > 1 {
+                        let rest = parts[1].components(separatedBy: "（")[0]
+                            .trimmingCharacters(in: .whitespaces)
+                        if rest.contains(":") { self.balanceWeight = rest }
+                    }
+                } else {
+                    self.balanceMode = "round-robin"
+                    self.balanceWeight = ""
+                }
                 // 解析 "实时延迟" 行：    en0      26.8 ms   en1      38.1 ms
                 var lat: [String: String] = [:]
                 for line in out.components(separatedBy: "\n") {

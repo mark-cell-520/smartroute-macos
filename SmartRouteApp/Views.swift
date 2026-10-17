@@ -701,7 +701,9 @@ struct BalanceView: View {
                     if model.balanceLoading { ProgressView().controlSize(.small) }
                 }
                 LabeledContent("配置开关", value: "BALANCE=\(model.balanceOn ? 1 : 0)")
-                LabeledContent("分流策略", value: model.balanceMode == "fastest" ? "最快线路" : "轮询两条")
+                // weighted 不能显示成"轮询两条"：容量配比下两边连接数可能差 4 倍，
+                // 说成轮询会让用户排查时完全对不上。配比要一并显示。
+                LabeledContent("分流策略", value: model.balanceStrategyLabel)
                 LabeledContent("系统 pf", value: pfLine)
                 LabeledContent("分流规则", value: ruleLine)
             }
@@ -739,7 +741,7 @@ struct BalanceView: View {
         Card {
             VStack(alignment: .leading, spacing: Theme.gapS) {
                 Text(model.balanceOn
-                     ? (model.balanceMode == "fastest" ? "正在把新连接全部送到延迟更低的那条线路。" : "正在把新连接轮询分发到两个接口。")
+                     ? model.balanceStrategyBlurb
                      : "开启后，不同的网络连接会分别走以太网和 Wi-Fi。")
                     .font(.callout)
 
@@ -782,10 +784,12 @@ struct BalanceView: View {
                 if model.balanceOn {
                     Text(model.balanceMode == "fastest"
                          ? "守护进程会定期重测两边延迟，某条线路变慢就自动改走另一条。"
-                         : "撤销会清空分流规则；如果 pf 是由本工具开启的，撤销时也会把系统 pf 关回去。")
+                         : (model.balanceMode == "weighted"
+                            ? "守护进程约每 10 分钟重测一次吞吐并调整配比；Wi-Fi 变慢会自动把配比调回来，否则会出现「开了并发比不开还慢」。"
+                            : "撤销会清空分流规则；如果 pf 是由本工具开启的，撤销时也会把系统 pf 关回去。"))
                         .font(.caption).foregroundStyle(.secondary)
                 } else {
-                    Text("轮询：多连接/多下载分摊到两个接口，带宽可叠加。\n最快：所有新连接走延迟低的那条，适合一条稳一条快的场景。")
+                    Text("轮询：多连接/多下载在两个接口间均分，适合两条线差不多快。\n配比：按实测吞吐分配，适合两条线差得远（如 100M 有线配 432M Wi-Fi）。\n最快：所有新连接走延迟低的那条，适合一条稳一条快的场景。")
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }

@@ -1843,7 +1843,8 @@ MSG
 
     # 抓基线字节数，下载完算增量，才能说出"每条线实际扛了多少"。
     # 在切段之前抓：抓晚了会把前面探测那几下算进去。
-    local T rc=0 eth_before=0 wifi_before=0
+    local T rc=0 eth_before=0 wifi_before=0 t_start
+    t_start="$(date +%s)"
     find_active
     [ -n "$ACTIVE_ETH_DEV" ]  && eth_before="$(_if_bytes "$ACTIVE_ETH_DEV")"
     [ -n "$ACTIVE_WIFI_DEV" ] && wifi_before="$(_if_bytes "$ACTIVE_WIFI_DEV")"
@@ -2006,6 +2007,37 @@ MSG
             echo "     • 连接数太少：-n 1 或 2 时轮询可能全落在同一条线上，试着 -n 8"
         else
             echo "  ✅ 两条线都在扛这个文件（这就是并发叠加生效的证据）"
+        fi
+    fi
+
+    # 【速率与结论】只报"扛了多少字节"回答不了"到底有没有变快"——
+    # 两条线都在扛，也可能总共只跑到快的那条线的速度（瓶颈在路由器上游）。
+    # 所以必须算出本次吞吐，并和守护进程实测的单线速度比：
+    #   接近 快线单独的速度      → 聚合没赚到，瓶颈在上游（同网关时常这样）
+    #   明显超过 快线单独的速度  → 聚合真的在叠加
+    # 这个结论必须说出来，否则用户花了力气开分流，却不知道有没有收益。
+    local t_end t_dur bps
+    t_end="$(date +%s)"
+    t_dur=$(( t_end - t_start ))
+    [ "$t_dur" -lt 1 ] && t_dur=1
+    bps=$(( size * 8 / t_dur ))
+    echo "本次吞吐: $(fmt_bps "$bps")（${t_dur}s）"
+
+    find_active 2>/dev/null
+    local _pe _pw _fast
+    _pe="$(_metric_val "speed_$ACTIVE_ETH_DEV")"
+    _pw="$(_metric_val "speed_$ACTIVE_WIFI_DEV")"
+    _fast="$_pe"; [ "${_pw:-0}" -gt "${_pe:-0}" ] 2>/dev/null && _fast="$_pw"
+    if [ -n "$_pe" ] && [ -n "$_pw" ] && [ "${_pe:-0}" -gt 0 ] 2>/dev/null && [ "${_pw:-0}" -gt 0 ] 2>/dev/null; then
+        # 超过快线单独速度的 80% 就算"基本吃满了快线"
+        local _thresh=$(( _fast * 8 / 10 ))
+        if [ "$bps" -ge "$_thresh" ]; then
+            echo "结论: 吞吐已接近单条快线的实测上限（$(fmt_bps "$_fast")），"
+            echo "      并发没有额外收益——瓶颈不在你这两个入口，大概率在路由器上游。"
+            echo "      同网关双接口本来就共享同一条上游链路，这不是工具的问题。"
+        else
+            echo "结论: 吞吐明显低于单条快线的上限（$(fmt_bps "$_fast")），"
+            echo "      还有空间。可试着加大 -n（如 16/24）让更多连接参与分摊。"
         fi
     fi
     return 0
@@ -2584,6 +2616,18 @@ balance_status() {
     [ -n "$bmode" ] || bmode="$BALANCE_MODE"
     if [ "$bmode" = "fastest" ]; then
         echo "  分流策略       : 最快线路（只走 ${bwinner:-未定}）"
+    elif [ "$bmode" = "weighted" ]; then
+        # 配比必须打出来。以前只打"轮询（两个接口交替）"，而 weighted 根本不
+        # 是轮询——它按实测吞吐把快的网关在 route-to 列表里重复多次。
+        # 显示成"轮询"会让用户以为两边一样多，实际可能是 1:4，
+        # 排查时完全对不上。而且配比是周期重测的，用户需要看到当前值。
+        local _bw
+        _bw="$(state_get balance_weight)"
+        if [ -n "$_bw" ]; then
+            echo "  分流策略       : 按容量配比 ${_bw}（以太网 x${_bw%%:*} / Wi-Fi x${_bw##*:}）"
+        else
+            echo "  分流策略       : 按容量配比（等待守护进程重测后显示）"
+        fi
     else
         echo "  分流策略       : 轮询（两个接口交替）"
     fi
@@ -2606,6 +2650,10 @@ balance_status() {
     echo
     if [ "$bmode" = "fastest" ]; then
         echo "  原理: 新连接固定走延迟更低的接口；守护进程定期重测，变慢会自动改走另一条"
+    elif [ "$bmode" = "weighted" ]; then
+        echo "  原理: 按实测吞吐把快的网关在 route-to 列表里重复多次，近似加权轮询"
+        echo "        守护进程约每 10 分钟重测一次，Wi-Fi 变慢会自动把配比调回来"
+        echo "        （否则会出现'开了并发比不开还慢'）"
     else
         echo "  原理: 新连接按轮询在两个网关间分流（不同连接走不同接口）"
     fi
