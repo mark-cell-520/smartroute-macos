@@ -1491,11 +1491,11 @@ cmd_doctor() {
                 # 用户明确要的就是并发（"两个网络一起跑一个数据"），
                 # 每次 doctor 都劝他关掉，既不听诉求，也没说清什么还有效。
                 # 而且原来的第二条建议是**错的**：同网关下用
-                # `smartroute fetch <URL> -n 16` 多连接下载仍能超过
+                # `smartroute fetch <URL> -n 4` 多连接下载仍能超过
                 # 单连接速度——瓶颈常常在单条 TCP 的拥塞控制/窗口，
                 # 不在聚合链路带宽。挑一个更快的接口反而拿不到这部分。
                 advice+=("同网关下并发不增加聚合带宽（上游是一条），但多连接/多应用仍可能更快：")
-                advice+=("  下载大文件用 smartroute fetch <URL> -n 16，让多个连接分摊到两个接口")
+                advice+=("  下载大文件用 smartroute fetch <URL> -n 4，让多个连接分摊到两个接口")
                 advice+=("  若只想让故障时另一条线立刻接上，保持开启即可，代价是慢接口会分到一部分连接")
             fi
         else
@@ -1807,7 +1807,8 @@ cmd_stats() {   # 输出各活跃接口的累计字节（App 用来算实时速�
 #
 # 这是软件层面能达到的上限，且对单文件下载确实有效。
 cmd_fetch() {   # $1=URL [-o 输出] [-n 连接数] [--no-balance-check]
-    local url="" out="" n=8 check=1 a
+    # 默认 4 是实测峰值（见下面连接数上限处的数据）。
+    local url="" out="" n=4 check=1 a
     while [ $# -gt 0 ]; do
         case "$1" in
             # 两个必须校验的地方：
@@ -1838,11 +1839,17 @@ cmd_fetch() {   # $1=URL [-o 输出] [-n 连接数] [--no-balance-check]
   注意：这依赖服务端支持 Range。工具会真发一个 Range 请求探测，
   不支持时自动退化为单连接并说明原因。
 
-  前置条件: sudo smartroute balance on [round-robin|weighted]
+  连接数：默认 4，上限 16。-n 给的是**上限**，不是一开始就起这么多。
+ 工具先起 2 条，之后每当下完的分片数达到阈值就加一条，直到 -n 的上限。
+ 服务端扛得住就自动加到上限，扛不住就停在低连接数——实测连接数超过
+ 峰值后吞吐单调下降（n=4 是 17.6 Mbps，n=16 掉到 8.0 Mbps，失败分片
+ 从 2 个涨到 11 个），所以让工具自己判断比一次起满更稳。
+
+ 前置条件: sudo smartroute balance on [round-robin|weighted]
   不开启也能跑，但所有连接会走同一条线，看不到叠加效果。
 
 示例:
-  smartroute fetch https://example.com/big.iso -o big.iso -n 16
+  smartroute fetch https://example.com/big.iso -o big.iso -n 4
 USAGE
                 return 0 ;;
             -*) die "未知选项: $1（用 --help 看用法）" ;;
@@ -1852,11 +1859,24 @@ USAGE
     [ -n "$url" ] || die "用法: smartroute fetch <URL> [-o 输出] [-n 连接数]"
     case "$n" in ''|*[!0-9]*) die "连接数必须是正整数: $n" ;; esac
     [ "$n" -ge 1 ] || die "连接数至少为 1"
-    # 上限 64。以前没有上限：-n 1000 会起 1000 个 curl 进程，
-    # 不但不会更快（连接数远超过带宽时是纯开销），还会把机器拖死、
-    # 触发沙箱/系统的并发连接限制，最后表现成"下载失败"。
-    # 64 已经远超两条家用宽带的所需连接数。
-    [ "$n" -le 64 ] || die "连接数上限 64（-n $n 太多了）。两条宽带走 8~24 就够"
+    # 上限 16，默认 4。这两个数字是**实测**定的，不是拍的。
+    #
+    # 实测（1GB 文件，OVH，两接口交替分片）：
+    #     n=2   218MB  1 个分片失败   17.0 Mbps
+    #     n=4   219MB  2 个分片失败   17.6 Mbps   ← 峰值
+    #     n=8   178MB  4 个分片失败   14.3 Mbps
+    #     n=16   97MB  11 个分片失败   8.0 Mbps
+    # 失败分片数基本随 n 等比例增长，吞吐单调下降。原因是连接数一多，
+    # 服务端开始限流/丢连接，而每条连接的 TCP 慢启动重新来过，反而更慢。
+    #
+    # 所以：
+    #   · 默认从 8 降到 4 —— 原来的默认值已经落在衰减区
+    #   · 上限从 64 降到 16 —— -n 16 实测是灾难（单独测 1GB 只下了 153MB
+    #     就多个连接超时）。旧注释说"两条宽带走 8~24 就够"是想当然，
+    #     与实测矛盾。
+    #   · 另外有自适应扩连接（见下面的 _fetch_ramp）：真正需要更多连接时
+    #     由工具自己判断，不需要用户猜。
+    [ "$n" -le 16 ] || die "连接数上限 16（-n $n 太多了）。实测 n=16 已明显衰减，需要更多连接请用自适应扩连"
 
     command -v curl >/dev/null 2>&1 || die "系统缺少 curl"
 
@@ -1967,7 +1987,16 @@ MSG
     # 连接数不能超过文件大小，否则有空段
     [ "$n" -gt "$size" ] && n="$size"
 
-    echo "大小 $(fmt_bytes "$size")，$n 个连接并行下载…"
+    # 措辞必须和实际行为一致：自适应扩连先起 2 条，之后才可能加到 n。
+    # 以前这里直接写"$n 个连接并行下载"，用户会以为真有 n 条在跑，
+    # 而活动监视器里只看到 2 条——软件撒谎比报错更糟。
+    local _show_start="$n"
+    [ "$_show_start" -gt 2 ] && _show_start=2
+    if [ "$n" -gt "$_show_start" ]; then
+        echo "大小 $(fmt_bytes "$size")，最多 $n 条连接（先起 $_show_start 条，按服务端表现逐步加）…"
+    else
+        echo "大小 $(fmt_bytes "$size")，$n 个连接并行下载…"
+    fi
 
     # 抓基线字节数，下载完算增量，才能说出"每条线实际扛了多少"。
     # 在切段之前抓：抓晚了会把前面探测那几下算进去。
@@ -2109,17 +2138,43 @@ MSG
     # 用户看到"8 个 worker"会以为有 8 条连接在跑，实际可能只有 1 条。
     if [ "$total_chunks" -lt "$n" ]; then
         echo "  切成 $total_chunks 片（每片约 $(fmt_bytes "$chunk")）"
-        echo "  文件较小，只有 $total_chunks 片可下，$n 个连接里有 $(( n - total_chunks )) 个会空转"
+        echo "  文件较小，只有 $total_chunks 片可下，上限 $n 条连接里多出来的会空转"
         echo "  （小文件切太细反而更慢，这是有意的；要跑满连接请换个大文件）"
     else
-        echo "  切成 $total_chunks 片（每片约 $(fmt_bytes "$chunk")），$n 个 worker 认领"
+        echo "  切成 $total_chunks 片（每片约 $(fmt_bytes "$chunk")），最多 $n 个 worker 认领"
     fi
     local -a pids=()
     local w
-    for w in $(seq 1 "$n"); do
+    # ── 自适应扩连接 ──
+    #
+    # 为什么不再一次性起满 n 个 worker：实测连接数是**有峰值**的，
+    # 超过之后吞吐单调下降、失败分片等比例增加：
+    #     n=2   218MB  1 个分片失败   17.0 Mbps
+    #     n=4   219MB  2 个分片失败   17.6 Mbps   ← 峰值
+    #     n=8   178MB  4 个分片失败   14.3 Mbps
+    #     n=16   97MB  11 个分片失败   8.0 Mbps
+    # 原因是连接数一多服务端就开始限流/丢连接，每条连接的 TCP 慢启动
+    # 重新来过，反而更慢。而"多少条是峰值"取决于服务端，用户没法预知。
+    #
+    # 所以改成：先起 2 个 worker，之后每当"已下载片数 ≥ 下一档阈值"就加一个，
+    # 直到用户给的 n。服务端扛得住 → 很快加到 n；服务端限流 → 片下得慢，
+    # 阈值一直不达到，就停在低连接数。不需要测速，也不需要用户猜。
+    #
+    # 阈值算法：下一档 = 当前已起 worker 总数 × 已起的 worker 数。
+    # 起 2 个 → 阈值 2；下完 2 片后起到 3 个 → 阈值 5；下完 5 片起到 4 个 → 9。
+    # 这样每个 worker 平均至少要完整下完一片才允许再加人，加人是赚到的。
+    local n_start="$n"
+    [ "$n_start" -gt 2 ] && n_start=2
+    [ "$n_start" -ge 1 ] || n_start=1
+    local -a pids=()
+    local _spawned=0 _next_spawn_at=$n_start _comp=0 _alive=0 _remain=0 _ramped=0
+    for w in $(seq 1 "$n_start"); do
         _fetch_worker "$T/q" "$total_chunks" "$url" "$T" "$chunk" "$size" &
         pids+=("$!")
+        _spawned=$((_spawned+1))
     done
+    [ "$n_start" -lt "$n" ] && _ramped=1
+
     # 有分片失败时立刻让其余 worker 停手。
     #
     # 以前不这样做：失败的 worker 自己 return 1，兄弟 worker 继续认领
@@ -2127,23 +2182,52 @@ MSG
     # （每段最长 600s），最后才报"已放弃"——消息和"其实全下完了"的
     # 行为互相矛盾，白费带宽和时间。用户等半天拿到一个不能用的结果。
     #
-    # 实现：第一个失败的 worker 创建 $T/stop，所有 worker 的认领循环
-    # 检查这个标志；父进程 poll 而不是干等，发现 stop 就把剩余 pid kill 掉。
-    local p _stop_seen=0
-    for p in ${pids[@]+"${pids[@]}"}; do
-        while kill -0 "$p" 2>/dev/null; do
-            if [ -f "$T/stop" ]; then
-                _stop_seen=1
-                break 2
-            fi
-            sleep 0.2
+    # 实现：失败的 worker 先写 $T/fail_<片号>，父进程 poll 发现就建 $T/stop，
+    # 所有 worker 的认领循环检查这个标志；父进程随后把剩余 pid kill 掉。
+    local p _stop_seen=0 rc=0 _f _fi
+    while :; do
+        # 数活着的 worker。全退出了就收尾。
+        _alive=0
+        for p in ${pids[@]+"${pids[@]}"}; do
+            kill -0 "$p" 2>/dev/null && _alive=$((_alive+1))
         done
-        wait "$p" || rc=1
-        # 这个 worker 失败了 → 立 stop，别让其他人再白下
-        if [ ! -f "$T/stop" ] && [ "$rc" -ne 0 ]; then
-            : > "$T/stop"
+        [ "$_alive" -eq 0 ] && break
+
+        # 失败检测：worker 写 fail_<片号> 后就 return 1，比 wait 更早发现
+        for _f in "$T"/fail_*; do
+            [ -f "$_f" ] || continue
+            [ -f "$T/stop" ] || : > "$T/stop"
+            _stop_seen=1; rc=1
+            break
+        done
+        [ "$_stop_seen" = "1" ] && break
+        # 扩连接：达到阈值、还有剩余片、且没到用户上限时才加
+        if [ "$_spawned" -lt "$n" ]; then
+            _comp=$(ls "$T"/p* 2>/dev/null | wc -l | tr -d ' ')
+            _remain=$(( total_chunks - _comp ))
+            if [ "$_comp" -ge "$_next_spawn_at" ] && [ "$_remain" -gt "$_alive" ]; then
+                _fetch_worker "$T/q" "$total_chunks" "$url" "$T" "$chunk" "$size" &
+                pids+=("$!")
+                _spawned=$((_spawned+1))
+                _next_spawn_at=$(( _comp + _spawned ))
+            fi
         fi
+        sleep 0.2
     done
+    # 保险：正常退出路径（_alive 归零）也要查一次失败。
+    # worker 可能在最后一轮 poll 之后、父进程收尸之前写完 fail_ 文件，
+    # 漏掉的话下载会带着缺失的分片进入合并，最后报"字节数不符"——
+    # 而真正的原因（某片 404/超时）被吞了，诊断完全指错方向。
+    if [ "$rc" -eq 0 ]; then
+        for _f in "$T"/fail_*; do
+            [ -f "$_f" ] || continue
+            rc=1
+            break
+        done
+    fi
+    if [ "$_ramped" = "1" ] && [ "$_spawned" -gt "$n_start" ]; then
+        echo "  自适应扩连：从 $n_start 条逐步加到 $_spawned 条（服务端扛得住才加）"
+    fi
     if [ "$_stop_seen" = "1" ]; then
         # 把还在跑的 worker 杀掉。它们的 curl 会随之退出（父进程被 kill
         # 时子进程不自动死，必须显式处理）。
@@ -2226,7 +2310,10 @@ MSG
     # 用户看到的是一个被系统性低估的数字，而且低估量取决于
     # 报告打了多少行，不可复现。
     t_end_ns="$(date +%s%N)"
-    echo "完成: ${out}（$(fmt_bytes "$size")，${total_chunks} 片 / ${n} 连接）"
+    # 报实际用过的连接数（_spawned），不是用户给的上限（n）。
+    # 自适应扩连下这两者经常不同：用户 -n 8，实际可能只起到 3 条。
+    # 报上限会让用户以为有 8 条在跑，去对 netstat 时对不上。
+    echo "完成: ${out}（$(fmt_bytes "$size")，${total_chunks} 片 / ${_spawned:-1} 连接）"
 
     # 【实测分摊】拿刚才的基线算增量，报告每条线实际扛了多少字节。
     # 为什么必须有这个：用户要的是"两个网络一起跑一个数据"的**证据**，

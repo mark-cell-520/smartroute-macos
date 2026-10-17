@@ -246,10 +246,14 @@ grep -q "要精确测量，请关掉其他下载/同步类程序后重试" smart
     && ok "给出精确测量的办法" || bad "没给办法"
 
 echo "== 12. -n 上限与合并引号 =="
-# 无上限时 -n 1000 起 1000 个 curl：不会更快，还会拖死机器、
-# 触发系统并发限制，最后表现成"下载失败"。
-grep -q "连接数上限 64" smartroute.sh \
-    && ok "-n 有上限 64" || bad "-n 无上限"
+# 上限从 64 降到 16，依据是实测：连接数超过峰值后吞吐单调下降、
+# 失败分片等比例增加（n=4 → 17.6 Mbps/2 失败，n=16 → 8.0 Mbps/11 失败）。
+# 旧注释"两条宽带走 8~24 就够"是想当然，与实测矛盾。
+grep -q "连接数上限 16" smartroute.sh \
+    && ok "-n 有上限 16（实测定）" || bad "-n 上限不是 16"
+# 上限值本身也校验：只 grep 文案不够，文案改了数字没改照样漏。
+grep -q '\[ "\$n" -le 16 \]' smartroute.sh \
+    && ok "上限数值是 16" || bad "上限数值不是 16"
 grep -qF '_catlist="$_catlist \"$T/p$_i\""' smartroute.sh \
     && ok "合并时分片路径加引号" || bad "合并路径未加引号"
 grep -q 'eval "cat \$_catlist"' smartroute.sh \
@@ -258,8 +262,16 @@ grep -q 'eval "cat \$_catlist"' smartroute.sh \
 echo "== 13. 小文件 worker 空转要说清 =="
 # 片数少于 worker 数时多余的 worker 直接退出。不说清楚的话，
 # 用户看到"8 个 worker"会以为有 8 条连接在跑，实际可能只有 1 条。
-grep -q "个连接里有" smartroute.sh \
-    && ok "说明有多少连接空转" || bad "没说 worker 空转"
+# 自适应扩连后，实际起的连接数（_spawned）和用户给的上限（n）经常不同。
+# 消息必须说"上限/最多"，不能说成"$n 个连接"——那会让用户以为真有 n 条
+# 在跑，去对活动监视器时对不上。软件撒谎比报错更糟。
+grep -q "上限 \$n 条连接里多出来的会空转" smartroute.sh \
+    && ok "空转消息说上限而非实际数" || bad "空转消息仍谎报连接数"
+grep -q "最多 \$n 个 worker 认领" smartroute.sh \
+    && ok "认领消息说最多" || bad "认领消息仍谎报连接数"
+# 完成行必须报实际用过的 _spawned，不是上限 n
+grep -q '\${_spawned:-1} 连接' smartroute.sh \
+    && ok "完成行报实际连接数" || bad "完成行仍报上限"
 grep -q "小文件切太细反而更慢，这是有意的" smartroute.sh \
     && ok "说明为什么小文件不切细" || bad "没解释小文件行为"
 

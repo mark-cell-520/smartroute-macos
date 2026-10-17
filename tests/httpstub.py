@@ -21,12 +21,34 @@ import socketserver
 
 BODY = b'A' * 5000
 
+def body_of(path):
+    """按路径生成指定大小的内容。/size/<n> -> n 字节。
+    原来的 /file/<n> 里 <n> 只是路径参数、文件恒为 5000 字节，
+    没法测"多连接分片"——文件比分片还小，只会有一个分片被领取。"""
+    if path.startswith('/size/'):
+        try:
+            n = int(path[len('/size/'):])
+        except Exception:
+            n = 0
+        return b'B' * n if n > 0 else b''
+    return BODY
+
 
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
 
     def log_message(self, *a):
         pass
+
+    def do_GET(self):
+        # 每个请求记一行到 /tmp/sr_stub_hits，用来数"服务端实际收到几个连接"
+        try:
+            with open('/tmp/sr_stub_hits', 'a') as f:
+                f.write("%s %s range=%s\n" % (self.command, self.path,
+                                               self.headers.get('Range') or '-'))
+        except Exception:
+            pass
+        Handler._real_get(self)
 
     def _send(self, code, headers, body=b''):
         self.send_response(code)
@@ -70,6 +92,54 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._send(416, [('Content-Range', 'bytes */1234')])
             else:
                 self._send(200, [('Content-Type', 'application/octet-stream')], BODY)
+            return
+        # /size/<n>：n 字节的文件，完整支持 Range。
+        # 用来测多连接分片——/file/ 恒为 5000 字节，比分片还小，
+        # 只会有一个分片被领取，测不到并发。
+        if p.startswith('/slowsize/'):
+            # 慢速文件：/slowsize/<n>/<delay_ms>，每个请求先睡 delay 毫秒。
+            # 用来测"服务端扛不住时自适应扩连不会加人"——没有慢模式的话，
+            # 本地桩永远是快的，扩连必然加到上限，测不到收敛行为。
+            import time as _t
+            _parts = p[len('/slowsize/'):].split('/')
+            _n = int(_parts[0]) if _parts[0].isdigit() else 0
+            _d = int(_parts[1]) / 1000.0 if len(_parts) > 1 and _parts[1].isdigit() else 0.0
+            body = b'C' * _n
+            rng = self._range()
+            if rng is None:
+                if _d > 0:
+                    _t.sleep(_d)
+                self._send(200, [('Content-Type', 'application/octet-stream'),
+                                 ('Accept-Ranges', 'bytes')], body)
+                return
+            a, b = rng
+            a = 0 if a is None else a
+            b = len(body) - 1 if b is None else min(b, len(body) - 1)
+            if a > b or a >= len(body):
+                self._send(416, [('Content-Range', 'bytes */%d' % len(body))])
+                return
+            if _d > 0:
+                _t.sleep(_d)
+            self._send(206, [('Content-Type', 'application/octet-stream'),
+                             ('Content-Range', 'bytes %d-%d/%d' % (a, b, len(body))),
+                             ('Accept-Ranges', 'bytes')], body[a:b + 1])
+            return
+        if p.startswith('/size/'):
+            body = body_of(p)
+            rng = self._range()
+            if rng is None:
+                self._send(200, [('Content-Type', 'application/octet-stream'),
+                                 ('Accept-Ranges', 'bytes')], body)
+                return
+            a, b = rng
+            a = 0 if a is None else a
+            b = len(body) - 1 if b is None else min(b, len(body) - 1)
+            if a > b or a >= len(body):
+                self._send(416, [('Content-Range', 'bytes */%d' % len(body))])
+                return
+            self._send(206, [('Content-Type', 'application/octet-stream'),
+                             ('Content-Range', 'bytes %d-%d/%d' % (a, b, len(body))),
+                             ('Accept-Ranges', 'bytes')], body[a:b + 1])
             return
         body = BODY
         if p.startswith('/norange'):

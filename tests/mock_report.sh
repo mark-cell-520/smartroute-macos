@@ -81,8 +81,11 @@ if printf '%s' "$DOC" | grep -q "网关相同"; then
     # 关掉既不听诉求，也没说清什么还有效。而且"挑一个更快的接口"这个
     # 旧建议是**错的**：同网关下用 smartroute fetch 多连接下载仍能超过
     # 单连接速度——瓶颈常在单条 TCP 的拥塞控制/窗口，不在聚合链路带宽。
-    # 所以现在给的建议是：用 fetch -n 16 把多个连接分摊到两个接口。
-    printf '%s' "$DOC" | grep -q "smartroute fetch <URL> -n 16" \
+    # 所以现在给的建议是：用 fetch -n 4 把多个连接分摊到两个接口。
+    # -n 从 16 改成 4 是实测定的：n=4 是吞吐峰值（17.6 Mbps），
+    # n=16 掉到 8.0 Mbps 且 11/16 个分片失败。而且现在 -n 是上限，
+    # 工具会自适应扩连，不需要用户猜一个大的数。
+    printf '%s' "$DOC" | grep -q "smartroute fetch <URL> -n 4" \
         && ok "给出可操作建议（多连接下载）" || bad "没有可操作建议"
     printf '%s' "$DOC" | grep -q "smartroute fetch" \
         && ok "建议里带具体命令" || bad "建议里没有命令"
