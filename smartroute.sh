@@ -868,8 +868,20 @@ cmd_watch() {
 
     # 【保护】默认路由若由 VPN/拨号等第三方接口持有（utun/ppp/ipsec），不干预——
     # 那种情况下流量本来就走在隧道里，改服务顺序/路由表没有意义甚至有害。
+    #
+    # ⚠️ 但"不干预"只适用于服务顺序/路由表那套单网选路逻辑。
+    # 双网并发的安全阀不能跟着一起跳过：VPN 持有默认路由时，
+    # 若某个物理口没有外网，pf route-to 仍会把一半新连接送进那个死口，
+    # 而且会把去往 VPN 目标的流量劫持到物理接口（隧道泄漏）。
+    # balance_on 只在开启时查过 VPN，之后连上 VPN 不会再查——
+    # 所以这里必须自己判，不能提前 return。
     if [ -n "$cur" ] && [ "$cur" != "$ACTIVE_ETH_DEV" ] && [ "$cur" != "$ACTIVE_WIFI_DEV" ]; then
-        echo "$(ts) default=$cur 由 VPN/其他接口持有，不干预"
+        echo "$(ts) default=$cur 由 VPN/其他接口持有，不干预服务顺序"
+        if [ "$BALANCE" = "1" ] && [ "$(id -u)" -eq 0 ]; then
+            log "VPN/其他接口 ($cur) 持有默认路由，关闭双网并发避免隧道泄漏"
+            balance_off quiet
+            notify "SmartRoute 双网并发" "VPN 接管了默认路由，已自动关闭双网并发（避免流量被分流到物理接口）"
+        fi
         return 0
     fi
 
@@ -2409,19 +2421,29 @@ balance_off() {   # $1=quiet 时不输出（安全阀内部调用）
         [ "$q" = "quiet" ] || echo "错误: 关闭双网并发需要 root（要清掉 pf 分流规则）: sudo smartroute balance off" >&2
         return 1
     fi
+    # 先写配置，再清规则。以前顺序相反，于是一个毫秒级窗口里：
+    # 守护进程看到 anchor 已空、配置文件却还是 BALANCE=1 → 重新 pfctl -f
+    # 加载 → 规则复活。最终状态是 pf 分流仍在生效，而配置说 0、
+    # status 显示"未生成"——静默自相矛盾，且重启后才消失。
+    # 配置也可能写不进去（root 建的 /Users/Shared/smartroute.conf 普通用户改不动）。
+    # 这个返回值以前被丢掉了，于是配置没改成也报成功。
+    if ! conf_set_auto BALANCE 0; then
+        [ "$q" = "quiet" ] || echo "错误: 配置写不进去（BALANCE 仍是 1），守护进程可能会重新开启，未清规则" >&2
+        return 1
+    fi
     pfctl -a "$PF_ANCHOR" -F all 2>/dev/null
     rm -f "$PF_ANCHOR_FILE" 2>/dev/null
     if pf_enabled_by_us; then
         pfctl -d 2>/dev/null && log "双网并发: 关闭由 smartroute 开启的系统 pf"
     fi
     rm -f "$PF_STATE_FILE" 2>/dev/null
+    # 分流相关的 state 必须一起清。以前不清，于是 off 之后 balance status
+    # 同屏自相矛盾："BALANCE=0 / 规则未生成"，下面却还挂着
+    # "分流策略: 按容量配比 1:4"——用户会以为关掉的只是规则、配比还在生效。
+    state_set balance_mode ""
+    state_set balance_winner ""
+    state_set balance_weight ""
     log "双网并发分流已关闭，网络恢复原状"
-    # 配置也可能写不进去（root 建的 /Users/Shared/smartroute.conf 普通用户改不动）。
-    # 这个返回值以前被丢掉了，于是配置没改成也报成功。
-    if ! conf_set_auto BALANCE 0; then
-        [ "$q" = "quiet" ] || echo "错误: pf 规则已清掉，但配置写不进去（BALANCE 仍是 1），守护进程可能会重新开启" >&2
-        return 1
-    fi
     [ "$q" = "quiet" ] || echo "双网并发分流已关闭，网络已恢复原状"
     return 0
 }
@@ -2498,6 +2520,26 @@ balance_validate() {   # $1=设备A $2=IP-A $3=设备B $4=IP-B $5=只走的设�
         log "并发分流验证通过: 连通性 $ok/10, 出站字节 $d1 +$g1 / $d2 +$g2${only:+ (只走 $only)}"
     else
         log "并发分流验证通过: 连通性 $ok/10（未能读取接口字节计数器，跳过分布检查）"
+    fi
+    return 0
+}
+
+# 重写 pf 规则前必须确认两个接口的网段都还能解析出来。
+#
+# 为什么 reevaluate 路径也需要这个守卫：dev_subnet 返回空的场景是真实存在
+# 的（接口在 find_active 之后丢了 IPv4、DHCP 续租间隙、ifconfig 输出变化）。
+# 此时生成的排除表会少一个 LAN，`to ! <lan_all>` 不再排除它，
+# 于是**那个网段的流量被 NAT 到互联网——局域网静默不通**。
+# balance_on 一直有这个检查，两个周期重测路径以前漏了：
+# 守护进程跑几分钟后一旦踩到，用户家里所有内网设备互相不通，
+# 而表面上只是"配比没更新"，没有任何报错。
+# 宁可保留旧规则不重写，也不能生成一条会打死局域网的规则。
+_balance_nets_ok() {   # $1=设备A $2=设备B，返回 0 表示可以安全重写
+    local l1 l2
+    l1="$(dev_subnet "$1")"; l2="$(dev_subnet "$2")"
+    if [ -z "$l1" ] || [ -z "$l2" ]; then
+        log "跳过规则重写: 无法确定接口网段 ($1=${l1:-未知} / $2=${l2:-未知})，保留现有规则"
+        return 1
     fi
     return 0
 }
@@ -2581,6 +2623,7 @@ MSG
     if [ -z "$lan1" ] || [ -z "$lan2" ]; then
         die "无法确定接口网段（$ACTIVE_ETH_DEV=${lan1:-未知} / $ACTIVE_WIFI_DEV=${lan2:-未知}），为安全起见不开启并发分流"
     fi
+    unset lan1 lan2
 
     # 排除 VPN/拨号网段，避免分流把 VPN 流量送到物理接口
     local excl
@@ -2625,7 +2668,7 @@ MSG
     #
     # 做法：把快的网关在 route-to 列表里重复多次，近似按容量配比。
     # pf 的 round-robin 只认列表顺序、不认权重，重复条目是最贴近的实现。
-    local w1=1 w2=1
+    local w1=1 w2=1 _bw0=""
     if [ "$mode" = "weighted" ]; then
         echo "正在测量两个接口的吞吐（各需一次下载，约几秒）…"
         local _t1 _t2 _n1 _n2 _g
@@ -2643,6 +2686,9 @@ MSG
                 w2=4; w1=$(( _t1 * 4 / _t2 )); [ "$w1" -lt 1 ] && w1=1
             fi
             echo "    → 按容量配比：以太网 x$w1 / Wi-Fi x$w2"
+            # 测到了才记配比。回退成轮询时不记——否则 status 会显示一个
+            # 实际没生效的配比，比不显示更糟。
+            _bw0="$w1:$w2"
         else
             echo "    ⚠️  至少一边测不到吞吐，回退为 1:1 轮询"
             w1=1; w2=1; mode="round-robin"
@@ -2680,6 +2726,13 @@ MSG
     conf_set_auto BALANCE 1
     conf_set_auto BALANCE_MODE "$mode"
     state_set balance_mode "$mode"
+    # weighted 一开启就把当前配比写进 state。以前不写，刚开完时
+    # balance status 显示"按容量配比（等待守护进程重测后显示）"，
+    # 而规则里其实已经是 1:4 了——用户看到的和实际生效的不一致，
+    # 而且这一等就是 10 分钟。
+    if [ "$mode" = "weighted" ] && [ -n "${_bw0:-}" ]; then
+        state_set balance_weight "$_bw0"
+    fi
     state_set balance_winner "$only"
     log "双网并发分流已开启: $ACTIVE_ETH_DEV <-> $ACTIVE_WIFI_DEV 模式=$mode${only:+ 最快=$only}"
     echo
@@ -2708,7 +2761,16 @@ cmd_balance() {
     local arg="${1:-status}"
     case "$arg" in
         on|enable|start)  shift; balance_on "$@" ;;
-        off|disable|stop) balance_off ;;
+        # off 也要拿锁。balance_on 走 acquire_lock_strict，off 以前不走，
+        # 于是 off 和一个 watch 周期撞上时（毫秒级窗口）：
+        # 守护进程看到 anchor 空、文件还在 → 重新 pfctl -f 加载 → 规则复活。
+        # 最终状态：pf 分流仍在生效，而配置 BALANCE=0、status 显示"未生成"
+        # ——静默自相矛盾，且重启后才消失。
+        off|disable|stop)
+            if [ "$(id -u)" -eq 0 ]; then
+                acquire_lock_strict || die "拿不到操作锁，请稍后重试"
+            fi
+            balance_off ;;
         status|st)        balance_status ;;
         *) die "用法: smartroute balance on [round-robin|fastest|weighted] | off | status" ;;
     esac
@@ -2732,6 +2794,10 @@ balance_reevaluate() {
     [ "$want" = "$cur" ] && return 0
     log "最快线路重测: $ACTIVE_ETH_DEV=${el:-测不到}ms / $ACTIVE_WIFI_DEV=${wl:-测不到}ms → ${want:-两条轮询}（原 ${cur:-两条轮询}）"
     excl="$(other_nets | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+    # 网段守卫：见 _balance_nets_ok 的注释。fastest 重测以前漏了这个检查，
+    # 一旦 dev_subnet 返回空就生成少一个 LAN 的排除表，
+    # 那个网段的流量会被 NAT 到互联网——局域网静默不通。
+    _balance_nets_ok "$ACTIVE_ETH_DEV" "$ACTIVE_WIFI_DEV" || return 0
     write_pf_rules "$ACTIVE_ETH_DEV" "$eth_gw" "$ACTIVE_WIFI_DEV" "$wifi_gw" "$excl" "$want" || return 1
     pfctl -e 2>/dev/null
     pfctl -a "$PF_ANCHOR" -f "$PF_ANCHOR_FILE" 2>/dev/null || return 1
@@ -2781,6 +2847,7 @@ balance_weight_reevaluate() {
     excl="$(other_nets | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
     # 注意不要传 same：write_pf_rules 自己用 dev_subnet 算，只收 8 个参数。
     # 多传不会报错，但会让人以为要在这里维护它——改子网判断时就会漏改。
+    _balance_nets_ok "$ACTIVE_ETH_DEV" "$ACTIVE_WIFI_DEV" || return 0
     write_pf_rules "$ACTIVE_ETH_DEV" "$eth_gw" "$ACTIVE_WIFI_DEV" "$wifi_gw" "$excl" "" "$w1" "$w2" || return 1
     pfctl -e 2>/dev/null
     pfctl -a "$PF_ANCHOR" -f "$PF_ANCHOR_FILE" 2>/dev/null || return 1
@@ -2854,6 +2921,16 @@ balance_status() {
     if [ -n "$ACTIVE_ETH_DEV" ] && [ -n "$ACTIVE_WIFI_DEV" ]; then
         local eg wg el wl
         eg="$(svc_router "$ACTIVE_ETH_SVC")"; wg="$(svc_router "$ACTIVE_WIFI_SVC")"
+        # 必须拿锁。measure_latency 在 root 下会先 cleanup_probe_routes
+        # 再加主机路由，而守护进程每 20 秒也在做同样的事。两边撞上时：
+        #   · status 显示的是错延迟（自己的探测路由被删，流量改走默认路由）
+        #   · 更糟——status 的 cleanup 会把守护进程刚加的探测路由删掉，
+        #     守护进程于是"测了另一个接口"，可能触发一次本不该发生的切换。
+        # acquire_lock_wait 的注释描述的就是这个事故。
+        # 非 root 时快速放行（没有锁文件可拿，也不该为看状态卡住）。
+        if [ "$(id -u)" -eq 0 ]; then
+            acquire_lock_wait || echo "  （守护进程正在操作，本次不测实时延迟）"
+        fi
         echo "  实时延迟       : 测量中…"
         el="$(measure_latency "$ACTIVE_ETH_DEV" "$eg" | tail -n 1)"
         wl="$(measure_latency "$ACTIVE_WIFI_DEV" "$wg" | tail -n 1)"
