@@ -45,8 +45,19 @@ check_mode BALANCE_MODE
 # 3) SPEED_TEST_URL 两边都必须限 http/https
 grep -q 'SPEED_TEST_URL) case "\$val" in http://\*|https://\*)' smartroute.sh \
     && ok "脚本侧 SPEED_TEST_URL 限 http/https" || bad "脚本侧没限协议"
-grep -q 'case "SPEED_TEST_URL": ok = val.hasPrefix("http://")' SmartRouteApp/NetworkModel.swift \
-    && ok "App 侧 SPEED_TEST_URL 限 http/https" || bad "App 侧没限协议"
+grep -q 'case "SPEED_TEST_URL"' SmartRouteApp/NetworkModel.swift \
+    && ok "App 侧对 SPEED_TEST_URL 有专门分支" || bad "App 侧没限协议"
+# 光有协议头（http:// 后面什么都没有）脚本侧是拒的，App 以前放过——
+# 于是用户看到已导入，守护进程却静默丢掉这个键。
+# 现在要求"按实际命中的前缀剥除后非空"。
+grep -q 'val.count > prefix.count' SmartRouteApp/NetworkModel.swift \
+    && ok "App 侧拒绝半截 URL（只有协议头）" \
+    || bad "App 侧仍会放过 http:// 这种半截值，与脚本不一致"
+# 但不能做得比脚本还严：http://x 这种 8 字符的短 URL 脚本是收的。
+# 曾经写成 count > "https://".count（8），正好把 http://x 一起拒掉。
+grep -q 'prefix.count' SmartRouteApp/NetworkModel.swift \
+    && ok "按实际前缀长度判定（不会误拒 http://x 这类短 URL）" \
+    || bad "判定基准写死成 https:// 的长度，会误拒短 http:// URL"
 
 # 4) 布尔键集合一致
 BASH_BOOL="$(grep -m1 'TLS_PROBE|NOTIFY|AUTO_WIFI_POWER|BALANCE|WIFI_FAILOVER)' smartroute.sh | sed 's/ *TLS_PROBE|/TLS_PROBE|/; s/) *$//')"

@@ -21,12 +21,12 @@
 
 到 GitHub Releases 页面下载最新版：
 
-- **`SmartRoute-2.1-macOS.dmg`** —— 推荐，双击即可安装（本文重点）
-- `SmartRoute-2.1-macOS.zip` —— 备用，解压后得到 `SmartRoute.app`
+- **`SmartRoute-2.2-macOS.dmg`** —— 推荐，双击即可安装（本文重点）
+- `SmartRoute-2.2-macOS.zip` —— 备用，解压后得到 `SmartRoute.app`
 
 ## 三、安装（DMG）
 
-1. 双击打开 `SmartRoute-2.1-macOS.dmg`
+1. 双击打开 `SmartRoute-2.2-macOS.dmg`
 2. 把 **SmartRoute** 拖到 **Applications** 快捷方式上（或拖到 Finder 侧栏的"应用程序"）
 3. 等待拷贝完成，弹出（推出）磁盘映像，删除下载的 dmg 即可
 4. 从"启动台"或"应用程序"文件夹打开 SmartRoute（菜单栏也会出现一个网络图标）
@@ -253,7 +253,7 @@ cd smartroute
 bash build_release.sh  # 编译通用二进制 App（arm64 + x86_64）+ 校验 + 打 ZIP
 bash build_dmg.sh      # 打 DMG（需在普通终端运行，沙箱内无法创建设备映像）
 
-bash tests/mock_balance_rules.sh   # 跑测试（共 38 个测试文件，1065 项断言）
+bash tests/mock_balance_rules.sh   # 跑测试（共 38 个测试文件，1067 项断言）
 ```
 
 > `build_dmg.sh` 需要在有设备访问权限的普通终端运行；在沙箱/CI 里会报

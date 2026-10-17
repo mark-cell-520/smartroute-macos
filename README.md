@@ -69,7 +69,7 @@ sudo smartroute report > r.txt  # 一键诊断报告（贴给别人排查用）
 tail -f /var/log/smartroute.log # 实时看日志
 ```
 
-### 双网并发 / 分流 / 监控（v2.1 新增）
+### 双网并发 / 分流 / 监控（v2.2 新增）
 
 ```bash
 # —— 双网并发：不同连接分别走两个接口（带宽叠加效果）——
@@ -254,7 +254,7 @@ Applications → 右键打开（绕过 Gatekeeper）即可。**给用户的完�
 
 ```bash
 bash sync-github.sh            # 首次：建仓库并推送（支持 gh CLI / 令牌 / 手动三种认证）
-bash sync-github.sh release 2.1  # 之后每次发版：构建 ZIP+DMG、推代码、建 Release 上传产物
+bash sync-github.sh release 2.2  # 之后每次发版：构建 ZIP+DMG、推代码、建 Release 上传产物
 ```
 
 **重新构建**（改了源码后）：
@@ -279,8 +279,8 @@ bash build_release.sh
 
 | 文件 | 说明 |
 |---|---|
-| `SmartRoute-2.1-macOS.zip` | **推荐分发格式**：解压后右键 → 打开（或拖到应用程序） |
-| `SmartRoute-2.1-macOS.dmg` | 带「拖到应用程序」的安装镜像（需要磁盘镜像权限的环境才能生成） |
+| `SmartRoute-2.2-macOS.zip` | **推荐分发格式**：解压后右键 → 打开（或拖到应用程序） |
+| `SmartRoute-2.2-macOS.dmg` | 带「拖到应用程序」的安装镜像（需要磁盘镜像权限的环境才能生成） |
 | `SmartRoute/安装说明.txt` | 随包附带的中文安装说明 |
 
 发布版特性：
@@ -302,8 +302,8 @@ bash sync-github.sh          # 初始化仓库、提交、创建远端仓库并�
 
 ```bash
 bash build_release.sh
-gh release create v2.1 dist/SmartRoute-2.1-macOS.zip \
-    --title "SmartRoute v2.1" --notes-file README.md
+gh release create v2.2 dist/SmartRoute-2.2-macOS.zip \
+    --title "SmartRoute v2.2" --notes-file README.md
 ```
 
 ---

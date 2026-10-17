@@ -19,7 +19,7 @@
 #   sudo smartroute status       查看当前状态（只读）
 #   sudo smartroute test [-v]    手动探测各接口连通性（-v 显示分层明细，不切换）
 #   sudo smartroute doctor       一键体检：定位“为什么上不了网”
-#   sudo smartroute set auto|ethernet|wifi   设置选路模式
+#   sudo smartroute set auto|ethernet|wifi|speed|latency   设置选路模式
 #   sudo smartroute config       显示当前生效配置
 #   smartroute log [行数]        查看日志
 #
@@ -1390,9 +1390,21 @@ cmd_test() {
 
 cmd_set() {
     local kv="$1" key val target
+    # 三种写法都要认，尤其是第二种——那是用户最自然的写法：
+    #   smartroute set wifi
+    #   smartroute set MODE wifi        ← KEY VALUE 两个参数
+    #   smartroute set MODE=wifi
+    # 以前只认第一和第三种，于是 `set MODE wifi` 落到下面的 *) 报
+    # "无法识别: MODE"——而 MODE 明明是个合法配置键。用户看到这句只会
+    # 更困惑：到底是模式名写错了，还是这个键不存在？
+    # 判定"长得像配置键"用全大写+下划线，不会和模式名（全小写）混淆。
+    if [ -n "${2:-}" ] && printf '%s' "$1" | grep -qE '^[A-Z][A-Z0-9_]*$'; then
+        kv="$1=$2"
+    fi
     if [ -z "$kv" ]; then
         echo "用法: smartroute set auto|ethernet|wifi|speed|latency"
-        echo "  或: smartroute set KEY=VALUE  （KEY 见 config 命令输出）"
+        echo "  或: smartroute set KEY VALUE      （KEY 见 smartroute config）"
+        echo "  或: smartroute set KEY=VALUE"
         exit 1
     fi
     case "$kv" in
@@ -1402,7 +1414,10 @@ cmd_set() {
         speed|fast)    key="MODE"; val="speed" ;;
         latency|lowdelay) key="MODE"; val="latency" ;;
         *=*)           key="${kv%%=*}"; val="${kv#*=}" ;;
-        *) echo "无法识别: $kv"; exit 1 ;;
+        *) echo "无法识别: $kv"
+           echo "用法: smartroute set auto|ethernet|wifi|speed|latency"
+           echo "  或: smartroute set KEY VALUE   （KEY 见 smartroute config）"
+           exit 1 ;;
     esac
 
     # 校验配置项

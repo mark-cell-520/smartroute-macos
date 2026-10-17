@@ -2,7 +2,12 @@
 # 把 SmartRouteApp/ 编译打包成 SmartRoute.app（需要 Xcode 或 Command Line Tools）
 set -e
 cd "$(dirname "$0")"
-VERSION="2.2"
+# 版本号从 VERSION 文件读，和 build_release.sh / build_dmg.sh 同一来源。
+# 以前这里硬编码 "2.2"，而那两个脚本读文件——改版本号时只改文件的话，
+# build_app.sh 产出的 app 会停在旧版本，Info.plist 和 dist 目录名对不上，
+# 而用户看到的是"设置里显示 2.1"这种没法自查的矛盾。
+VERSION="$(cat VERSION 2>/dev/null | tr -d '[:space:]')"
+[ -n "$VERSION" ] || { echo "错误：读不到 VERSION 文件" >&2; exit 1; }
 APP="SmartRoute.app"
 
 echo "==> 清理旧构建"

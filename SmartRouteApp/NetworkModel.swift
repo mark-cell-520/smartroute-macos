@@ -410,7 +410,7 @@ final class NetworkModel: ObservableObject {
                 // 同网段直连，没有网关 IP 可 ping。这不是故障，是"没有这项信息"。
                 gwUnknown = true
             } else {
-                let (_, code) = Shell.run("ping -c 1 -W 800 \(defGw)", timeout: 3)
+                let (_, code) = Shell.run("ping -c 1 -W 800 \(Shell.quote(defGw))", timeout: 3)
                 if code == 0 {
                     gwReachable = true
                 } else {
@@ -506,7 +506,7 @@ final class NetworkModel: ObservableObject {
                 }
                 // getMedia 输出两行（Current: / Active:），要的是 Active 那行。
                 // 直接取整个输出会把 "Current: autoselect" 一起带进来。
-                let o = Shell.run("networksetup -getMedia \(ethDev) | awk -F': *' '/^Active:/{print $2; exit}'", timeout: 5).out
+                let o = Shell.run("networksetup -getMedia \(Shell.quote(ethDev)) | awk -F': *' '/^Active:/{print $2; exit}'", timeout: 5).out
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 if !o.isEmpty { snapshot.linkSpeedEth = o }
                 // "100baseTX <full-duplex...>" -> 100。解析不出留 0，
@@ -574,7 +574,7 @@ final class NetworkModel: ObservableObject {
         DispatchQueue.global().async {
             var failures: [String] = []
             for (key, value) in items {
-                let (out, code) = Shell.run("'\(script)' set \(key)=\(value)", timeout: 10)
+                let (out, code) = Shell.run("'\(script)' set \(Shell.quote(key))=\(Shell.quote(value))", timeout: 10)
                 if code != 0 { failures.append("\(key): \(out)") }
             }
             // 普通权限写不进去（多半是用户级配置被 root 创建过，/Users/Shared 带 sticky 位），
@@ -582,7 +582,7 @@ final class NetworkModel: ObservableObject {
             if !failures.isEmpty {
                 do {
                     for (key, value) in items {
-                        _ = try Privileged.run("'\(script)' set \(key)=\(value)")
+                        _ = try Privileged.run("'\(script)' set \(Shell.quote(key))=\(Shell.quote(value))")
                     }
                     DispatchQueue.main.async { completion(true, "已用管理员权限保存") }
                     return
@@ -804,11 +804,24 @@ final class NetworkModel: ObservableObject {
             case "BALANCE_MODE": ok = (val == "round-robin" || val == "fastest" || val == "weighted")
             case _ where boolKeys.contains(key): ok = (val == "0" || val == "1")
             case _ where intKeys.contains(key):  ok = !val.isEmpty && val.allSatisfy { $0.isNumber }
-            // 必须和脚本一致地限制 http/https。脚本侧已收紧（该值会被原样交给
-            // curl --interface 下载），App 若放行任意字符串就形成缺口。
-            case "SPEED_TEST_URL": ok = val.hasPrefix("http://") || val.hasPrefix("https://")
-            case "WIFI_PREFERRED": ok = !val.contains("\n")
+            // 必须和脚本一致地同时拒 \n 和 \r。脚本侧是
+            // *[$'\n\r']*，这里以前只查了 \n——于是带 \r 的行 App 放进去了、
+            // 脚本却丢掉，用户看到的是已导入但实际没生效。
+            case "WIFI_PREFERRED": ok = !val.contains("\n") && !val.contains("\r")
             case "PROBE_TARGETS":  ok = val.allSatisfy { $0.isNumber || $0 == "." || $0 == " " }
+            // 脚本侧是 http://*|https://* 再判 [ -n "$val" ]，即光有协议头
+            // （http:// 后面什么都没有）也算非法。只查 hasPrefix 会放过这种
+            // 半截值，交给 curl 时只会更难排查。
+            // 必须按**实际命中的前缀**剥除再判空：写成 count > "https://".count
+            // 会把 http://x 这种 8 字符的合法短 URL 一起拒掉（脚本是收的），
+            // 那是把校验做得比脚本还严——用户存得进脚本、App 却报不合法。
+            case "SPEED_TEST_URL":
+                if let prefix = val.hasPrefix("https://") ? "https://"
+                              : val.hasPrefix("http://")  ? "http://"  : nil {
+                    ok = val.count > prefix.count
+                } else {
+                    ok = false
+                }
             default: break
             }
             if ok { out += "\(key)=\(val)\n" } else { rejected += 1 }
@@ -1465,7 +1478,9 @@ final class NetworkModel: ObservableObject {
         }
         wifiPreferred = normalized
         wifiMessage = ""
-        setConfigBatch([("WIFI_PREFERRED", Shell.quote(normalized))]) { ok, msg in
+        // 传原始值，不在这里 Shell.quote：quote 已收敛到 setConfigBatch 内部，
+        // 在这里再包一层会变成空串加原引号，反而存不进东西。
+        setConfigBatch([("WIFI_PREFERRED", normalized)]) { ok, msg in
             DispatchQueue.main.async {
                 self.wifiMessage = ok ? (normalized.isEmpty ? "已恢复默认顺序" : "优先列表已保存") : "保存失败: \(msg)"
                 self.wifiMessageFailed = !ok
