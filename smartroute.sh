@@ -152,7 +152,20 @@ conf_parse_file() {   # $1=文件路径
         case "$line" in ''|\#*) continue ;; esac
         case "$line" in *=*) ;; *) continue ;; esac
         k="${line%%=*}"; v="${line#*=}"
-        k="${k%%[[:space:]]*}"; k="${k##[[:space:]]}"
+        # 键名两端都要 trim，而且必须用"去头/去尾成对"的写法。
+        # 以前是 k="${k%%[[:space:]]*}"; k="${k##[[:space:]]}" ——
+        # 第一招在键名**左侧**有空格时会把整个键削成空串
+        # （%%[[:space:]]* 从第一个空格一直删到尾），于是整行被当成
+        # 未知键静默跳过。缩进的配置行就是这么丢的。
+        # 正确做法：先删掉"开头那段纯空白"，再删掉"结尾那段纯空白"。
+        k="${k#"${k%%[![:space:]]*}"}"
+        k="${k%"${k##*[![:space:]]}"}"
+        # 值也要 trim。`KEY = value`（等号两边带空格）是很自然的写法，
+        # 但以前不 trim：v 变成 " value"，数字键撞 *[!0-9]* 被静默丢弃，
+        # 计数器/超时类参数从不上报——用户改了配置却没有任何效果，
+        # 也看不到任何提示。mode 类的值则是前后带空格直接不匹配。
+        v="${v#"${v%%[![:space:]]*}"}"
+        v="${v%"${v##*[![:space:]]}"}"
         # 只认白名单键
         case " $VALID_KEYS " in
             *" $k "*) ;;
@@ -1432,15 +1445,30 @@ cmd_doctor() {
         b=$(printf '%s' "$wifi_ip" | cut -d. -f1-3)
         if [ "$a" = "$b" ]; then
             echo "    ${C_WARN}⚠️  以太网与 Wi-Fi 同网段（$a.x），路由会互相干扰${C_RST}"
-            advice+=("两个接口同一网段：修改路由器 LAN 网段（如改成 192.168.2.x），或只用一个接口")
+            # 不要建议"修改路由器 LAN 网段"。对用户来说那等于"去改硬件/
+            # 网络配置"——他明确说过做不到、也不是他要解决的问题。
+            # 他要的是在这个网络现状下把并发做出来。
+            # 同网段真正的影响是：内核按路由表选源 IP，同子网只会用默认路由
+            # 那个接口的 IP，所以 pf route-to 改了出口却改不了源地址，
+            # 回程流量仍从原接口回来。这个已经在 write_pf_rules 里用
+            # nat on ... -> ($ext) 解决了，剩下的是聚合带宽受上游限制。
+            advice+=("同网段已处理：分流规则带 nat on ... -> (\$ext) 强制按出口改源地址，回程才不会走错接口")
             # 同网段通常意味着同一个网关、同一台路由器——那"双网并发"就没有
             # 第二条 WAN 可分。这条建议是可操作的（关掉开关就行），
             # 而"改路由器网段"对大多数人做不到，所以必须补上。
             if eth_wifi_same_gateway; then
                 echo "    ${C_WARN}⚠️  而且两者网关相同（$(svc_router "${ACTIVE_ETH_SVC:-}" 2>/dev/null)），是同一台路由器${C_RST}"
                 echo "        → 双网并发（BALANCE=1）不会有任何带宽收益，反而会把一半连接赶到更慢的接口"
-                advice+=("建议关闭双网并发：smartroute balance off（或 App 里的并发分流开关）")
-                advice+=("想更快就改用「网速优先/延时优先」模式挑一个更快的接口，而不是两个都用")
+                # 陈述事实，不 prescribe 关掉。
+                # 用户明确要的就是并发（"两个网络一起跑一个数据"），
+                # 每次 doctor 都劝他关掉，既不听诉求，也没说清什么还有效。
+                # 而且原来的第二条建议是**错的**：同网关下用
+                # `smartroute fetch <URL> -n 16` 多连接下载仍能超过
+                # 单连接速度——瓶颈常常在单条 TCP 的拥塞控制/窗口，
+                # 不在聚合链路带宽。挑一个更快的接口反而拿不到这部分。
+                advice+=("同网关下并发不增加聚合带宽（上游是一条），但多连接/多应用仍可能更快：")
+                advice+=("  下载大文件用 smartroute fetch <URL> -n 16，让多个连接分摊到两个接口")
+                advice+=("  若只想让故障时另一条线立刻接上，保持开启即可，代价是慢接口会分到一部分连接")
             fi
         else
             echo "    网段无冲突（eth=$a.x wifi=$b.x）${C_OK}✓${C_RST}"
@@ -1499,7 +1527,14 @@ cmd_doctor() {
             ;;
         stopped)
             echo "    守护进程: ${C_ERR}未检测到（未安装或已停止）${C_RST}（上次心跳 ${dage} 秒前）"
-            advice+=("守护进程未运行：cd ~/Pictures/smartroute && sudo bash install.sh")
+            # 不能写死 ~/Pictures/smartroute——用户可能从别处安装
+            # （下载 zip 解压到 Downloads、clone 到别处）。照着一条
+            # 不存在的路径执行只会得到 "No such file or directory"，
+            # 而真正要做的只是"在安装目录里跑 install.sh"。
+            # $0 是用户实际调用的路径，从它推目录才对。
+            local _d
+            _d="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+            advice+=("守护进程未运行：cd ${_d:-<smartroute 安装目录>} && sudo bash install.sh")
             ;;
     esac
 
@@ -1799,7 +1834,13 @@ USAGE
 
     # 输出名：用户没给就从 URL 推
     if [ -z "$out" ]; then
-        out="${url%%\?*}"; out="${out##*/}"
+        # 先剥 query 再剥 # 片段，顺序不能反。
+    # 只剥 query 不剥 # 的后果：URL 带片段锚点（CDN 直链常见，形如
+    # http://x/f.iso#sha=1）会存成一个名叫 "f.iso#sha=1" 的文件——
+    # 扩展名变了，双击打不开，而且很难联想到是锚点导致的。
+    # 反过来先剥 # 再剥 ? 也行，但两种都要剥。
+    out="${url%%#*}"; out="${out%%\?*}"; out="${out##*/}"
+    [ -n "$out" ] || out="download"
         [ -n "$out" ] || out="download.bin"
     fi
 
@@ -2782,8 +2823,26 @@ MSG
         die "并发分流未通过验证，已自动还原（详见 sudo smartroute log）"
     fi
 
-    conf_set_auto BALANCE 1
-    conf_set_auto BALANCE_MODE "$mode"
+    # 返回值必须检查。以前两个都被丢掉，于是配置没落盘也照样打印
+    # "✅ 双网并发已开启"。而 BALANCE=1 没写进去的后果是：
+    # 重启或重载配置后，守护进程的并发安全阀、weighted/fastest 重测
+    # 全部静默停摆——用户以为并发开着，实际上只剩启动时那一套
+    # pf 规则在跑，接口挂了也不会自动关。
+    # /Users/Shared/smartroute.conf 属 root 时普通用户改不动，
+    # 这个场景在 wifi auto 分支（3510-3526）和 balance_off 里都处理了，
+    # 这里以前漏掉。
+    if ! conf_set_auto BALANCE 1; then
+        balance_off quiet
+        die "pf 规则已装好，但配置写不进去（BALANCE 没设成 1），守护进程不会维护它。\
+            通常是 /Users/Shared/smartroute.conf 属主不对，请执行:\
+            sudo chown \$(id -un):staff /Users/Shared/smartroute.conf && sudo smartroute balance on"
+    fi
+    if ! conf_set_auto BALANCE_MODE "$mode"; then
+        balance_off quiet
+        die "pf 规则已装好，但 BALANCE_MODE 没写进配置，重启后会回落到 round-robin。\
+            通常是 /Users/Shared/smartroute.conf 属主不对，请执行:\
+            sudo chown \$(id -un):staff /Users/Shared/smartroute.conf && sudo smartroute balance on"
+    fi
     state_set balance_mode "$mode"
     # weighted 一开启就把当前配比写进 state。以前不写，刚开完时
     # balance status 显示"按容量配比（等待守护进程重测后显示）"，
@@ -3609,6 +3668,18 @@ cmd_measure() {
                 ensure_throughput "$ACTIVE_ETH_DEV" "$ACTIVE_WIFI_DEV"
                 ensure_latency "$ACTIVE_ETH_DEV" "$(svc_router "$ACTIVE_ETH_SVC")" \
                                "$ACTIVE_WIFI_DEV" "$(svc_router "$ACTIVE_WIFI_SVC")"
+            else
+                # 跳过时必须说为什么。以前直接跳到 cmd_measurements，
+                # 打出四行"未测"就结束——App 的"立即测速"按钮看起来坏了，
+                # 而实际只是守护进程还没判定接口可用（或接口不在线）。
+                # 用户没法从输出里区分"工具坏了"和"接口没就绪"。
+                local _why=""
+                [ -z "$ACTIVE_ETH_DEV" ]  && _why="${_why}没检测到活跃以太网接口；"
+                [ -z "$ACTIVE_WIFI_DEV" ] && _why="${_why}没检测到活跃 Wi-Fi 接口；"
+                [ "$(state_get eth_ok)"  != "1" ] && _why="${_why}守护进程判定以太网当前不可用；"
+                [ "$(state_get wifi_ok)" != "1" ] && _why="${_why}守护进程判定 Wi-Fi 当前不可用；"
+                echo "跳过测速：${_why:-接口状态未就绪}"
+                echo "（等守护进程跑过一轮、或确认两个接口都在线后再试）"
             fi
             cmd_measurements
             ;;

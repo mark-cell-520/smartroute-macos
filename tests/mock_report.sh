@@ -76,10 +76,24 @@ if printf '%s' "$DOC" | grep -q "网关相同"; then
     ok "同网关时明确说出来"
     printf '%s' "$DOC" | grep -q "BALANCE=1）不会有任何带宽收益" \
         && ok "说明为什么没收益（一条 WAN 两个入口）" || bad "没说清为什么"
-    printf '%s' "$DOC" | grep -q "建议关闭双网并发" \
-        && ok "给出可操作建议（关并发）" || bad "没有可操作建议"
-    printf '%s' "$DOC" | grep -q "balance off" \
+    # 可操作建议不能是"把用户要的功能关掉"。
+    # 用户明确要的就是并发（"两个网络一起跑一个数据"），doctor 每次劝他
+    # 关掉既不听诉求，也没说清什么还有效。而且"挑一个更快的接口"这个
+    # 旧建议是**错的**：同网关下用 smartroute fetch 多连接下载仍能超过
+    # 单连接速度——瓶颈常在单条 TCP 的拥塞控制/窗口，不在聚合链路带宽。
+    # 所以现在给的建议是：用 fetch -n 16 把多个连接分摊到两个接口。
+    printf '%s' "$DOC" | grep -q "smartroute fetch <URL> -n 16" \
+        && ok "给出可操作建议（多连接下载）" || bad "没有可操作建议"
+    printf '%s' "$DOC" | grep -q "smartroute fetch" \
         && ok "建议里带具体命令" || bad "建议里没有命令"
+    # 必须仍然说清"为什么不增加聚合带宽"——不能因为要给希望就说谎
+    printf '%s' "$DOC" | grep -q "不增加聚合带宽" \
+        && ok "仍说清不增加聚合带宽（不说谎）" || bad "把限制说没了"
+    # 不能再劝关功能
+    printf '%s' "$DOC" | grep -q "建议关闭双网并发" \
+        && bad "还在劝用户关掉他要的功能" || ok "没有劝关功能"
+    printf '%s' "$DOC" | grep -q "想更快就改用" \
+        && bad "还在给错的建议（挑一个更快的接口）" || ok "没有挑单接口的建议"
 else
     echo "  （本机不同网关，跳过同网关相关断言）"
 fi
