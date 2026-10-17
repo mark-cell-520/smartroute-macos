@@ -3068,6 +3068,15 @@ balance_validate() {   # $1=设备A $2=IP-A $3=设备B $4=IP-B $5=只走的设�
         if nc -z -w "$NC_TIMEOUT" "$t" 53 >/dev/null 2>&1; then ok=$((ok+1)); continue; fi
         if nc -z -w "$NC_TIMEOUT" "$t" 443 >/dev/null 2>&1; then ok=$((ok+1)); continue; fi
         if curl -s -m 4 -o /dev/null "http://$t/" 2>/dev/null; then ok=$((ok+1)); fi
+        # 前 4 次全灭就别测剩下的了。pf 规则真把网络搞坏时，每次探测都要等满
+        # nc 超时（NC_TIMEOUT 秒）+ 3 种兜底，10 次要 60-90 秒——用户看到的就是
+        # "命令卡住"，然后按 Ctrl-C。早失败早还原，用户根本感觉不到卡过。
+        # （Ctrl-C 现在也有 trap 兜底了，但能不让它发生更好。）
+        if [ "$i" -eq 4 ] && [ "$ok" -eq 0 ]; then
+            log "并发分流验证快速失败: 前 4 次探测全部超时，判定网络已不通"
+            echo "验证快速失败：前 4 次探测全部超时，pf 规则可能影响了网络，已自动还原" >&2
+            return 1
+        fi
     done
     # 连通性：至少 8/10。pf 规则真有问题时会全灭（0/10），
     # 8 分的门槛足以区分"规则坏了"和"网络偶发丢包"。
@@ -3144,6 +3153,18 @@ _balance_nets_ok() {   # $1=设备A $2=设备B，返回 0 表示可以安全重�
     return 0
 }
 
+# balance_on 被 Ctrl-C / kill 时的还原。单独定义而不是内联 trap 字符串：
+# 内联的话引号嵌套能把人看疯，而且没法 echo 告知用户"正在还原"——
+# 而那一句正是用户最需要看到的：他知道网络马上会回来。
+_balance_on_interrupt() {
+    echo "" >&2
+    echo "已中断，正在还原 pf 规则（网络马上恢复）…" >&2
+    balance_off quiet 2>/dev/null
+    trap - INT TERM
+    # 130 = 128 + SIGINT，是 shell 的约定退出码
+    exit 130
+}
+
 balance_on() {
     [ "$(id -u)" -eq 0 ] || die "双网并发需要 root: sudo smartroute balance on"
     command -v pfctl >/dev/null 2>&1 || die "系统缺少 pfctl"
@@ -3185,7 +3206,7 @@ balance_on() {
     #   · 不会变快：瓶颈在路由器后面的那一条上游，不在入口
     #   · 反而更慢：一半的连接被赶到更慢的那个接口（本机 100M 有线 vs Wi-Fi）
     #   · 还可能引入非对称路由的问题
-    # 所以默认拒绝。确实想试（比如验证 pf 规则）可以用 --force。
+    # 所以默认拒绝。--force 是逃生门，不是"验证一下"的推荐路径——
     local force=0 a2
     for a2 in "$@"; do
         case "$a2" in --force|-f) force=1 ;; esac
@@ -3197,13 +3218,21 @@ balance_on() {
   · 不会变快：瓶颈在路由器后面的上游链路，不在入口
   · 反而更慢：一半连接会被赶到更慢的那个接口
   · 可能引入非对称路由问题
-真要试试（例如验证 pf 规则）请加 --force：
-  sudo smartroute balance on --force
+⚠️  强开（--force）有让网络卡死的风险，实测发生过：
+    加载 pf 规则后整个网络不通，要跑 balance off 才恢复。
+    原因：同一个网关时两条线走同一台路由器，pf 把连接轮流赶到两个接口，
+    回包可能走错接口而被 pf 状态表丢弃。
+    真要坚持强开，请先确认你还能再跑一次：
+      sudo smartroute balance off
 MSG
         exit 1
     fi
     if [ "$eth_gw" = "$wifi_gw" ]; then
-        echo "⚠️  两个接口网关相同（${eth_gw}），分流不会有带宽收益，仅按 --force 要求开启"
+        # 不要把 --force 说成"验证一下"的推荐路径。实测用户就是照着这句提示
+        # 强开的，结果网络卡死、只能自己想到 balance off 才恢复。
+        # 同一个网关意味着两条线走同一台路由器：pf 把连接轮流赶到两个接口时，
+        # 回包可能走错接口、被 pf 状态表丢掉——表现就是整个网络卡住。
+        echo "⚠️  两个接口网关相同（${eth_gw}），已按 --force 强开。"
     fi
 
     echo "正在检测两个接口的外网连通性…"
@@ -3295,9 +3324,23 @@ MSG
         fi
     fi
 
+    # ── 中断保护：从加载 pf 这一刻起，任何 Ctrl-C / kill 都必须先还原 ──
+    #
+    # 实测过的故障链（用户报"开启双网并发后网络卡死"）：
+    #   1. pf 规则加载，网络被规则搞坏
+    #   2. balance_validate 跑 10 次 nc，每次超时 2 秒、还有 3 种兜底，
+    #      全灭时要 60-90 秒——用户看到的就是"命令卡住"
+    #   3. 用户按 Ctrl-C
+    #   4. **没有 trap**，pf 规则留在系统里，网络继续卡着
+    #   5. 用户自己想到 balance off 才恢复
+    #
+    # 日志完全对得上：既没有"验证失败"也没有"已开启"，但 pf 确实是
+    # smartroute 开的。第 4 步是纯粹的可避免故障——用户正是指望这个命令
+    # 救他，却不能靠它自救。
+    trap '_balance_on_interrupt' INT TERM
     echo "生成分流规则: $ACTIVE_ETH_DEV($lan1, gw $eth_gw) <-> $ACTIVE_WIFI_DEV($lan2, gw $wifi_gw) [$mode]"
     write_pf_rules "$ACTIVE_ETH_DEV" "$eth_gw" "$ACTIVE_WIFI_DEV" "$wifi_gw" "$excl" "$only" "$w1" "$w2" \
-        || die "无法写入 $PF_ANCHOR_FILE"
+        || { trap - INT TERM; die "无法写入 $PF_ANCHOR_FILE"; }
 
     # 记录系统 pf 原状态，便于撤销时还原
     if pf_enabled; then
@@ -3308,18 +3351,18 @@ MSG
         log "双网并发: 系统 pf 原为关闭，已由 smartroute 开启（撤销时会关闭）"
     fi
     pfctl -a "$PF_ANCHOR" -f "$PF_ANCHOR_FILE" 2>/dev/null \
-        || { balance_off quiet; die "加载 pf 规则失败，已还原"; }
+        || { trap - INT TERM; balance_off quiet; die "加载 pf 规则失败，已还原"; }
     # 关键校验：规则"加载成功"不等于"生效"。锚点若没被主规则集引用，
     # pfctl 照样返回 0，但流量永远不会匹配。这里必须回读确认规则真的在规则集里。
     if ! pfctl -a "$PF_ANCHOR" -s rules 2>/dev/null | grep -q "route-to"; then
-        balance_off quiet
+        trap - INT TERM; balance_off quiet
         die "pf 锚点 $PF_ANCHOR 未生效（未被主规则集引用），已还原；请检查 /etc/pf.conf 是否包含 anchor \"com.apple/*\""
     fi
 
     echo "正在验证分流效果（10 个测试连接）…"
     if ! balance_validate "$ACTIVE_ETH_DEV" "$(dev_ipv4 "$ACTIVE_ETH_DEV")" \
                          "$ACTIVE_WIFI_DEV" "$(dev_ipv4 "$ACTIVE_WIFI_DEV")" "$only"; then
-        balance_off quiet
+        trap - INT TERM; balance_off quiet
         die "并发分流未通过验证，已自动还原（详见 sudo smartroute log）"
     fi
 
@@ -3332,13 +3375,13 @@ MSG
     # 这个场景在 wifi auto 分支（3510-3526）和 balance_off 里都处理了，
     # 这里以前漏掉。
     if ! conf_set_auto BALANCE 1; then
-        balance_off quiet
+        trap - INT TERM; balance_off quiet
         die "pf 规则已装好，但配置写不进去（BALANCE 没设成 1），守护进程不会维护它。\
             通常是 /Users/Shared/smartroute.conf 属主不对，请执行:\
             sudo chown \$(id -un):staff /Users/Shared/smartroute.conf && sudo smartroute balance on"
     fi
     if ! conf_set_auto BALANCE_MODE "$mode"; then
-        balance_off quiet
+        trap - INT TERM; balance_off quiet
         die "pf 规则已装好，但 BALANCE_MODE 没写进配置，重启后会回落到 round-robin。\
             通常是 /Users/Shared/smartroute.conf 属主不对，请执行:\
             sudo chown \$(id -un):staff /Users/Shared/smartroute.conf && sudo smartroute balance on"
@@ -3352,6 +3395,7 @@ MSG
         state_set balance_weight "$_bw0"
     fi
     state_set balance_winner "$only"
+    trap - INT TERM
     log "双网并发分流已开启: $ACTIVE_ETH_DEV <-> $ACTIVE_WIFI_DEV 模式=$mode${only:+ 最快=$only}"
     echo
     if [ "$mode" = "fastest" ]; then
@@ -3419,6 +3463,15 @@ balance_reevaluate() {
     write_pf_rules "$ACTIVE_ETH_DEV" "$eth_gw" "$ACTIVE_WIFI_DEV" "$wifi_gw" "$excl" "$want" || return 1
     pfctl -e 2>/dev/null
     pfctl -a "$PF_ANCHOR" -f "$PF_ANCHOR_FILE" 2>/dev/null || return 1
+    # ⚠️ 已知缺口（不要假装这里没有）：改写规则后**没有**做 balance_validate。
+    # balance_on 有，这两条重测路径没有。想过加上，实测不可行：
+    #   · 代价：10 个探测，快几秒慢几十秒，而守护进程这条路径每轮都跑
+    #   · 误伤：单次网络抖动就可能把用户的双网并发永久关掉，太鲁莽
+    #     （balance_off 会把 BALANCE 置 0，守护进程不会自己开回来）
+    #   · 测不了：mock_fastest.sh 没有 netstat mock，validate 读真实计数器，
+    #     而 mock 的 nc 不产生真实流量，验证必然失败——7 条断言假失败
+    # 现在的兜底只有两道：cmd_watch 的"任一口没外网就关"安全阀，
+    # 和规则丢失重载。真要补，应该先给这两条路径加 netstat mock。
     state_set balance_winner "$want"
     notify "SmartRoute 网速优先" "已切换到更快的线路：$(dev_cn "${want:-}")（两条线路轮流用）"
     return 0
@@ -3487,7 +3540,7 @@ balance_status() {
         echo "  ⚠️  两个接口网关相同（${_sgw:-同一路由器}），经同一台路由器上网。"
         echo "     这不是两条 WAN，而是一条 WAN 的两个入口——双网并发不会变快，"
         echo "     反而会把一半连接赶到更慢的接口。建议 BALANCE=0。"
-        echo "     （确实想验证 pf 规则可 sudo smartroute balance on --force）"
+        echo "     （强开有网络卡死风险，不建议；见 balance on 的提示）"
         echo
     fi
     pf_enabled

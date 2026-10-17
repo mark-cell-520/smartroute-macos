@@ -154,8 +154,29 @@ out="$(run 'wifi_saved_list | tr "\n" ","')"
 [ "$out" = "CZ-305,m,CZ-BH-407,mm," ] && ok "按系统保存顺序输出：$out" || bad "得到: $out"
 
 echo "=== 2. wifi current：dBm 与格数 ==="
+# 必须 mock 掉 wifiscan helper，否则这个测试在断言**活硬件**。
+# wifi_scan_bin() 的候选列表第 4 项是真实的 /usr/local/bin/smartroute-wifiscan，
+# 开发机上都装着；它返回本机实时信号。曾经的断言写死 "-70 44"——44 正是这台
+# 机器的真实信道。信号只要从 -70 漂到 -71 dBm 就失败，全量回归里偶发红一次，
+# 而单独跑 5 次全绿，极难复现。
+# 在 $T 下放一个假 helper：wifi_scan_bin 用 BASH_SOURCE[0] 定位，
+# source $T/sr.sh 时 d=$T，$T/wifiscan 是第一个候选，必然压过真实 helper。
+cat > "$T/wifiscan" <<'MOCKHELPER'
+#!/bin/bash
+[ "${1:-}" = "--current" ] || exit 0
+# helper 输出 TSV：rssi \t channel \t rate \t noise
+printf '%s\t%s\t%s\t%s\n' "${MOCK_RSSI:--70}" "${MOCK_CHANNEL:-44}" \
+                        "${MOCK_RATE:-144}" "${MOCK_NOISE:--98}"
+exit 0
+MOCKHELPER
+chmod +x "$T/wifiscan"
 out="$(run 'wifi_current_signal')"
 [ "$out" = "-70 44" ] && ok "读出信号与信道：$out" || bad "得到: $out"
+# helper 不在时要能回退 system_profiler，不能直接失败
+out="$(run 'rm -f "$T/wifiscan"; wifi_current_signal')"
+printf '%s' "$out" | grep -qE '^-?[0-9]+ [0-9]+$' \
+    && ok "helper 缺失时回退 system_profiler（仍读出信号）" \
+    || bad "helper 缺失时没有回退，Wi-Fi 没连上就整个函数失败: $out"
 for pair in "-45:4" "-55:4" "-62:3" "-70:2" "-78:2" "-88:1" "x:?"; do
     r="${pair%%:*}"; want="${pair##*:}"
     got="$(run "wifi_bars $r")"

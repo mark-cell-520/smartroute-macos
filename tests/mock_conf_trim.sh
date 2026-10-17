@@ -50,13 +50,13 @@ echo "== 2. balance_on 必须检查 conf_set_auto 返回值（P2-10）=="
 # 以前两个返回值都丢掉，配置没落盘也照样打印"✅ 双网并发已开启"。
 # 后果：重启后并发安全阀、weighted/fastest 重测全部静默停摆。
 B="$(grep -n '^balance_on()' smartroute.sh | cut -d: -f1)"
-sed -n "${B},$((B+200))p" smartroute.sh | grep -q 'if ! conf_set_auto BALANCE 1; then' \
+sed -n "${B},$((B+320))p" smartroute.sh | grep -q 'if ! conf_set_auto BALANCE 1; then' \
     && ok "检查 BALANCE 写入结果" || bad "BALANCE 写入结果被忽略"
-sed -n "${B},$((B+200))p" smartroute.sh | grep -q 'if ! conf_set_auto BALANCE_MODE' \
+sed -n "${B},$((B+320))p" smartroute.sh | grep -q 'if ! conf_set_auto BALANCE_MODE' \
     && ok "检查 BALANCE_MODE 写入结果" || bad "BALANCE_MODE 写入结果被忽略"
-sed -n "${B},$((B+200))p" smartroute.sh | grep -q "守护进程不会维护它" \
+sed -n "${B},$((B+320))p" smartroute.sh | grep -q "守护进程不会维护它" \
     && ok "失败时说明后果（不只是报错）" || bad "没说后果"
-sed -n "${B},$((B+200))p" smartroute.sh | grep -q "balance_off quiet" \
+sed -n "${B},$((B+320))p" smartroute.sh | grep -q "balance_off quiet" \
     && ok "写入失败时回滚规则，不留半开状态" || bad "没回滚，会留下规则但配置说 0"
 
 echo "== 3. cmd_measure 静默跳过必须说原因（P2-13）=="

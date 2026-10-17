@@ -255,7 +255,10 @@ echo "== 4c. 网络不通 → 应失败 =="
 export MOCK_NET_OK=0
 : > "$MOCK_LOG"
 out="$(run 'balance_validate en0 192.168.2.36 en1 192.168.1.5' 2>&1)"
-echo "$out" | grep -q "TCP 测试连接只有" && ok "网络不通时明确报错（含成功数）" || bad "网络不通未报错: $out"
+# 现在网络不通会走"前 4 次全灭即快速失败"分支，措辞和跑满 10 次时不同，
+# 但两者都算明确报错 + 自动还原。断言要同时认这两种。
+echo "$out" | grep -qE "TCP 测试连接只有|前 4 次探测全部超时" \
+    && ok "网络不通时明确报错（含成功数或快速失败原因）" || bad "网络不通未报错: $out"
 export MOCK_NET_OK=1
 
 echo "== 5. balance_status 不炸 =="
@@ -386,7 +389,7 @@ _verdict() {   # 打印 balance_on 的判定：拒绝 / 放行 / 用法错误 / 
     out="$(_bo2 "$1")"
     case "$out" in
         *"不会变快"*)          echo "拒绝" ;;
-        *"仅按 --force 要求开启"*) echo "放行" ;;
+        *"已按 --force 强开"*)   echo "放行" ;;
         *"用法"*)              echo "用法错误" ;;
         *)                     echo "其他: $(printf '%s' "$out" | head -1)" ;;
     esac
@@ -462,6 +465,107 @@ printf '%s\n' "$out" | grep -q "有 3 条非法条目已跳过" \
 # 合法条目应该真的去添加路由（这里 route 是真实的，会失败，但日志应有尝试痕迹）
 printf '%s\n' "$out" | grep -q "跳过非法条目 '10.0.0.0/8" && bad "合法条目被当成非法" || ok "合法条目走了应用路径"
 rm -f /tmp/_r.txt
+
+echo
+echo "== 15. balance_on 中断保护：Ctrl-C 不许把网络留在卡死状态 =="
+# 实测故障链（用户报"开启双网并发后网络卡死"）：
+#   1. pf 规则加载，网络被规则搞坏
+#   2. balance_validate 跑 10 次 nc，全灭时要 60-90 秒（每次等满超时+3 种兜底）
+#   3. 用户看到"命令卡住" → 按 Ctrl-C
+#   4. 没有 trap → pf 规则留着，网络继续卡着
+#   5. 用户自己想到 balance off 才恢复
+# 日志对得上：既无"验证失败"也无"已开启"，但 pf 确实是 smartroute 开的。
+_bo_int() {
+    bash -c "
+        . '$T/sr.sh'
+        export PATH='$T/bin:/usr/bin:/bin:/usr/sbin:/sbin'
+        export MOCK_LOG='$MOCK_LOG'
+        balance_off() { echo 'BALANCE_OFF_CALLED' >> \"\$MOCK_LOG\"; }
+        _balance_on_interrupt
+        echo SHOULD_NOT_REACH
+    " 2>&1
+}
+: > "$MOCK_LOG"
+out="$(_bo_int)"
+grep -q "BALANCE_OFF_CALLED" "$MOCK_LOG" \
+    && ok "中断时调用 balance_off（还原 pf 规则）" || bad "中断时没有还原 pf，网络会继续卡着"
+echo "$out" | grep -q "正在还原 pf 规则" \
+    && ok "告知用户正在还原（那一刻用户最需要看到这句）" || bad "中断时无声，用户不知道网络会不会回来"
+echo "$out" | grep -q "SHOULD_NOT_REACH" \
+    && bad "中断后还在继续跑，trap 没退出" || ok "中断后立即退出，不再往下执行"
+bash -c "
+    . '$T/sr.sh'
+    export PATH='$T/bin:/usr/bin:/bin:/usr/sbin:/sbin'
+    export MOCK_LOG='$MOCK_LOG'
+    balance_off() { :; }
+    _balance_on_interrupt
+" >/dev/null 2>&1
+[ "$?" = "130" ] && ok "退出码 130（128+SIGINT，shell 约定）" || bad "退出码不是 130"
+
+# trap 必须在加载 pf **之前**挂上，否则加载完到挂 trap 之间被中断照样漏
+_trap_line=$(grep -n "trap '_balance_on_interrupt' INT TERM" "$SRC" | head -1 | cut -d: -f1)
+# 必须取 trap **之后**的第一处 pf 加载。文件里共 4 处（cmd_watch /
+# balance_on / balance_reevaluate / balance_weight_reevaluate），
+# 取全局第一处会落到 cmd_watch（第 1043 行），那当然比 trap 行号小。
+_pf_line=$(awk -v t="$_trap_line" 'NR>t && /pfctl -a "\$PF_ANCHOR" -f "\$PF_ANCHOR_FILE"/{print NR; exit}' "$SRC")
+if [ -n "$_trap_line" ] && [ -n "$_pf_line" ] && [ "$_trap_line" -lt "$_pf_line" ]; then
+    ok "trap 挂在加载 pf 之前（第 $_trap_line 行 < 第 $_pf_line 行）"
+else
+    bad "trap 挂在加载 pf 之后或没挂（$_trap_line / $_pf_line），中断会漏还原"
+fi
+# 成功路径必须摘掉 trap，否则它会渗到后续命令里
+grep -q "state_set balance_winner \"\$only\"
+trap - INT TERM" "$SRC" \
+    && ok "成功路径摘掉 trap（不渗到后续命令）" || bad "成功路径没摘 trap"
+# 每条 die/回滚分支都要先摘 trap 再走，否则 trap 会在进程退出前多余地跑一次
+_n_clear=$(grep -c "trap - INT TERM; balance_off quiet" "$SRC")
+[ "$_n_clear" -ge 3 ] \
+    && ok "回滚分支都先摘 trap（$_n_clear 处）" \
+    || bad "回滚分支漏摘 trap：只有 $_n_clear 处，期望 >=3"
+
+echo "== 16. 验证快速失败：网络真坏时不许跑满 60-90 秒 =="
+# 10 次 nc 全超时要 60-90 秒，用户看到的就是"卡住"然后 Ctrl-C。
+# 前 4 次全灭就该收手——早还原，用户根本感觉不到卡过。
+grep -q 'if \[ "\$i" -eq 4 \] && \[ "\$ok" -eq 0 \]' "$SRC" \
+    && ok "前 4 次全灭即快速失败" || bad "没有快速失败，网络坏时要白等 60-90 秒"
+export MOCK_NET_OK=0
+: > "$MOCK_LOG"
+run 'balance_validate en0 192.168.2.36 en1 192.168.1.5' >/dev/null 2>&1
+nc_calls=$(grep -c "^nc " "$MOCK_LOG")
+# 4 轮 × 每轮最多 3 种兜底（53/443/curl），curl 不在 nc mock 里但会真跑；
+# 关键是比较：快速失败应显著少于 10 轮的量
+if [ "$nc_calls" -le 8 ]; then
+    ok "网络不通时只探了 $nc_calls 次就收手（不是跑满 10 轮）"
+else
+    bad "网络不通时探了 $nc_calls 次，白等太久，用户会 Ctrl-C"
+fi
+export MOCK_NET_OK=1
+
+echo "== 17. 已知缺口必须被写明，不能假装不存在 =="
+# balance_on 有"加载后验证 + 失败自动还原"，但两条重测路径
+# （balance_reevaluate / balance_weight_reevaluate）没有。想过补，实测不可行：
+#   · 10 个探测，快几秒慢几十秒，而守护进程每轮都跑这条路径
+#   · 单次网络抖动就可能把用户的双网并发永久关掉（balance_off 会置 BALANCE=0，
+#     守护进程不会自己开回来）——太鲁莽
+#   · mock_fastest.sh 没有 netstat mock，validate 读真实计数器而 mock 的 nc
+#     不产生真实流量，验证必然失败——7 条断言假失败
+# 所以这里不断言"已修复"，而是断言"缺口被明确记录、且没有半吊子实现"。
+# 半吊子实现（加了验证但误伤率很高）比没有验证更糟：用户会莫名失去功能。
+# 必须排除注释行：那段"已知缺口"的注释里就写着 balance_validate 这个词
+# （解释为什么没加），不排除会自己打自己。
+_reeval_v=$(awk '/^balance_reevaluate\(\) \{/,/^\}/' "$SRC" | grep -v '^[[:space:]]*#' | grep -c "balance_validate")
+_wreeval_v=$(awk '/^balance_weight_reevaluate\(\) \{/,/^\}/' "$SRC" | grep -v '^[[:space:]]*#' | grep -c "balance_validate")
+[ "$_reeval_v" = "0" ] \
+    && ok "balance_reevaluate 没有偷偷加验证（误伤率高，见注释）" \
+    || bad "balance_reevaluate 加了验证：单次抖动就会关掉用户的双网并发"
+[ "$_wreeval_v" = "0" ] \
+    && ok "balance_weight_reevaluate 同样没加" || bad "balance_weight_reevaluate 加了验证"
+grep -q "已知缺口（不要假装这里没有）" "$SRC" \
+    && ok "缺口在代码里被明确记录" \
+    || bad "缺口没有记录，下一个人会以为已经安全"
+grep -q "mock_fastest.sh 没有 netstat mock" "$SRC" \
+    && ok "记录了为什么没加（可复现的理由，不是借口）" \
+    || bad "没记录原因，后人无法判断该不该补"
 
 echo
 echo "结果: $PASS 通过, $FAIL 失败"
