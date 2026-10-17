@@ -1696,6 +1696,210 @@ cmd_stats() {   # 输出各活跃接口的累计字节（App 用来算实时速�
     return 0
 }
 
+# ---------------- 多连接下载：让两条线一起扛一个文件 ----------------
+#
+# 为什么需要它：用户问"两个网络一起跑一个数据"。IP 路由层面做不到——
+# pf 按连接（状态）选路，一个 TCP 连接从头到尾只用一条线；一条流跨两条线
+# 需要 MPTCP，macOS 不支持。这是硬限制，不是实现力度问题。
+#
+# 但"一个文件"可以拆。HTTP Range 请求让同一个文件被切成多段，每段是一条
+# 独立的 TCP 连接。配合 pf 轮询分流，这些连接会分摊到两个接口上，
+# 下载端按顺序拼回原文件——用户看到的就是"一个下载用满了两条线"。
+#
+# 这是软件层面能达到的上限，且对单文件下载确实有效。
+cmd_fetch() {   # $1=URL [-o 输出] [-n 连接数] [--no-balance-check]
+    local url="" out="" n=8 check=1 a
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -o|--output) out="$2"; shift 2 ;;
+            -n|--conns)  n="$2"; shift 2 ;;
+            --no-balance-check) check=0; shift ;;
+            -h|--help)
+                cat <<'USAGE'
+用法: smartroute fetch <URL> [-o 输出文件] [-n 连接数]
+
+  把一个下载拆成多个 TCP 连接，配合双网并发让两条线一起扛一个文件。
+
+  HTTP 层用 Range 请求切段，每段一条独立连接；pf 轮询分流把这些连接
+  分摊到两个接口；下载完按顺序拼回原文件。
+
+  注意：这依赖服务端支持 Range。工具会真发一个 Range 请求探测，
+  不支持时自动退化为单连接并说明原因。
+
+  前置条件: sudo smartroute balance on [round-robin|weighted]
+  不开启也能跑，但所有连接会走同一条线，看不到叠加效果。
+
+示例:
+  smartroute fetch https://example.com/big.iso -o big.iso -n 16
+USAGE
+                return 0 ;;
+            -*) die "未知选项: $1（用 --help 看用法）" ;;
+            *)  [ -z "$url" ] && url="$1" || die "只接受一个 URL"; shift ;;
+        esac
+    done
+    [ -n "$url" ] || die "用法: smartroute fetch <URL> [-o 输出] [-n 连接数]"
+    case "$n" in ''|*[!0-9]*) die "连接数必须是正整数: $n" ;; esac
+    [ "$n" -ge 1 ] || die "连接数至少为 1"
+
+    command -v curl >/dev/null 2>&1 || die "系统缺少 curl"
+
+    # 输出名：用户没给就从 URL 推
+    if [ -z "$out" ]; then
+        out="${url%%\?*}"; out="${out##*/}"
+        [ -n "$out" ] || out="download.bin"
+    fi
+
+    # 双网并发没开就说清楚，否则用户看不到叠加会以为功能坏了
+    if [ "$check" = "1" ] && [ ! -s "$PF_ANCHOR_FILE" ]; then
+        cat >&2 <<MSG
+提示：未检测到双网并发规则，所有连接会走同一条线。
+      要看到两条线叠加，先执行：
+        sudo smartroute balance on round-robin
+      （或 sudo smartroute balance on weighted 按容量配比）
+MSG
+    fi
+
+    echo "探测 $url …"
+    # 只取响应头，不下载内容。-L 跟随跳转，否则跳转站的 Content-Length 是跳转页的
+    local hdr size
+    hdr="$(curl -sS -L -I --max-time 20 "$url" 2>/dev/null)"
+    [ -n "$hdr" ] || die "取不到响应头（网络不通或 URL 无效）"
+    # 大小写不敏感：有的服务器写 content-length
+    size="$(printf '%s\n' "$hdr" | awk 'tolower($1)=="content-length:"{v=$2} END{print v+0}')"
+
+    # 取不到大小（分块编码、动态生成）就没法切段
+    if [ "$size" -le 0 ]; then
+        echo "服务端未给出 Content-Length，无法切段，改用单连接下载。"
+        curl -L --progress-bar -o "$out" "$url" || die "下载失败"
+        echo "完成: $out"
+        return 0
+    fi
+
+    # 是否支持 Range，**不能只信 Accept-Ranges 头**。
+    # 实测 speed.cloudflare.com 根本不返回这个头，却也不认 Range（请求 0-99
+    # 照样给全量）；反过来也有服务器支持 Range 但不声明。唯一可靠的办法是
+    # 真发一个 Range 请求，看返回的是 206 还是 200。
+    # 代价：多下载 64 字节，可忽略。
+    echo "  探测 Range 支持…"
+    local probe_code
+    probe_code="$(curl -sS -L -o /dev/null -w '%{http_code}' --range 0-63 --max-time 20 "$url" 2>/dev/null)"
+    if [ "$probe_code" != "206" ]; then
+        echo "服务端不支持 Range（请求 0-63 返回 ${probe_code:-无响应}，期望 206），无法切段。"
+        echo "这种情况只能单连接，两条线帮不上——换一个支持 Range 的源即可。"
+        curl -L --progress-bar -o "$out" "$url" || die "下载失败"
+        echo "完成: $out"
+        return 0
+    fi
+
+    # 连接数不能超过段数，否则多余的空段会白占一个 curl 进程
+    [ "$n" -gt "$size" ] && n="$size"
+
+    echo "大小 $(fmt_bytes "$size")，拆 $n 段并行下载…"
+
+    # 抓基线字节数，下载完算增量，才能说出"每条线实际扛了多少"。
+    # 在切段之前抓：抓晚了会把前面探测那几下算进去。
+    local T rc=0 eth_before=0 wifi_before=0
+    find_active
+    [ -n "$ACTIVE_ETH_DEV" ]  && eth_before="$(_if_bytes "$ACTIVE_ETH_DEV")"
+    [ -n "$ACTIVE_WIFI_DEV" ] && wifi_before="$(_if_bytes "$ACTIVE_WIFI_DEV")"
+    case "$eth_before"  in ''|*[!0-9]*) eth_before=0 ;; esac
+    case "$wifi_before" in ''|*[!0-9]*) wifi_before=0 ;; esac
+    T="$(mktemp -d /tmp/smartroute_fetch.XXXXXX)" || die "建不了临时目录"
+    # 无论成功失败都要清理，否则 /tmp 里堆一堆分片
+    trap 'rm -rf "$T"' RETURN INT TERM HUP
+
+    # 切段：每段 chunk 字节，最后一段吃掉余数。
+    # 用 $(()) 而不是 bc——macOS 默认没有 bc。
+    local chunk i start end
+    chunk=$(( size / n ))
+
+    # 每个分片带重试。为什么必须重试：这个工具的用途就是"同时用两条线"，
+    # 连接数一多，偶发的超时/重置就从" rare 事件"变成"几乎每次都有"。
+    # 不重试的话，8 段里挂 1 段整个下载就废了——用户会觉得功能不可用。
+    # 实测 -n 8 时分片会撞上 Recv failure，重试后即可完成。
+    _fetch_seg() {   # $1=分片号 $2=start $3=end $4=URL $5=临时目录
+        local idx="$1" st="$2" en="$3" u="$4" d="$5" try
+        for try in 1 2 3; do
+            if curl -sS -L --max-time 600 --range "${st}-${en}" -o "$d/p$idx" "$u" 2>/dev/null; then
+                # 服务端可能返回 200（忽略 Range）而非 206，此时拿到的是全量。
+                # 用字节数判断：对不上就重试，三次都不对就交给后面的总量校验报错。
+                local got
+                got="$(wc -c < "$d/p$idx" 2>/dev/null | tr -d ' ')"
+                [ "$got" = $(( en - st + 1 )) ] && return 0
+            fi
+            [ "$try" -lt 3 ] && sleep 1
+        done
+        return 1
+    }
+
+    local -a pids=()
+    for i in $(seq 0 $((n-1))); do
+        start=$(( i * chunk ))
+        if [ "$i" -eq $((n-1)) ]; then end=$(( size - 1 )); else end=$(( start + chunk - 1 )); fi
+        _fetch_seg "$i" "$start" "$end" "$url" "$T" &
+        pids+=("$!")
+    done
+    local p
+    for p in ${pids[@]+"${pids[@]}"}; do
+        wait "$p" || rc=1
+    done
+    if [ "$rc" -ne 0 ]; then
+        die "有分片下载失败（已重试 3 次，临时文件已清理）。可降低 -n 重试"
+    fi
+
+    # 校验总字节，少一块就说明服务端没按 Range 给全
+    local got=0
+    for i in $(seq 0 $((n-1))); do
+        [ -f "$T/p$i" ] || die "缺少分片 $i"
+        got=$(( got + $(wc -c < "$T/p$i" | tr -d ' ') ))
+    done
+    if [ "$got" -ne "$size" ]; then
+        die "分片大小不符（期望 ${size}，实得 ${got}），服务端可能未正确支持 Range"
+    fi
+
+    cat $(for i in $(seq 0 $((n-1))); do printf '%s/p%s ' "$T" "$i"; done) > "$out" || die "合并失败"
+    echo "完成: ${out}（$(fmt_bytes "$size")，${n} 段）"
+
+    # 【实测分摊】拿刚才的基线算增量，报告每条线实际扛了多少字节。
+    # 为什么必须有这个：用户要的是"两个网络一起跑一个数据"的**证据**，
+    # 不是一句"已开启"。没有证据，功能开着也没人信；出了问题也分不清是
+    # "分流没生效"还是"生效了但对这个源没用"——这两种的处理完全不同。
+    # 而且这是唯一不依赖服务端日志的验证方式，用户自己能复现。
+    local eth_after=0 wifi_after=0
+    [ -n "$ACTIVE_ETH_DEV" ]  && eth_after="$(_if_bytes "$ACTIVE_ETH_DEV")"
+    [ -n "$ACTIVE_WIFI_DEV" ] && wifi_after="$(_if_bytes "$ACTIVE_WIFI_DEV")"
+    case "$eth_after"  in ''|*[!0-9]*) eth_after=0 ;; esac
+    case "$wifi_after" in ''|*[!0-9]*) wifi_after=0 ;; esac
+    local d_eth=$(( eth_after - eth_before ))
+    local d_wifi=$(( wifi_after - wifi_before ))
+    # 基线可能比现在还大（计数器回绕、或刚重连过），负数没意义
+    [ "$d_eth" -lt 0 ] && d_eth=0
+    [ "$d_wifi" -lt 0 ] && d_wifi=0
+    local d_all=$(( d_eth + d_wifi ))
+    if [ "$d_all" -gt 0 ]; then
+        local pct_eth=$(( d_eth * 100 / d_all )) pct_wifi=$(( d_wifi * 100 / d_all ))
+        echo "流量分摊（本次下载期间）:"
+        echo "  ${ACTIVE_ETH_DEV:-以太网}: $(fmt_bytes "$d_eth") (${pct_eth}%)"
+        echo "  ${ACTIVE_WIFI_DEV:-Wi-Fi}: $(fmt_bytes "$d_wifi") (${pct_wifi}%)"
+        # 判定"两条线都在扛"必须有阈值，不能只看非零。
+        # 实测：没开分流时 en0 也有 247 字节——那是 TCP 握手和 DNS 探测，
+        # 不是有效载荷。按"非零即算"会打出"✅ 两条线都在扛"，
+        # 而实际 99% 的流量在另一条线上。伪造证据比不报更糟：
+        # 用户照着这个结论去排查，会被带偏到完全错误的方向。
+        # 5% 是有效分担的下限：低于它说明这条线基本没参与。
+        local _min_pct=5
+        if [ "$pct_eth" -lt "$_min_pct" ] || [ "$pct_wifi" -lt "$_min_pct" ]; then
+            echo "  ⚠️  只有一条线在扛，分流未生效。常见原因："
+            echo "     • 没执行 sudo smartroute balance on（新连接全走默认路由）"
+            echo "     • 网关相同且未加 --force（工具默认拒绝同网关分流）"
+            echo "     • 连接数太少：-n 1 或 2 时轮询可能全落在同一条线上，试着 -n 8"
+        else
+            echo "  ✅ 两条线都在扛这个文件（这就是并发叠加生效的证据）"
+        fi
+    fi
+    return 0
+}
+
 cmd_quality() {   # 每接口 6 个包测延迟/丢包（root 强制走该接口，非 root 只能测默认路由）
     local role dev svc gw out loss rtt min avg max rest via
     # 逐个接口加主机路由强制走指定网卡，同样要和守护进程的探测互斥
@@ -3069,6 +3273,24 @@ measure_throughput() {
 }
 
 # 字节/秒 -> "12.3 Mbps"
+# 某接口累计收发的字节数。用于下载前后对比，看流量实际走了哪条线。
+# 列位：Name(1) Mtu(2) Network(3) Address(4) Ipkts(5) Ierrs(6) Ibytes(7)
+#       Opkts(8) Oerrs(9) Obytes(10) Coll(11)
+_if_bytes() {   # $1=BSD 设备名 -> stdout: Ibytes+Obytes
+    netstat -i -b -I "$1" 2>/dev/null | awk 'NR==2{print $7 + $10; exit}'
+}
+
+fmt_bytes() {   # $1=字节数 -> "1.5 GB" / "320.0 MB"
+    awk -v b="${1:-0}" 'BEGIN{
+        if (b <= 0) { print "0 B"; exit }
+        # 用 1024 进制：下载工具和访达都按这个显示，混用会让用户对不上数
+        if (b >= 1073741824) printf "%.2f GB", b / 1073741824
+        else if (b >= 1048576) printf "%.1f MB", b / 1048576
+        else if (b >= 1024) printf "%.1f KB", b / 1024
+        else printf "%d B", b
+    }'
+}
+
 fmt_bps() {   # $1=字节/秒
     awk -v b="${1:-0}" 'BEGIN{
         if (b <= 0) { print "未知"; exit }
@@ -3217,6 +3439,7 @@ main() {
         stats)          cmd_stats ;;
         report|rep)     cmd_report ;;
         quality|q)      cmd_quality ;;
+        fetch|dl)       cmd_fetch "$@" ;;
         -h|--help|help) usage ;;
         *)              usage ;;
     esac

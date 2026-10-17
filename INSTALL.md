@@ -118,6 +118,7 @@ smartroute set speed              # 网速优先：实测吞吐大的赢（也�
 smartroute measurements          # 看上次实测的吞吐与延迟
 sudo smartroute measure now       # 立即重新测量
 sudo smartroute report > r.txt    # 一键诊断报告（贴给别人排查用）
+smartroute fetch <URL> -o f   # 多连接下载：把一个文件拆到两条线上同时下
 
 # —— Wi-Fi 选择与自动切换 ——
 smartroute wifi list             # 已保存的 Wi-Fi（免权限）
@@ -252,7 +253,7 @@ cd smartroute
 bash build_release.sh  # 编译通用二进制 App（arm64 + x86_64）+ 校验 + 打 ZIP
 bash build_dmg.sh      # 打 DMG（需在普通终端运行，沙箱内无法创建设备映像）
 
-bash tests/mock_balance_rules.sh   # 跑测试（共 27 个测试文件，739 项断言）
+bash tests/mock_balance_rules.sh   # 跑测试（共 28 个测试文件，762 项断言）
 ```
 
 > `build_dmg.sh` 需要在有设备访问权限的普通终端运行；在沙箱/CI 里会报
