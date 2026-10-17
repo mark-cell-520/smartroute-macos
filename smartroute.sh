@@ -54,6 +54,9 @@ BALANCE_MODE="round-robin"  # 并发分流策略: round-robin=两个接口轮询
 FASTEST_SWITCH_RATIO=20     # 判定"明显更快"的延迟差阈值（百分比）。低于这个差距就继续轮询，
                             # 避免在两条差不多的线路间来回切
 FASTEST_RECHECK=12          # fastest 模式下守护进程重新测延迟的轮询次数（每轮约 20 秒）
+WEIGHT_RECHECK=30           # weighted 模式下重测吞吐、更新配比的轮询次数（每轮约 20 秒）
+                           # 30 轮 ≈ 10 分钟。测速本身有 SPEED_RECHECK(300s) 缓存兜底，
+                           # 不会每个轮询都真下载；但轮询太频会反复 pfctl -f 重建 anchor。
 WIFI_FAILOVER=0             # Wi-Fi 上不了网时，自动试连其它已保存的 Wi-Fi（1 开启）
 WIFI_PREFERRED=""           # 优先试连的 Wi-Fi 名（逗号分隔，靠前优先）。留空=按系统保存顺序
 WIFI_FAILOVER_COOLDOWN=120  # Wi-Fi 故障转移的最小间隔（秒），防止在网络间来回跳
@@ -67,7 +70,7 @@ SPEED_SWITCH_RATIO=30       # 判定"明显更快"的吞吐差阈值（百分比
                             # 避免在两条差不多的线路间来回切
 
 # 可用 set 命令修改的配置项
-VALID_KEYS="MODE OK_N FAIL_N COOLDOWN PROBE_TARGETS PING_TIMEOUT NC_TIMEOUT TLS_PROBE NOTIFY AUTO_WIFI_POWER BALANCE BALANCE_MODE FASTEST_SWITCH_RATIO WIFI_FAILOVER WIFI_PREFERRED WIFI_FAILOVER_COOLDOWN SPEED_TEST_URL SPEED_TEST_TIMEOUT SPEED_RECHECK LATENCY_RECHECK SPEED_SWITCH_RATIO FASTEST_RECHECK"
+VALID_KEYS="MODE OK_N FAIL_N COOLDOWN PROBE_TARGETS PING_TIMEOUT NC_TIMEOUT TLS_PROBE NOTIFY AUTO_WIFI_POWER BALANCE BALANCE_MODE FASTEST_SWITCH_RATIO WIFI_FAILOVER WIFI_PREFERRED WIFI_FAILOVER_COOLDOWN SPEED_TEST_URL SPEED_TEST_TIMEOUT SPEED_RECHECK LATENCY_RECHECK SPEED_SWITCH_RATIO FASTEST_RECHECK WEIGHT_RECHECK"
 
 CONF="/etc/smartroute.conf"                     # 系统级配置（root 维护，install.sh 生成）
 USER_CONF="/Users/Shared/smartroute.conf"       # 用户级配置（App/普通用户可写，优先级更高）
@@ -888,6 +891,15 @@ cmd_watch() {
             else
                 log "并发分流: 规则文件不存在，关闭并发开关"
                 balance_off quiet
+            fi
+        elif [ "$(state_get balance_mode)" = "weighted" ]; then
+            # 权重模式：周期性重测吞吐并更新配比。只在权重真的变了时才重写规则。
+            local bwcyc
+            bwcyc=$(( $(state_get balance_wcycle) + 1 ))
+            state_set balance_wcycle "$bwcyc"
+            if [ "$bwcyc" -ge "$WEIGHT_RECHECK" ]; then
+                state_set balance_wcycle 0
+                balance_weight_reevaluate
             fi
         elif [ "$(state_get balance_mode)" = "fastest" ]; then
             # 最快线路模式：周期性重测延迟，线路变慢自动改道
@@ -2112,14 +2124,31 @@ write_pf_rules() {   # $1=设备A $2=网关A $3=设备B $4=网关B $5=额外排�
         echo "ext2 = \"$d2\""
         echo "gw2  = \"$gw2\""
         echo "table <lan_all> { $list }"
-        if [ "$same" = "1" ]; then
-            echo "# 两个接口在同一网段（${lan1}），源地址天然合法，不需要 NAT"
-        else
-            echo "# 两个接口在不同网段，按出口接口修正源地址，否则对端网关会丢弃"
-            echo "# （macOS 的 pf 不支持 match...nat-to，用经典 nat 规则；nat-anchor \"com.apple/*\" 覆盖本锚点）"
-            echo "nat on \$ext1 from ! <lan_all> to any -> (\$ext1)"
-            [ "$d1" = "$d2" ] || echo "nat on \$ext2 from ! <lan_all> to any -> (\$ext2)"
-        fi
+        # NAT 必须加，**同网段也要加**。
+        #
+        # 以前的判断是"同网段源地址天然合法，不需要 NAT"——这个判断是错的，
+        # 而且错得正好把唯一的提速路径堵死：
+        #
+        #   内核按路由表给数据包选源地址。两个接口同网段时，去 192.168.1.1
+        #   的路由只会指向其中一个接口（默认路由那个，en0），于是源地址
+        #   固定是 en0 的 192.168.1.36。pf 的 route-to 只负责把包从 en1
+        #   发出去，不改源地址。
+        #
+        #   结果是：包带着 en0 的 IP 从 Wi-Fi 出去，路由器按 ARP 表知道
+        #   192.168.1.36 在有线口上，回程全部走有线。
+        #
+        #   对下载来说这致命——**下行永远走 100M 有线**，Wi-Fi 那 432M
+        #   一点没用上。用户看到的现象就是"开了并发下载还是 100M"。
+        #
+        # 加了 nat on en1 -> (en1) 之后，源地址被改写成 en1 的 192.168.1.5，
+        # 路由器据此把回程送到 Wi-Fi 口，下行才真正走 Wi-Fi。
+        # NAT 的代价很小（一次地址改写），换来的是回程真的走对接口。
+        echo "# 按出口接口修正源地址。同网段也必须做：内核选源地址只看路由表，"
+        echo "# 同网段时永远选成默认路由那个接口的 IP；route-to 不改源地址，"
+        echo "# 不回改的话回程会全部涌向另一个接口（下载就被钉死在慢的那条上）。"
+        echo "# macOS 的 pf 不支持 match...nat-to，用经典 nat 规则；nat-anchor \"com.apple/*\" 覆盖本锚点"
+        echo "nat on \$ext1 from ! <lan_all> to any -> (\$ext1)"
+        [ "$d1" = "$d2" ] || echo "nat on \$ext2 from ! <lan_all> to any -> (\$ext2)"
         # 分流规则：fastest 模式收敛成单网关（round-robin 对单网关无意义）
         if [ "$d1" = "$d2" ]; then
             echo "pass out route-to { (\$ext1 \$gw1) } inet proto { tcp udp } from any to ! <lan_all>"
@@ -2459,6 +2488,55 @@ balance_reevaluate() {
     pfctl -a "$PF_ANCHOR" -f "$PF_ANCHOR_FILE" 2>/dev/null || return 1
     state_set balance_winner "$want"
     notify "SmartRoute 网速优先" "已切换到更快的线路：$(dev_cn "${want:-}")（两条线路轮流用）"
+    return 0
+}
+
+# weighted 模式的周期性重测。
+#
+# 为什么要重测：权重是在 balance on 那一刻算的，之后永不更新。可 Wi-Fi 的
+# 实际吞吐一直在变（走远一点、信道拥塞、邻居开机），几分钟后 1:4 就失真了。
+# 失真的后果很直接：如果 Wi-Fi 掉到比有线还慢，4/5 的新连接还在往 Wi-Fi 送，
+# 总吞吐反而低于单走有线——"开了并发比不开还慢"。
+#
+# 只在**权重真的变了**时才重写 pf 规则。pfctl -f 会重建整张 anchor，
+# 正在跑的连接不断（pf 是有状态的，规则重载不影响已有 state），但没必要
+# 每次轮询都重载一遍；而且只有变化才值得通知用户。
+balance_weight_reevaluate() {
+    local eth_gw wifi_gw t1 t2 w1 w2 cur excl
+    eth_gw="$(svc_router "$ACTIVE_ETH_SVC")"; wifi_gw="$(svc_router "$ACTIVE_WIFI_SVC")"
+    [ -n "$eth_gw" ] && [ -n "$wifi_gw" ] || return 0
+    # 复用缓存：ensure_throughput 内部按 SPEED_RECHECK 判断新鲜度，
+    # 不会每个轮询都真下载一次。force 传空就是不强制。
+    ensure_throughput "$ACTIVE_ETH_DEV" "$ACTIVE_WIFI_DEV" || return 0
+    # 必须用 _metric_val，不能用 state_get：_metric_set 存的是"值 时间戳"，
+    # state_get 原样返回、带着空格。用 state_get 会让下面两道校验全落空
+    # （空格命中 *[!0-9]*），于是**永远不重写**——重测功能静默失效，
+    # 而表面上只是"配比没更新"，没有任何报错。
+    # _metric_val 负责去掉时间戳，非数字/非正数一律返回空。
+    t1="$(_metric_val "speed_$ACTIVE_ETH_DEV")"
+    t2="$(_metric_val "speed_$ACTIVE_WIFI_DEV")"
+    [ -n "$t1" ] && [ -n "$t2" ] || return 0
+    [ "$t1" -gt 0 ] && [ "$t2" -gt 0 ] || return 0
+
+    # 归一化到 1..4：与 balance_on 保持同一套算法，否则用户看到的配比
+    # 会和实际生效的不一致。上限 4 也防止快的那条把慢的饿死。
+    if [ "$t1" -ge "$t2" ]; then
+        w1=4; w2=$(( t2 * 4 / t1 )); [ "$w2" -lt 1 ] && w2=1
+    else
+        w2=4; w1=$(( t1 * 4 / t2 )); [ "$w1" -lt 1 ] && w1=1
+    fi
+    cur="$(state_get balance_weight)"
+    [ "$cur" = "$w1:$w2" ] && return 0
+
+    log "权重重测: $ACTIVE_ETH_DEV=$(fmt_bps "$t1") / $ACTIVE_WIFI_DEV=$(fmt_bps "$t2") → ${w1}:${w2}（原 ${cur:-未记录}）"
+    excl="$(other_nets | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+    # 注意不要传 same：write_pf_rules 自己用 dev_subnet 算，只收 8 个参数。
+    # 多传不会报错，但会让人以为要在这里维护它——改子网判断时就会漏改。
+    write_pf_rules "$ACTIVE_ETH_DEV" "$eth_gw" "$ACTIVE_WIFI_DEV" "$wifi_gw" "$excl" "" "$w1" "$w2" || return 1
+    pfctl -e 2>/dev/null
+    pfctl -a "$PF_ANCHOR" -f "$PF_ANCHOR_FILE" 2>/dev/null || return 1
+    state_set balance_weight "$w1:$w2"
+    notify "SmartRoute 并发配比已更新" "以太网 x${w1} / Wi-Fi x${w2}（按实测吞吐自动调整）"
     return 0
 }
 

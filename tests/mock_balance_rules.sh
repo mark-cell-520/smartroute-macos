@@ -181,7 +181,15 @@ echo "== 3. write_pf_rules =="
 : > "$MOCK_LOG"
 run "write_pf_rules en1 192.168.1.1 en6 192.168.1.1 ''" >/dev/null
 grep -q "round-robin" "$T/etc/pf.anchor" && ok "生成轮询规则" || bad "生成轮询规则"
-grep -q "nat on" "$T/etc/pf.anchor" && bad "同网段不应写 NAT" || ok "同网段不写 NAT（源地址天然合法）"
+# 这一条以前断言的是"同网段不写 NAT"，理由写的是"源地址天然合法"。
+# 那个理由是错的，而且错得正好把唯一的提速路径堵死，所以反过来断言：
+#   内核按路由表选源地址。同网段时去网关的路由只指向默认路由那个接口
+#   （en0），源地址固定是 en0 的 IP。pf 的 route-to 只改出口、不改源地址。
+#   于是包带着 en0 的 IP 从 Wi-Fi 出去，路由器按 ARP 知道这个 IP 在有线口，
+#   回程全走有线。对下载这致命：下行永远 100M，Wi-Fi 那 432M 一点用不上。
+#   用户看到的现象就是"开了并发下载还是 100M"。
+# 加 nat on en1 -> (en1) 把源地址改写成 en1 的 IP，回程才真的走 Wi-Fi。
+grep -q "nat on" "$T/etc/pf.anchor" && ok "同网段也必须写 NAT（否则回程涌向另一接口）" || bad "同网段没有 NAT，下载会被钉死在慢的那条线上"
 grep -q "192.168.1.0/24" "$T/etc/pf.anchor" && ok "同网段只排除一个网段" || bad "同网段排除项"
 run "write_pf_rules en1 192.168.1.1 en0 192.168.1.1 ''" >/dev/null
 grep -q "nat on" "$T/etc/pf.anchor" && ok "不同网段写 NAT" || bad "不同网段写 NAT"
