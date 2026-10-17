@@ -33,6 +33,15 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 MODE="auto"                 # auto | ethernet | wifi
 OK_N=2                      # 连续探测成功 N 次 → 判定“可用”
 FAIL_N=3                    # 连续探测失败 N 次 → 判定“不可用”
+RECONFIRM_DELAY=3           # 当前接口首次探测失败后，多久做一次当场确认（秒）
+RECONFIRM_TIMES=2           # 最多当场确认几次
+RECONFIRM_BUDGET=9          # 本周期内"当场确认"最多再花几秒（硬上限）
+                            #
+                            # 为什么必须有这个上限：非 root 下一次完整探测要
+                            # ping(0.8s)+nc(2s)+curl(4s) 约 7 秒。两次确认就是
+                            # 7+3+7+3 = 20 秒，正好顶到 StartInterval——下一个
+                            # 守护实例会被锁挡在门外，等于白白少轮询一次，
+                            # "快速"反而变成"更慢"。所以按预算截断，宁少确认一次。
 COOLDOWN=45                 # 两次切换之间的最小间隔（秒），防止抖动
 PROBE_TARGETS="223.5.5.5 119.29.29.29 114.114.114.114 1.1.1.1 8.8.8.8"
 PING_TIMEOUT=800            # ping 超时（毫秒）
@@ -51,6 +60,8 @@ WIFI_FAILOVER_COOLDOWN=120  # Wi-Fi 故障转移的最小间隔（秒），防�
 SPEED_TEST_URL="https://speed.cloudflare.com/__down?bytes=5000000"   # 网速优先模式的测速地址
 SPEED_TEST_TIMEOUT=8        # 单次测速超时（秒）
 SPEED_RECHECK=300           # 多久重新测一次网速（秒）。测速要真下载，太频繁费流量
+LATENCY_DEGRADE_RATIO=2     # 当前线路延迟是另一条的这个倍数以上，视为"可能变慢"，
+                            # 提前重测吞吐（延迟探测只要几个包，比真下载便宜得多）
 LATENCY_RECHECK=60          # 多久重新测一次延迟（秒）
 SPEED_SWITCH_RATIO=30       # 判定"明显更快"的吞吐差阈值（百分比）。低于它就继续用当前线路，
                             # 避免在两条差不多的线路间来回切
@@ -776,10 +787,69 @@ cmd_watch() {
         wifi_res="$(probe_dev "$ACTIVE_WIFI_DEV" "$(svc_router "$ACTIVE_WIFI_SVC")" | sed -n 1p)"
     fi
 
-    local se sw eth_ok wifi_ok cur want
+    local se sw eth_ok wifi_ok cur want _rc_eth=0 _rc_wifi=0 _rc_role _rc_dev _rc_svc _rc_n _rc_res
+    cur="$(default_dev)"
+
+    # 【快速故障转移】当前接口探测失败时，不要干等下一个 20 秒周期。
+    #
+    # 原来的时序：FAIL_N=3 个周期 × StartInterval 20 秒 = 最少 60 秒才切换。
+    # 用户体感是"网断了快一分钟才恢复"——这正是"一个没网络，另一个不能
+    # 快速接上"的根因。
+    #
+    # 现在：本周期内连续确认 RECONFIRM_TIMES 次，每次都失败就记一笔，
+    # 持续断网的检测时间降到约 26 秒（第 2 轮 20s + 周期内 10s 确认）。
+    # 代价只在真的出问题时才付——健康时一次都不多跑。
+    #
+    # 为什么不是"失败就立刻切"：一次探测失败可能只是几秒抖动（DNS 抽风、
+    # AP 重连、系统忙）。坐实到 3 笔再动，避免把用户莫名其妙切到另一条线——
+    # 那种情况下他宁愿多等十几秒。
+    local _rc_role="" _rc_dev="" _rc_svc=""
+    if [ "$cur" = "$ACTIVE_ETH_DEV" ] && [ "$eth_res" = "fail" ] && [ -n "$ACTIVE_ETH_DEV" ]; then
+        _rc_role="eth";  _rc_dev="$ACTIVE_ETH_DEV";  _rc_svc="$ACTIVE_ETH_SVC"
+    elif [ "$cur" = "$ACTIVE_WIFI_DEV" ] && [ "$wifi_res" = "fail" ] && [ -n "$ACTIVE_WIFI_DEV" ]; then
+        _rc_role="wifi"; _rc_dev="$ACTIVE_WIFI_DEV"; _rc_svc="$ACTIVE_WIFI_SVC"
+    fi
+
+    if [ -n "$_rc_role" ]; then
+        local _rc_n=0 _rc_res="fail" _rc_deadline
+        _rc_deadline=$(( $(date +%s) + RECONFIRM_BUDGET ))
+        while [ "$_rc_n" -lt "$RECONFIRM_TIMES" ]; do
+            # 预算用尽就停：剩下的交给下一个周期。少确认一次只是慢一点，
+            # 侵占下一个周期会让守护进程整体轮询变稀，得不偿失。
+            [ "$(date +%s)" -ge "$_rc_deadline" ] && {
+                log "${_rc_role} 当场确认已达 ${RECONFIRM_BUDGET}s 预算上限，剩余交由下一轮"
+                break
+            }
+            sleep "$RECONFIRM_DELAY"
+            # 用 probe_dev 而不是只 ping：有些网络/路由器禁 ICMP，ping 永远不通
+            # 但链路是好的。只 ping 会把"禁 ping 的网络"误判成恢复，从而停止加速。
+            _rc_res="$(probe_dev "$_rc_dev" "$(svc_router "$_rc_svc")" | sed -n 1p)"
+            if [ "$_rc_res" != "fail" ]; then
+                log "${_rc_role} 当场确认恢复，不加速判定"
+                break
+            fi
+            _rc_n=$((_rc_n+1))
+            log "${_rc_role} 第 ${_rc_n} 次当场确认仍失败，加速判定"
+        done
+        if [ "$_rc_role" = "eth" ]; then
+            [ "$_rc_res" != "fail" ] && eth_res="$_rc_res"
+            _rc_eth="$_rc_n"
+        else
+            [ "$_rc_res" != "fail" ] && wifi_res="$_rc_res"
+            _rc_wifi="$_rc_n"
+        fi
+    fi
+
     se="$(update_streak eth "$eth_res")"
     sw="$(update_streak wifi "$wifi_res")"
-    cur="$(default_dev)"
+    # 当场确认失败的每一次都要记一笔。少了这一步，快速确认就只是"白等几秒
+    # 然后照样只记一笔"，检测时间一点没缩短。
+    # 记满 RECONFIRM_TIMES 笔后停：再加就逼近 StartInterval 了，
+    # 下一个实例会被锁挡在门外，反而少轮询一次。
+    local _i=0
+    while [ "$_i" -lt "$_rc_eth" ]; do se="$(update_streak eth fail)"; _i=$((_i+1)); done
+    _i=0
+    while [ "$_i" -lt "$_rc_wifi" ]; do sw="$(update_streak wifi fail)"; _i=$((_i+1)); done
 
     # 【保护】默认路由若由 VPN/拨号等第三方接口持有（utun/ppp/ipsec），不干预——
     # 那种情况下流量本来就走在隧道里，改服务顺序/路由表没有意义甚至有害。
@@ -859,7 +929,33 @@ cmd_watch() {
             # 网速优先：实测吞吐大的赢。两个都上不了网时交给可用性逻辑兜底
             if [ "$eth_ok" -eq 1 ] && [ "$wifi_ok" -eq 1 ] \
                && [ -n "$ACTIVE_ETH_DEV" ] && [ -n "$ACTIVE_WIFI_DEV" ]; then
-                ensure_throughput "$ACTIVE_ETH_DEV" "$ACTIVE_WIFI_DEV"
+                # 【变慢预警】吞吐缓存还新鲜，但当前线路延迟已经明显高于另一条时，
+                # 提前重测一次吞吐，不要等 SPEED_RECHECK（默认 300 秒）到期。
+                # 没有这一步，线路劣化要最多 5 分钟才被发现——用户体感是
+                # "变慢了半天也不换"。
+                # 延迟探测只要几个包（约 1 秒），比每次都真下载便宜得多，
+                # 所以拿它当廉价的早期信号是划算的。
+                local _force=""
+                if _metric_fresh "speed_$cur" "$SPEED_RECHECK"; then
+                    ensure_latency "$ACTIVE_ETH_DEV" "$(svc_router "$ACTIVE_ETH_SVC")" \
+                                   "$ACTIVE_WIFI_DEV" "$(svc_router "$ACTIVE_WIFI_SVC")"
+                    local _oth_dev _lc _lo
+                    _oth_dev="$ACTIVE_WIFI_DEV"
+                    [ "$cur" = "$ACTIVE_WIFI_DEV" ] && _oth_dev="$ACTIVE_ETH_DEV"
+                    _lc="$(_metric_val "lat_$cur")"
+                    _lo="$(_metric_val "lat_$_oth_dev")"
+                    # 两边都测得出来才比；任一边缺数据就按缓存走，不猜。
+                    # 用 awk 比而不是 shell 整数：延迟是小数（14.3），
+                    # 自己转整数要处理补齐位数、八进制（08）一堆坑，
+                    # 而 pick_fastest 本来就用 awk，统一做法更不容易错。
+                    if [ -n "$_lc" ] && [ -n "$_lo" ] \
+                       && awk -v a="$_lc" -v b="$_lo" -v r="$LATENCY_DEGRADE_RATIO" \
+                              'BEGIN{ exit !(a+0 > b+0 * r) }'; then
+                        log "变慢预警: ${cur} 延迟 ${_lc}ms 超过 ${_oth_dev} 的 ${_lo}ms 的 ${LATENCY_DEGRADE_RATIO} 倍，提前重测吞吐"
+                        _force=1
+                    fi
+                fi
+                ensure_throughput "$ACTIVE_ETH_DEV" "$ACTIVE_WIFI_DEV" "$_force"
                 local _se _sw _pick
                 _se="$(_metric_val "speed_$ACTIVE_ETH_DEV")"
                 _sw="$(_metric_val "speed_$ACTIVE_WIFI_DEV")"
@@ -1661,7 +1757,9 @@ other_nets() {
 }
 
 write_pf_rules() {   # $1=设备A $2=网关A $3=设备B $4=网关B $5=额外排除网段 $6=只走的设备(fastest)
+                     # $7=权重A $8=权重B（按容量重复网关，近似加权轮询；缺省 1:1）
     local d1="$1" gw1="$2" d2="$3" gw2="$4" excl="${5:-}" only="${6:-}"
+    local wA="${7:-1}" wB="${8:-1}"
     local lan1 lan2 same=0 list
     lan1="$(dev_subnet "$d1")"; lan2="$(dev_subnet "$d2")"
     if [ -n "$lan1" ] && [ "$lan1" = "$lan2" ]; then same=1; fi
@@ -1681,6 +1779,8 @@ write_pf_rules() {   # $1=设备A $2=网关A $3=设备B $4=网关B $5=额外排�
         echo "# 撤销: sudo smartroute balance off"
         if [ -n "$only" ]; then
             echo "# 策略: fastest —— 只走延迟更低的 $only"
+        elif [ "$wA" != "1" ] || [ "$wB" != "1" ]; then
+            echo "# 策略: weighted ${wA}:${wB} —— 按实测吞吐配比分配新连接"
         else
             echo "# 策略: round-robin —— 新连接在两个接口间轮询"
         fi
@@ -1701,7 +1801,13 @@ write_pf_rules() {   # $1=设备A $2=网关A $3=设备B $4=网关B $5=额外排�
         if [ "$d1" = "$d2" ]; then
             echo "pass out route-to { (\$ext1 \$gw1) } inet proto { tcp udp } from any to ! <lan_all>"
         else
-            echo "pass out route-to { (\$ext1 \$gw1) (\$ext2 \$gw2) } round-robin inet proto { tcp udp } from any to ! <lan_all>"
+            # 加权轮询：把快的网关按权重重复。pf 的 round-robin 只认列表顺序，
+            # 重复条目是唯一能近似配比的写法（没有 weight 关键字可用）。
+            local _rr="" _k=0
+            _k=0; while [ "$_k" -lt "$wA" ]; do _rr="$_rr (\$ext1 \$gw1)"; _k=$((_k+1)); done
+            _k=0; while [ "$_k" -lt "$wB" ]; do _rr="$_rr (\$ext2 \$gw2)"; _k=$((_k+1)); done
+            _rr="${_rr# }"
+            echo "pass out route-to { $_rr } round-robin inet proto { tcp udp } from any to ! <lan_all>"
         fi
         if [ -n "$excl" ]; then
             echo "# 已排除 VPN/拨号网段: $excl"
@@ -1817,9 +1923,10 @@ balance_on() {
     done
     mode="${mode:-$BALANCE_MODE}"
     case "$mode" in
-        round-robin|rr|轮询) mode="round-robin" ;;
-        fastest|fast|最快)   mode="fastest" ;;
-        *) die "用法: smartroute balance on [round-robin|fastest] [--force]" ;;
+        round-robin|rr|轮询)   mode="round-robin" ;;
+        fastest|fast|最快)     mode="fastest" ;;
+        weighted|weight|权重)  mode="weighted" ;;
+        *) die "用法: smartroute balance on [round-robin|fastest|weighted] [--force]" ;;
     esac
 
     find_active
@@ -1908,8 +2015,41 @@ MSG
         fi
     fi
 
+    # 【权重分流】实测两边吞吐，按容量分配新连接。
+    #
+    # 原来的 round-robin 是 1:1 盲分。可两条线 rarely 一样快——本机就是
+    # 100M 有线配 432M Wi-Fi。1:1 平分意味着每边只拿到一半的连接，
+    # 而快的那条（Wi-Fi）明明还能多扛，慢的那条（100M）却已经占满。
+    # 总吞吐因此卡在慢的那条上，用户体验就是"并发也没变快"。
+    #
+    # 做法：把快的网关在 route-to 列表里重复多次，近似按容量配比。
+    # pf 的 round-robin 只认列表顺序、不认权重，重复条目是最贴近的实现。
+    local w1=1 w2=1
+    if [ "$mode" = "weighted" ]; then
+        echo "正在测量两个接口的吞吐（各需一次下载，约几秒）…"
+        local _t1 _t2 _n1 _n2 _g
+        _t1="$(measure_throughput "$ACTIVE_ETH_DEV")"
+        _t2="$(measure_throughput "$ACTIVE_WIFI_DEV")"
+        printf "    %s: %s    %s: %s\n" "$ACTIVE_ETH_DEV" "$(fmt_bps "${_t1:-0}")" \
+                                       "$ACTIVE_WIFI_DEV" "$(fmt_bps "${_t2:-0}")"
+        if [ -n "$_t1" ] && [ -n "$_t2" ] && [ "$_t1" -gt 0 ] 2>/dev/null && [ "$_t2" -gt 0 ] 2>/dev/null; then
+            # 归一化到 1..4：快的一边定为 4，另一边按比例取整（至少 1）。
+            # 不引入 gcd——比例取整到 4 档已经够用，多一个helper不划算。
+            # 上限 4 也防止快的那条把慢的饿死（慢的那条仍能分担，真出事时是备份）。
+            if [ "$_t1" -ge "$_t2" ]; then
+                w1=4; w2=$(( _t2 * 4 / _t1 )); [ "$w2" -lt 1 ] && w2=1
+            else
+                w2=4; w1=$(( _t1 * 4 / _t2 )); [ "$w1" -lt 1 ] && w1=1
+            fi
+            echo "    → 按容量配比：以太网 x$w1 / Wi-Fi x$w2"
+        else
+            echo "    ⚠️  至少一边测不到吞吐，回退为 1:1 轮询"
+            w1=1; w2=1; mode="round-robin"
+        fi
+    fi
+
     echo "生成分流规则: $ACTIVE_ETH_DEV($lan1, gw $eth_gw) <-> $ACTIVE_WIFI_DEV($lan2, gw $wifi_gw) [$mode]"
-    write_pf_rules "$ACTIVE_ETH_DEV" "$eth_gw" "$ACTIVE_WIFI_DEV" "$wifi_gw" "$excl" "$only" \
+    write_pf_rules "$ACTIVE_ETH_DEV" "$eth_gw" "$ACTIVE_WIFI_DEV" "$wifi_gw" "$excl" "$only" "$w1" "$w2" \
         || die "无法写入 $PF_ANCHOR_FILE"
 
     # 记录系统 pf 原状态，便于撤销时还原
@@ -1946,9 +2086,17 @@ MSG
         echo "✅ 双网并发已开启（最快线路模式）：新连接全部走 $only"
         echo "   • 守护进程每隔约 $((FASTEST_RECHECK * 20 / 60)) 分钟重测延迟，线路变慢会自动改走另一条"
     else
-        echo "✅ 双网并发已开启：新连接会在两个接口间轮询分流"
-        echo "   • 多连接/多应用（浏览、下载、云同步）会分摊到两个接口"
-        echo "   • 单线程下载不会翻倍（单个连接固定走一个接口）"
+        echo "✅ 双网并发已开启（${mode}）：新连接会按容量分摊到两个接口"
+        echo "   • 多连接/多应用（浏览、下载、云同步）能叠加两条线的带宽"
+        if [ "$w1" != "1" ] || [ "$w2" != "1" ]; then
+            echo "   • 本次配比 以太网 x$w1 : Wi-Fi x$w2 —— 按实测吞吐，慢的那条不会先被占满"
+        fi
+        # 这句话必须说清楚。用户问"两个网络一起跑一个数据"——IP 路由做不到：
+        # pf 按连接（状态）选路，一个 TCP 连接从头到尾只用一条线。
+        # 一条流跨两条线需要 MPTCP，macOS 不支持。含糊其辞比直说更糟，
+        # 因为用户会以为是工具没做到，反复重装。
+        echo "   • 单线程下载不会翻倍：一个连接固定走一个接口（IP 路由的硬限制，"
+        echo "     要一条流跨两条线需要 MPTCP，macOS 不支持）"
     fi
     echo "   • 任一口失去外网会自动关闭并发并还原（见守护进程安全阀）"
     echo "   • 撤销: sudo smartroute balance off"
@@ -2935,11 +3083,16 @@ _metric_fresh() {   # $1=state 键 $2=有效期秒 -> 0 新鲜 / 1 过期
 
 # 确保两个接口的吞吐都测过（缓存新鲜就不重测）。
 # 串行测：并行会互相抢带宽，两个数都失真。
-ensure_throughput() {   # $1=eth_dev $2=wifi_dev
-    local d
+ensure_throughput() {   # $1=eth_dev $2=wifi_dev [$3=force 非空则忽略缓存新鲜度]
+    local d force="${3:-}"
     for d in "$1" "$2"; do
         [ -n "$d" ] || continue
-        _metric_fresh "speed_$d" "$SPEED_RECHECK" && continue
+        # 注意不能写成 "[ -n "$force" ] || _metric_fresh ... && continue"：
+        # bash 里 a || b && c 是左结合，等价于 (a || b) && c——force 非空时
+        # 前半为真、照样 continue，正好把意思弄反。必须用 if 把分支写清楚。
+        if [ -z "$force" ]; then
+            _metric_fresh "speed_$d" "$SPEED_RECHECK" && continue
+        fi
         local v
         v="$(measure_throughput "$d")"
         if [ -n "$v" ]; then

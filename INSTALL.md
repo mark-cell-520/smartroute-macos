@@ -107,6 +107,7 @@ smartroute doctor                 # 一键体检：定位"为什么上不了网"
 smartroute test -v                # 手动探测两个接口（-v 看分层明细）
 smartroute config                 # 查看当前生效配置
 sudo smartroute balance on        # 开启双网并发（轮询）
+sudo smartroute balance on weighted  # 按实测容量配比分流（推荐：两条线速度差得多时用）
 sudo smartroute balance on fastest# 开启双网并发（只走最快线路）
 sudo smartroute balance status    # 查看并发状态与两边实时延迟
 sudo smartroute balance off       # 关闭并恢复原状
@@ -251,7 +252,7 @@ cd smartroute
 bash build_release.sh  # 编译通用二进制 App（arm64 + x86_64）+ 校验 + 打 ZIP
 bash build_dmg.sh      # 打 DMG（需在普通终端运行，沙箱内无法创建设备映像）
 
-bash tests/mock_balance_rules.sh   # 跑测试（共 24 个测试文件，698 项断言）
+bash tests/mock_balance_rules.sh   # 跑测试（共 26 个测试文件，722 项断言）
 ```
 
 > `build_dmg.sh` 需要在有设备访问权限的普通终端运行；在沙箱/CI 里会报
