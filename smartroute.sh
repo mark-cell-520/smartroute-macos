@@ -1760,41 +1760,74 @@ MSG
     fi
 
     echo "探测 $url …"
-    # 只取响应头，不下载内容。-L 跟随跳转，否则跳转站的 Content-Length 是跳转页的
-    local hdr size
-    hdr="$(curl -sS -L -I --max-time 20 "$url" 2>/dev/null)"
-    [ -n "$hdr" ] || die "取不到响应头（网络不通或 URL 无效）"
-    # 大小写不敏感：有的服务器写 content-length
-    size="$(printf '%s\n' "$hdr" | awk 'tolower($1)=="content-length:"{v=$2} END{print v+0}')"
+    # 三个信息都要：支不支持 Range、文件多大、以及大小是否可信。
+    #
+    # 为什么不能只用一种办法（每种都在真实 CDN 上失败过）：
+    #   · 普通 HEAD —— 有时压根不返回 Content-Length（HTTP/2 + 分块）
+    #   · --range 0-0 —— 有的 CDN 返回 206 却不带 Content-Range，只有 1 字节
+    #   · --range 999999999-（越界）—— 规范要求返回 416 + Content-Range: */N，
+    #     且 body 为 0、不浪费流量。但实测同一 URL 它和 HEAD 会给出**不同**的
+    #     大小（CDN 按请求返回不同压缩变体），信它就会切出错文件。
+    #
+    # 所以：HEAD 优先（对大多数服务器最准），越界探针兜底，
+    # 最后由下载时的字节数校验做最终裁决——宁可失败也不产出错文件。
+    local probe_hdr probe_code size="" cr_size="" head_size=""
+    probe_hdr="$(curl -sS -L -D - -o /dev/null --range 999999999- --max-time 20 "$url" 2>/dev/null)"
+    [ -n "$probe_hdr" ] || die "取不到响应（网络不通或 URL 无效）"
+    probe_code="$(printf '%s\n' "$probe_hdr" | awk 'NR==1{print $2; exit}')"
+    # Content-Range: bytes */31402 —— 斜杠后就是总大小。
+    # 取冒号之后的全部内容，不能用 $2：值形如 "bytes */31402"，
+    # $2 是单位 "bytes"、$3 才是 "*/31402"。用 $2 会永远拿不到大小，
+    # 于是每次都退化成单连接，表面上只是"取不到总大小"，极难查。
+    # 顺带去掉行尾 CR（curl -D - 输出 CRLF）。
+    cr_size="$(printf '%s\n' "$probe_hdr" | awk '
+        tolower($1)=="content-range:" {
+            line=$0
+            sub(/^[^:]*:[[:space:]]*/,"",line)
+            sub(/\r$/,"",line)
+            n=split(line,a,"/")
+            if (a[n]+0 > 0) v=a[n]
+        }
+        END{print v+0}')"
 
-    # 取不到大小（分块编码、动态生成）就没法切段
-    if [ "$size" -le 0 ]; then
-        echo "服务端未给出 Content-Length，无法切段，改用单连接下载。"
-        curl -L --progress-bar -o "$out" "$url" || die "下载失败"
-        echo "完成: $out"
-        return 0
-    fi
+    local head_hdr
+    head_hdr="$(curl -sS -L -I --max-time 20 "$url" 2>/dev/null)"
+    head_size="$(printf '%s\n' "$head_hdr" | awk 'tolower($1)=="content-length:"{v=$2} END{print v+0}')"
 
-    # 是否支持 Range，**不能只信 Accept-Ranges 头**。
-    # 实测 speed.cloudflare.com 根本不返回这个头，却也不认 Range（请求 0-99
-    # 照样给全量）；反过来也有服务器支持 Range 但不声明。唯一可靠的办法是
-    # 真发一个 Range 请求，看返回的是 206 还是 200。
-    # 代价：多下载 64 字节，可忽略。
-    echo "  探测 Range 支持…"
-    local probe_code
-    probe_code="$(curl -sS -L -o /dev/null -w '%{http_code}' --range 0-63 --max-time 20 "$url" 2>/dev/null)"
-    if [ "$probe_code" != "206" ]; then
-        echo "服务端不支持 Range（请求 0-63 返回 ${probe_code:-无响应}，期望 206），无法切段。"
+    # 支持 Range 的判定：416（规范行为）或 206（把越界范围截断到文件内）
+    local range_ok=0
+    if [ "$probe_code" = "416" ] || [ "$probe_code" = "206" ]; then range_ok=1; fi
+
+    if [ "$range_ok" != "1" ]; then
+        echo "服务端不支持 Range（越界范围返回 ${probe_code:-无响应}，期望 416），无法切段。"
         echo "这种情况只能单连接，两条线帮不上——换一个支持 Range 的源即可。"
         curl -L --progress-bar -o "$out" "$url" || die "下载失败"
         echo "完成: $out"
         return 0
     fi
 
-    # 连接数不能超过段数，否则多余的空段会白占一个 curl 进程
+    # 大小：HEAD 优先，越界探针兜底
+    size="$head_size"
+    [ "$size" -gt 0 ] || size="$cr_size"
+    if [ "$size" -le 0 ]; then
+        echo "服务端支持 Range 但取不到总大小，改用单连接下载。"
+        curl -L --progress-bar -o "$out" "$url" || die "下载失败"
+        echo "完成: $out"
+        return 0
+    fi
+    # 两个来源都拿到却不一样：以 HEAD 为准，但要告知。
+    # 这种 CDN 会按请求返回不同压缩变体，切段很可能拼出错文件——
+    # 后面的字节数校验会拦住，这里先说清楚，免得用户以为是工具的 bug。
+    if [ "$head_size" -gt 0 ] && [ "$cr_size" -gt 0 ] && [ "$head_size" != "$cr_size" ]; then
+        echo "⚠️  服务端对同一文件报告了两个大小（HEAD ${head_size} / Range 探测 ${cr_size}）。"
+        echo "    这类 CDN 会按请求返回不同变体，多连接下载可能拼不出原文件；"
+        echo "    若下方校验失败，请改用单连接或换一个源。"
+    fi
+
+    # 连接数不能超过文件大小，否则有空段
     [ "$n" -gt "$size" ] && n="$size"
 
-    echo "大小 $(fmt_bytes "$size")，拆 $n 段并行下载…"
+    echo "大小 $(fmt_bytes "$size")，$n 个连接并行下载…"
 
     # 抓基线字节数，下载完算增量，才能说出"每条线实际扛了多少"。
     # 在切段之前抓：抓晚了会把前面探测那几下算进去。
@@ -1808,22 +1841,51 @@ MSG
     # 无论成功失败都要清理，否则 /tmp 里堆一堆分片
     trap 'rm -rf "$T"' RETURN INT TERM HUP
 
-    # 切段：每段 chunk 字节，最后一段吃掉余数。
-    # 用 $(()) 而不是 bc——macOS 默认没有 bc。
-    local chunk i start end
-    chunk=$(( size / n ))
+    # ── 工作队列，而不是固定切分 ──
+    #
+    # 固定切分（每连接一段）由**最慢的那一段**决定总时长。本机 100M 有线配
+    # 432M Wi-Fi，-n 8 均分成 4/4：有线那 4 段是瓶颈，Wi-Fi 早早下完就闲着，
+    # 聚合完全白做——总时间约等于"全文件走有线"的时间。
+    #
+    # 改成：把文件切成很多小片（目标 128 片以上，每片至少 1MB），起 n 个 worker，
+    # 每个 worker 下完一片就回头认领下一片。快的线自然认领更多片，
+    # 不需要知道两条线各多快，也不需要测速——这是自平衡的。
+    #
+    # 认领用 mkdir 做原子锁：同一片只有一个 worker 能建成目录，天然无锁。
+    # 不用共享计数器 + flock——macOS 默认没有 flock，自己写锁又是轮询忙等。
+    local chunk total_chunks
+    total_chunks=128
+    [ "$total_chunks" -gt "$size" ] && total_chunks="$size"
+    chunk=$(( size / total_chunks ))
+    # 每片至少 1MB：片太小则 TCP 握手和慢启动开销占比过高，吞吐反而掉
+    while [ "$chunk" -lt 1048576 ] && [ "$total_chunks" -gt 1 ]; do
+        total_chunks=$(( total_chunks / 2 ))
+        chunk=$(( size / total_chunks ))
+    done
+    # 重新算实际片数（向上取整，最后一片吃余数）
+    total_chunks=$(( (size + chunk - 1) / chunk ))
+    mkdir -p "$T/q"
+
+    # 认领第一个还没被认领的分片。从头扫：mkdir 失败就是被别人认领了，
+    # 直接试下一片，不需要加锁也不需要读共享状态。
+    _claim_chunk() {   # $1=队列目录 $2=总片数 -> stdout: 片号；领完返回 1
+        local q="$1" total="$2" i
+        for i in $(seq 0 $((total-1))); do
+            mkdir "$q/c$i" 2>/dev/null && { echo "$i"; return 0; }
+        done
+        return 1
+    }
 
     # 每个分片带重试。为什么必须重试：这个工具的用途就是"同时用两条线"，
-    # 连接数一多，偶发的超时/重置就从" rare 事件"变成"几乎每次都有"。
+    # 连接数一多，偶发的超时/重置就从 rare 事件变成几乎每次都有。
     # 不重试的话，8 段里挂 1 段整个下载就废了——用户会觉得功能不可用。
     # 实测 -n 8 时分片会撞上 Recv failure，重试后即可完成。
-    _fetch_seg() {   # $1=分片号 $2=start $3=end $4=URL $5=临时目录
-        local idx="$1" st="$2" en="$3" u="$4" d="$5" try
+    _fetch_seg() {   # $1=分片号 $2=start $3=end $4=URL $5=目录
+        local idx="$1" st="$2" en="$3" u="$4" d="$5" try got
         for try in 1 2 3; do
             if curl -sS -L --max-time 600 --range "${st}-${en}" -o "$d/p$idx" "$u" 2>/dev/null; then
                 # 服务端可能返回 200（忽略 Range）而非 206，此时拿到的是全量。
                 # 用字节数判断：对不上就重试，三次都不对就交给后面的总量校验报错。
-                local got
                 got="$(wc -c < "$d/p$idx" 2>/dev/null | tr -d ' ')"
                 [ "$got" = $(( en - st + 1 )) ] && return 0
             fi
@@ -1832,11 +1894,32 @@ MSG
         return 1
     }
 
+    # worker：认领-下载循环，直到队列空了
+    # 失败时把片号和期望/实得字节数写进错误文件——主流程据此说出**真正的原因**。
+    # 笼统的"下载失败"会让用户以为是网络问题；实测多数是服务端 Range 行为
+    # 不一致（报了 31402 字节却返回 87533），这两种的处理完全不同。
+    _fetch_worker() {   # $1=队列目录 $2=总片数 $3=URL $4=分片目录 $5=片大小 $6=文件大小
+        local q="$1" total="$2" u="$3" d="$4" cs="$5" sz="$6" idx st en want got
+        while idx="$(_claim_chunk "$q" "$total")"; do
+            st=$(( idx * cs ))
+            en=$(( st + cs - 1 ))
+            # 最后一片可能超出文件末尾，截断
+            [ "$en" -gt $(( sz - 1 )) ] && en=$(( sz - 1 ))
+            want=$(( en - st + 1 ))
+            if ! _fetch_seg "$idx" "$st" "$en" "$u" "$d"; then
+                got="$(wc -c < "$d/p$idx" 2>/dev/null | tr -d ' ')"
+                printf '%s %s %s\n' "$idx" "$want" "${got:-0}" > "$d/fail_$idx"
+                return 1
+            fi
+        done
+        return 0
+    }
+
+    echo "  切成 $total_chunks 片（每片约 $(fmt_bytes "$chunk")），$n 个 worker 认领"
     local -a pids=()
-    for i in $(seq 0 $((n-1))); do
-        start=$(( i * chunk ))
-        if [ "$i" -eq $((n-1)) ]; then end=$(( size - 1 )); else end=$(( start + chunk - 1 )); fi
-        _fetch_seg "$i" "$start" "$end" "$url" "$T" &
+    local w
+    for w in $(seq 1 "$n"); do
+        _fetch_worker "$T/q" "$total_chunks" "$url" "$T" "$chunk" "$size" &
         pids+=("$!")
     done
     local p
@@ -1844,12 +1927,28 @@ MSG
         wait "$p" || rc=1
     done
     if [ "$rc" -ne 0 ]; then
-        die "有分片下载失败（已重试 3 次，临时文件已清理）。可降低 -n 重试"
+        # 把失败原因说清楚：是连接不通，还是服务端 Range 行为不一致。
+        # 后者要换源，前者才该降低 -n——笼统一句"下载失败"等于让用户瞎猜。
+        local _fi _fidx _fwant _fgot _msg=""
+        for _fi in "$T"/fail_*; do
+            [ -f "$_fi" ] || continue
+            # 不能用 _ 当 read 的目标：bash 里 _ 是特殊变量（上一条命令的最后一个
+            # 参数），read 写进去也会被后续命令覆盖，读出来是空的。
+            read -r _fidx _fwant _fgot < "$_fi" 2>/dev/null
+            [ -n "$_msg" ] && _msg="${_msg}；"
+            _msg="${_msg}分片 ${_fidx:-?} 期望 ${_fwant:-?} 字节、实得 ${_fgot:-?} 字节"
+        done
+        if [ -n "$_msg" ]; then
+            echo "分片大小与请求不符：${_msg}"
+            echo "原因：这个服务端的 Range 行为不一致（对同一文件返回不同内容/大小），"
+            echo "      多连接下载无法保证拼出原文件，已放弃。请换一个源，或用单连接下载。"
+        fi
+        die "有分片下载失败（已重试 3 次，临时文件已清理）"
     fi
 
     # 校验总字节，少一块就说明服务端没按 Range 给全
     local got=0
-    for i in $(seq 0 $((n-1))); do
+    for i in $(seq 0 $((total_chunks-1))); do
         [ -f "$T/p$i" ] || die "缺少分片 $i"
         got=$(( got + $(wc -c < "$T/p$i" | tr -d ' ') ))
     done
@@ -1857,8 +1956,8 @@ MSG
         die "分片大小不符（期望 ${size}，实得 ${got}），服务端可能未正确支持 Range"
     fi
 
-    cat $(for i in $(seq 0 $((n-1))); do printf '%s/p%s ' "$T" "$i"; done) > "$out" || die "合并失败"
-    echo "完成: ${out}（$(fmt_bytes "$size")，${n} 段）"
+    cat $(for i in $(seq 0 $((total_chunks-1))); do printf '%s/p%s ' "$T" "$i"; done) > "$out" || die "合并失败"
+    echo "完成: ${out}（$(fmt_bytes "$size")，${total_chunks} 片 / ${n} 连接）"
 
     # 【实测分摊】拿刚才的基线算增量，报告每条线实际扛了多少字节。
     # 为什么必须有这个：用户要的是"两个网络一起跑一个数据"的**证据**，

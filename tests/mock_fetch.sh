@@ -70,14 +70,28 @@ echo "== 3. _if_bytes 取对列 =="
 [ -z "$(ev '_if_bytes en9')" ] && ok "不存在的接口输出空（不是 0）" \
     || bad "不存在的接口应有空输出"
 
-echo "== 4. Range 探测必须真发请求，不能只信头 =="
-# 实测 speed.cloudflare.com 不返回 Accept-Ranges 头，却也不认 Range
-# （请求 0-99 照样给全量）。只信头会把"不支持"误判成"支持"，
-# 然后切段、拼出一个错文件。所以必须看真实返回码是不是 206。
-grep -q "请求 0-63 返回" smartroute.sh \
-    && ok "用真实 Range 请求的结果说话" || bad "没有真发 Range 请求"
-grep -q 'probe_code" != "206"' smartroute.sh \
-    && ok "只接受 206" || bad "没有校验 206"
+echo "== 4. Range 探测：三种办法都在真实 CDN 上失败过 =="
+# 实测记录（都在 jsdelivr/Cloudflare 上发生过）：
+#   · 普通 HEAD 有时压根不返回 Content-Length（HTTP/2 + 分块）
+#   · --range 0-0 返回 206 却不带 Content-Range，只有 content-length: 1
+#   · --range 999999999-（越界）规范要求 416 + Content-Range: */N，
+#     且 body 为 0；但它和 HEAD 对同一 URL 会给出不同大小
+#     （CDN 按请求返回不同压缩变体），信它就会切出错文件。
+# 所以 HEAD 优先、越界探针兜底，最后由下载时字节数校验裁决。
+grep -q "range 999999999-" smartroute.sh \
+    && ok "用越界范围探测（规范强制带 Content-Range）" || bad "没有越界探测"
+grep -q 'probe_code" = "416"' smartroute.sh \
+    && ok "按 416 判定支持 Range" || bad "没有按 416 判定"
+grep -q "head_size" smartroute.sh \
+    && ok "HEAD 优先取大小" || bad "没有 HEAD 优先"
+grep -q "两个大小" smartroute.sh \
+    && ok "两个来源不一致时会告知用户" || bad "大小冲突不告知"
+# Content-Range 的值形如 "bytes */31402"，$2 是单位、$3 才是值。
+# 用 $2 会永远拿不到大小，于是每次都退化成单连接——极难查。
+grep -q 'sub(/\^\[^:\]\*:\[\[:space:\]\]\*/,"",line)' smartroute.sh \
+    && ok "取冒号后全部内容，没用 $2（$2 是单位 bytes）" || bad "还在用 $2 取 Content-Range"
+grep -q 'sub(/\\r\$/,"",line)' smartroute.sh \
+    && ok "去掉行尾 CR（curl -D - 输出 CRLF）" || bad "没去 CR"
 # 只查"有没有拿它当判据"：判据必须是真实 206 返回码
 grep -q 'accept_ranges' smartroute.sh \
     && bad "还在用 accept_ranges 变量做判据（已证明不可靠）" || ok "不拿 Accept-Ranges 头做判据"
@@ -94,6 +108,30 @@ echo "== 6. 流量分摊不能伪造证据 =="
 # 实测：没开分流时 en0 也有 247 字节（TCP 握手/DNS），不是有效载荷。
 # 按"非零即算"会打出"✅ 两条线都在扛"，而实际 99% 在另一条线上。
 # 伪造证据比不报更糟——用户照着错误结论排查会被带偏。
+echo "== 5b. 工作队列：不能固定切分 =="
+# 固定切分由最慢的那一段决定总时长。本机 100M 有线配 432M Wi-Fi，
+# -n 8 均分 4/4：有线那 4 段是瓶颈，Wi-Fi 早早下完就闲着，聚合白做。
+# 工作队列让快的线自然多认领分片，不需要知道两条线各多快。
+grep -q "_claim_chunk" smartroute.sh \
+    && ok "有认领机制（工作队列）" || bad "还是固定切分"
+grep -q "_fetch_worker" smartroute.sh \
+    && ok "worker 认领-下载循环" || bad "没有 worker 循环"
+grep -q 'mkdir "\$q/c\$i"' smartroute.sh \
+    && ok "用 mkdir 原子认领（无锁）" || bad "认领不是原子的"
+grep -q "total_chunks=128" smartroute.sh \
+    && ok "目标 128 片以上（细粒度才能自平衡）" || bad "片数太少，粗粒度无法自平衡"
+
+echo "== 5c. 失败必须说清原因 =="
+# "下载失败"会让用户以为是网络问题；实测多数是服务端 Range 不一致，
+# 那种情况该换源而不是降 -n。笼统一句等于让用户瞎猜。
+grep -q "分片大小与请求不符" smartroute.sh \
+    && ok "大小不符有专门提示" || bad "大小不符没有专门提示"
+grep -q "请换一个源，或用单连接下载" smartroute.sh \
+    && ok "给出换源建议" || bad "没给换源建议"
+# read 的目标不能是 _：bash 里 _ 是特殊变量，会被覆盖，读出来是空的
+grep -q 'read -r _fidx _fwant _fgot' smartroute.sh \
+    && ok "read 用了普通变量名（没用 _）" || bad "read 目标用了 _"
+
 grep -q "_min_pct=5" smartroute.sh \
     && ok "有 5% 有效分担阈值" || bad "没有阈值，会把 247 字节当成在扛"
 grep -q 'pct_eth" -lt "$_min_pct"' smartroute.sh \
