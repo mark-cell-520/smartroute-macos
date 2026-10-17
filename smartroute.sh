@@ -48,6 +48,8 @@ RECONFIRM_BUDGET=9          # 本周期内"当场确认"最多再花几秒（硬
                             # 守护实例会被锁挡在门外，等于白白少轮询一次，
                             # "快速"反而变成"更慢"。所以按预算截断，宁少确认一次。
 COOLDOWN=45                 # 两次切换之间的最小间隔（秒），防止抖动
+FLAP_BACKOFF_AT=3           # 同一目标被系统推翻这么多次后，暂停抢路由
+FLAP_BACKOFF=1800           # 暂停多久（秒）。见 cmd_watch 里的退避逻辑
 PROBE_TARGETS="223.5.5.5 119.29.29.29 114.114.114.114 1.1.1.1 8.8.8.8"
 PING_TIMEOUT=800            # ping 超时（毫秒）
 NC_TIMEOUT=2                # TCP 探测超时（秒）
@@ -757,6 +759,14 @@ reorder_first() {   # $1=服务名
     local primary="$1" svc
     local rest=()
     svc_order_backup_once
+    # 已经是第一个就立刻返回，不要调 networksetup。
+    #
+    # 这个命令会重排并重配**所有**网络服务，是重量级操作。实测一台机器上
+    # 它被调了 105 次：macOS 不停把默认路由判回以太网，工具不停抢回来，
+    # 而每次抢都跑一遍完整的服务重排——顺序本来就一直是对的，纯属白干，
+    # 还把网络抖得厉害。用户体感是"这工具在卡我的网"。
+    # 调用方靠 REORDER_NOOP 区分"真调整了"和"本来就是对的"，
+    # 从而跳过那 2 秒等待（见 do_switch）。
     while IFS= read -r svc; do
         [ -z "$svc" ] && continue
         [ "$svc" = "$primary" ] && continue
@@ -820,7 +830,22 @@ do_switch() {   # $1=目标设备 $2=原默认设备 $3=eth探测 $4=wifi探测 
     state_set last_switch "$(date +%s)"
 
     # 1) 首选：调整服务顺序（持久，网络重连后依然有效）
-    if [ -n "$svc" ] && reorder_first "$svc"; then
+    #
+    # 但**已经是第一个就别调**。networksetup -ordernetworkservices 会重排并
+    # 重配所有网络服务，是重量级操作。实测一台机器上它被调了 105 次：
+    # macOS 不停把默认路由判回以太网、工具不停抢回来，而每次抢都跑一遍
+    # 完整的服务重排——顺序本来就一直是对的，纯属白干，还把网络抖得厉害。
+    # 用户体感是"这工具在卡我的网"。
+    #
+    # 判断放在这里而不是 reorder_first 里：那个函数的契约是"总是重排"，
+    # 在里面加早退会让它的参数拼装逻辑测不到（现有测试全红）。
+    local _need_reorder=1
+    if [ -z "$svc" ]; then
+        _need_reorder=0
+    elif [ "$(ordered_service_names | head -1)" = "$svc" ]; then
+        _need_reorder=0
+    fi
+    if [ "$_need_reorder" = "1" ] && reorder_first "$svc"; then
         sleep 2
         now="$(default_dev)"
         if [ "$now" = "$want" ]; then
@@ -831,6 +856,20 @@ do_switch() {   # $1=目标设备 $2=原默认设备 $3=eth探测 $4=wifi探测 
             return 0
         fi
         log "服务顺序已调整但默认路由仍为 ${now:-无}，尝试直接修改路由表"
+    elif [ "$_need_reorder" = "0" ] && [ -n "$svc" ]; then
+        # 顺序已经没有可调整的空间了，但**先确认默认路由是不是已经对了**。
+        # 顺序对、路由也对的情况很常见（上一轮刚调好，这轮在被判回来之前）。
+        # 少了这一步会明明已经对了还去删/加默认路由——纯粹的白白中断网络。
+        now="$(default_dev)"
+        if [ "$now" = "$want" ]; then
+            # 顺序已经是对的、默认路由也已经是对的——这一轮什么都没做。
+            # 别发"已切换"通知：用户什么都没感觉到，却收到一条切换通知，
+            # 只会让他怀疑工具在谎报。宁可安静，也不要假成功。
+            # 也不写 last_switch：没动过路由表，没有需要节流的重试。
+            log "默认路由已是 ${now}（${svc} 优先），无需调整"
+            return 0
+        fi
+        log "服务顺序已是 $svc 优先，无需重排；直接修改路由表"
     else
         log "无法通过服务顺序切换（服务名:${svc:-无}），尝试直接修改路由表"
     fi
@@ -1134,6 +1173,47 @@ cmd_watch() {
             log "冷却期中（距上次切换 $((now - last))s < ${COOLDOWN}s），跳过本次切换"
             return 0
         fi
+        # 【 futile 抗争退避】系统已经第 FLAP_BACKOFF_AT 次把默认路由判回去了，
+        # 就别再抢。实测这台机器：macOS 每几分钟把默认路由判回 en0，工具切回
+        # en1，累计 105 次。每次切换都要跑 networksetup -ordernetworkservices
+        # （重配所有网络服务）+ sleep 2，随后又被判回去。用户体感是
+        # "网络被这工具卡住了"——这时候继续抢比不抢更糟，必须停手。
+        #
+        # 但**只在两条线都健康时退避**。偏好之争（都想上，只是选哪个）可以等；
+        # 真的有一条线死了必须立刻切，否则就是拿用户的断网换自己的清静。
+        # 这个区分是这条逻辑能存在的前提。
+        # 退避用独立的时间戳 flap_quiet_until，不用 last_switch。
+        # 后者同时被冷却期、flap 累加、flap 清零三处使用，混在一起会互相
+        # 干扰：清零逻辑会在退避途中把 flap_count 清掉，退避条件随之失效，
+        # 于是重新开始抢——退避等于没做。
+        local _fn _quiet
+        _fn="$(state_get flap_count)"
+        [[ "$_fn" =~ ^[0-9]+$ ]] || _fn=0
+        _quiet="$(state_get flap_quiet_until)"
+        [[ "$_quiet" =~ ^[0-9]+$ ]] || _quiet=0
+        if [ "$_fn" -ge "$FLAP_BACKOFF_AT" ] \
+           && [ "$eth_res" = "ok" ] && [ "$wifi_res" = "ok" ] \
+           && [ "$now" -lt "$_quiet" ]; then
+            # 只在进入退避时说一次，不要每轮刷屏
+            if [ "$(state_get flap_backoff)" != "1" ]; then
+                state_set flap_backoff 1
+                state_set flap_quiet_until $((now + FLAP_BACKOFF))
+                log "选路退避：默认路由已被系统改回累计 $_fn 次，暂停切换 ${FLAP_BACKOFF}s（两条线都正常，属偏好之争，先让网络稳下来）"
+                log "  根因：两个接口同网段/同网关时，系统会反复把默认路由判回同一个接口"
+                log "  想彻底解决：让两个口走不同网段，或用 smartroute balance on 做双网并发"
+                notify "SmartRoute 已暂停自动切换" "默认路由已被系统改回累计 ${_fn} 次。两条线都正常，继续抢只会让网络更卡，已暂停 ${FLAP_BACKOFF} 秒。若网线和 Wi-Fi 接同一台路由器，请看状态页的说明。"
+            fi
+            return 0
+        fi
+        if [ "$(state_get flap_backoff)" = "1" ]; then
+            # 退避到期：给一次重新尝试的机会，并把计数清零重新累计。
+            # 不清零的话下一轮会立刻再进退避，等于永久放弃——用户若真把
+            # 网络改好了（两个口不同网段），工具永远发现不了。
+            state_set flap_backoff 0
+            state_set flap_count 0
+            state_set flap_quiet_until 0
+            log "选路退避结束，重新尝试自动切换"
+        fi
         do_switch "$want" "$cur" "$eth_res" "$wifi_res" "$se" "$sw"
     elif [ -n "$(state_get flap_count)" ] && [ "$(state_get flap_count)" != "0" ]; then
         # 问题解决后必须把 flap 计数清掉。
@@ -1158,7 +1238,10 @@ cmd_watch() {
         # 警报会消失。两条路径用同一个时间尺度，才不会一边清零一边累加。
         _last="$(state_get last_switch)"
         [[ "$_last" =~ ^[0-9]+$ ]] || _last=0
-        if [ $((now - _last)) -gt 1800 ]; then
+        # 退避途中不能清 flap_count：退避条件正是 flap_count >= 门槛，
+        # 一清就等于提前解除退避，重新开始每 20 秒抢一次路由。
+        # 退避自己会在到期时清零（见上面的退避退出分支）。
+        if [ $((now - _last)) -gt 1800 ] && [ "$(state_get flap_backoff)" != "1" ]; then
             state_set flap_count 0
             state_set flap_target ""
             log "默认路由已稳定，清除选路不稳定计数"

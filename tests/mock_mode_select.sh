@@ -270,6 +270,63 @@ _rs="$(grep -n '_last.*-gt 1800' "$SRC")"
 [ -n "$_sw" ] && ok "do_switch 累加门槛是 -le 1800" || bad "do_switch 门槛被改了"
 [ -n "$_rs" ] && ok "清零门槛是 -gt 1800（与累加互补）" || bad "清零门槛与累加不互补"
 
+echo "== 8. futile 抗争必须退避，但断网时绝不退避 =="
+# 实测这台机器：macOS 每几分钟把默认路由判回 en0，工具切回 en1，
+# 累计 105 次。每次切换都跑 networksetup -ordernetworkservices
+# （重配所有网络服务）+ sleep 2，然后又被判回去。用户体感是
+# "网络被这工具卡住了"——继续抢比不抢更糟。
+# 但两条线都健康时的"偏好之争"才该退避；真有一条线死了必须立刻切。
+# 每轮都写一份**干净**的状态文件。用 >> 追加会堆出多个 flap_count= 行，
+# 而 state_get 只读第一行——读到的是上一轮甚至上一节的值，
+# 于是"该退避却没退避"，看着像被测代码错了，其实是夹具脏了。
+# $1=eth_res $2=wifi_res $3=cur $4=flap_count $5=quiet_until $6=flap_backoff $7=mode
+w() {
+    : > "$T/calls.log"
+    printf 'streak_eth=2\nstreak_wifi=2\nflap_count=%s\nflap_quiet_until=%s\nflap_backoff=%s\nlast_switch=%s\n' \
+        "$4" "$5" "${6:-0}" "$(( $(date +%s) - 100 ))" > "$T/state/state"
+    ETH_RES="$1" WIFI_RES="$2" CUR_DEV="$3" MODE_V="${7:-wifi}" runwatch >/dev/null 2>&1
+    grep -c '^switch' "$T/calls.log"
+}
+now_s="$(date +%s)"
+
+# A) 两条线都健康 + 已抖过 5 次 + 退避未到期 → 不切
+n="$(w ok ok en0 5 $((now_s+600)))"
+[ "$n" = "0" ] && ok "偏好之争已抖 5 次：不再抢路由" || bad "还在抢（调了 do_switch $n 次）"
+[ "$(sget flap_backoff)" = "1" ] && ok "记下退避状态" || bad "没记退避状态"
+
+# B) 同样场景，但以太网真的死了 → 必须立刻切
+n="$(w fail ok en0 5 $((now_s+600)))"
+[ "$n" -ge 1 ] && ok "以太网真死了：退避让路，立刻切换" || bad "断网时也在退避，用户掉线"
+[ "$(sget flap_backoff)" != "1" ] && ok "断网时不进入退避" || bad "断网时进了退避"
+
+# C) 反过来：正在用 Wi-Fi 而它死了 → 切回以太网。
+#    必须用 MODE=auto。MODE=wifi 是"强制 Wi-Fi"，没有可用性兜底
+#    （Wi-Fi 死了 want 直接为空，压根不切）——那是另一个问题，
+#    这里要验的是"退避不拦真断网"，得给一个允许切换的模式。
+n="$(w ok fail en1 5 $((now_s+600)) 0 auto)"
+[ "$n" -ge 1 ] && ok "Wi-Fi 真死了：退避让路，立刻切回以太网" || bad "断网时也在退避"
+
+# D) 退避到期 → 给一次机会，并清零重新累计（否则永久放弃）。
+#    必须 flap_backoff=1：退出分支只在"正在退避"时跑。
+#    少了它等于测一条不会执行的路径。
+n="$(w ok ok en0 5 $((now_s-10)) 1)"
+[ "$n" -ge 1 ] && ok "退避到期：重新尝试切换" || bad "退避永不结束"
+[ "$(sget flap_backoff)" = "0" ] && ok "退避标记已清除" || bad "退避标记没清"
+[ "$(sget flap_count)" = "0" ] && ok "计数清零重新累计（否则立刻再进退避）" || bad "计数没清零，会立刻再退避"
+
+# E) 没抖过（flap_count=1）→ 正常切换，不进退避
+n="$(w ok ok en0 1 0)"
+[ "$n" -ge 1 ] && ok "只抖过 1 次：正常切换" || bad "过早退避"
+[ "$(sget flap_backoff)" != "1" ] && ok "未误入退避" || bad "误入退避"
+
+# F) 退避途中不许清 flap_count（清了就等于提前解除退避）
+#    注意 cur=en1 == want，走的是 elif 清零分支，正是要防的那条路
+n="$(w ok ok en1 5 $(( $(date +%s) + 600 )) 1)"
+[ "$n" = "0" ] && ok "退避途中不切换" || bad "退避途中还在切"
+out="$(MODE_V=wifi CUR_DEV=en1 runwatch 2>&1)"
+[ "$(sget flap_count)" = "5" ] && ok "退避途中不清 flap_count" || bad "退避途中被清零，退避会提前失效"
+echo "$out" | grep -q "默认路由已稳定" && bad "退避途中谎报稳定" || ok "退避途中不谎报稳定"
+
 echo ""
 echo "结果: $PASS 通过, $FAIL 失败"
 [ "$FAIL" -eq 0 ]

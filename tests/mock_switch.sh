@@ -87,6 +87,10 @@ cat > "$T/order" <<'EOF'
 (Hardware Port: iPhone USB, Device: en5)
 EOF
 printf '(1) Ethernet\n(Hardware Port: Ethernet, Device: en0)\n' > "$T/order_one"
+# 目标（Ethernet）不在第一位。第 4/5/6 节要验"服务顺序这条路真的走了"，
+# 必须用这个文件。用 $T/order（Ethernet 已在第一位）的话，
+# do_switch 会判定"无需重排"直接改路由表，那几节就永远测不到重排逻辑。
+printf '(1) Wi-Fi\n(Hardware Port: Wi-Fi, Device: en1)\n\n(2) Ethernet\n(Hardware Port: Ethernet, Device: en0)\n\n(3) iPhone USB\n(Hardware Port: iPhone USB, Device: en5)\n' > "$T/order_need"
 printf '(1) Thunderbolt Bridge\n(Hardware Port: Thunderbolt Bridge, Device: en2)\n\n(2) Wi-Fi\n(Hardware Port: Wi-Fi, Device: en1)\n' > "$T/order_sp"
 cat > "$T/hw" <<'EOF'
 Hardware Port: Ethernet
@@ -152,7 +156,7 @@ grep -qx "Thunderbolt Bridge" "$T/calls" \
 
 echo "== 4. do_switch：服务顺序这条路走通 =="
 reset_calls
-run_in "$T/order" "$T/def_en0" 'do_switch en0 en1 ok ok 2 2' >/dev/null
+run_in "$T/order_need" "$T/def_en0" 'do_switch en0 en1 ok ok 2 2' >/dev/null
 grep -q "^REORDER$" "$T/calls" && ok "先试服务顺序" || bad "没试服务顺序"
 # 只查 add/delete：default_dev 也会调 route -n get default，宽泛地 grep "ROUTE"
 # 会把正常的查询误判成"动了路由表"
@@ -160,9 +164,25 @@ grep -qE "ROUTE (add|delete) default" "$T/calls" && bad "成功了还去改路�
 grep -q "^NOTIFY" "$T/calls" && ok "发了切换通知" || bad "没发通知"
 grep -q "^last_switch=" "$T/state/st" 2>/dev/null && ok "记录了切换时间（冷却用）" || bad "没记录 last_switch"
 
+echo "== 4b. 目标已是第一个时不许重排（实测被白调了 105 次）=="
+# networksetup -ordernetworkservices 会重排并重配所有网络服务，是重量级操作。
+# 实测一台机器：macOS 不停把默认路由判回以太网、工具不停抢回来，
+# 每次抢都跑一遍完整服务重排——而顺序本来就一直是对的，纯属白干，
+# 还把网络抖得厉害。用户体感是"这工具在卡我的网"。
+reset_calls
+: > "$T/state/st"; : > "$T/sr.log"
+run_in "$T/order" "$T/def_en0" 'do_switch en0 en1 ok ok 2 2' >/dev/null
+grep -q "^REORDER$" "$T/calls" && bad "已经是第一个还去重排（白调 networksetup）" || ok "已是第一个时不调 networksetup"
+grep -q "无需调整" "$T/sr.log" && ok "日志说明无需调整" || bad "跳过但没说明原因: $(tail -2 "$T/sr.log")"
+# 跳过后仍要确认默认路由已经对了，不能直接去删/加默认路由
+grep -qE "ROUTE (add|delete) default" "$T/calls" && bad "明明已经对了还去动路由表" || ok "路由已正确时不动路由表"
+# 什么都没做就不该发"已切换"通知。用户毫无感知却收到切换通知，
+# 只会让他怀疑工具在谎报——宁可安静，也不要假成功。
+grep -q "^NOTIFY" "$T/calls" && bad "什么都没做却发切换通知（假成功）" || ok "无需调整时不发切换通知"
+
 echo "== 5. do_switch：服务顺序失败 -> 兜底改路由表 =="
 reset_calls
-out="$(run_in "$T/order" "$T/def_en1" 'export MOCK_REORDER_RC=1; do_switch en0 en1 ok ok 2 2')"
+out="$(run_in "$T/order_need" "$T/def_en1" 'export MOCK_REORDER_RC=1; do_switch en0 en1 ok ok 2 2')"
 grep -q "无法通过服务顺序切换" "$T/sr.log" && ok "识别到服务顺序失败" || bad "没识别失败: $(tail -2 "$T/sr.log")"
 grep -q "ROUTE delete default" "$T/calls" && ok "兜底删了默认路由" || bad "兜底没删默认路由"
 grep -q "ROUTE add default" "$T/calls" && ok "兜底加了默认路由" || bad "兜底没加默认路由"
@@ -173,7 +193,7 @@ reset_calls
 # state 文件要清：第 4 节走成功路径时写了 last_switch，
 # 不清的话这一节的"失败不该写 last_switch"会读到上一节的残留。
 : > "$T/state/st"; : > "$T/sr.log"
-out="$(run_in "$T/order" "$T/def_en1" 'export MOCK_REORDER_RC=1 MOCK_ADD_RC=1; do_switch en0 en1 ok ok 2 2')"
+out="$(run_in "$T/order_need" "$T/def_en1" 'export MOCK_REORDER_RC=1 MOCK_ADD_RC=1; do_switch en0 en1 ok ok 2 2')"
 grep -q "ROUTE delete default" "$T/calls" && ok "确实执行了删除" || bad "没删除"
 grep -q "失败：无法添加 default via" "$T/sr.log" \
     && ok "明确记录添加失败（用户断网时可排查）" || bad "添加失败没日志，断网却无从查起: $(tail -2 "$T/sr.log")"
@@ -232,7 +252,7 @@ esac
 exit 0
 EOS
 chmod +x "$T/bin/route"
-out="$(run_in "$T/order" "$T/def_en1" 'export MOCK_REORDER_RC=1; do_switch en0 en1 ok ok 2 2')"
+out="$(run_in "$T/order_need" "$T/def_en1" 'export MOCK_REORDER_RC=1; do_switch en0 en1 ok ok 2 2')"
 grep -q "尝试恢复原默认路由" "$T/sr.log" \
     && ok "走了恢复分支" || bad "没走恢复分支: $(tail -3 "$T/sr.log")"
 grep -q "已恢复原默认路由：en1 via" "$T/sr.log" \
