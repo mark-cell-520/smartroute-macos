@@ -918,6 +918,21 @@ cmd_watch() {
             return 0
         fi
         do_switch "$want" "$cur" "$eth_res" "$wifi_res" "$se" "$sw"
+    elif [ -n "$(state_get flap_count)" ] && [ "$(state_get flap_count)" != "0" ]; then
+        # 问题解决后必须把 flap 计数清掉。
+        #
+        # 否则：用户按提示改了局域网网段、系统不再反复判回以太网了，
+        # 状态页却永远挂着"macOS 已 51 次把默认路由改回以太网"。
+        # 一个永不消失的假警报比没有警报更糟——它会让人怀疑工具在说谎，
+        # 然后不再看任何提示。
+        #
+        # 判定"没在抖"的标准：这一轮不需要切换。要么没有倾向（want 空），
+        # 要么想要的就是当前的（我们上一次的选择守住了）。
+        # 注意不能写成"没调用 do_switch 就重置"——冷却期里也不切换，
+        # 但那正是抖得最厉害的时候，清了就等于把证据擦掉。
+        state_set flap_count 0
+        state_set flap_target ""
+        log "默认路由已稳定，清除选路不稳定计数"
     fi
 }
 

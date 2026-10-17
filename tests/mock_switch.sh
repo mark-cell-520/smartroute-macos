@@ -307,7 +307,104 @@ grep -q "第 3 次" "$T/sr.log" && ok "第 3 次写了日志" || bad "第 3 次�
 _rf 'do_switch en0 en1 ok ok 2 2'
 _fc2="$(awk -F= '$1=="flap_count"{print $2}' "$T/state/st")"
 [ "$_fc2" = "1" ] && ok "目标改变后重置为 1" || bad "目标改变后应重置为 1，实际 ${_fc2:-空}"
+
+# 端到端：走完整的 cmd_watch，验证"问题解决后计数归零"。
+# 上面的直调 do_switch 验不了这条——归零的分支在 cmd_watch 里，
+# 而且它的触发条件是"这一轮不需要切换"，只有跑完整轮次才成立。
+# 第一次写这个 e2e 时 mock 漏了 -listallhardwareports/-getinfo，
+# find_active 返回空、cmd_watch 第一行就 return 了，看起来像"计数没动"。
+# 状态文件也必须清空：上一节（9b）直调 do_switch 留下了 flap_count /
+# streak_* / last_switch，带着这些开头，第一轮的滞回和冷却判定都不一样，
+# 累计行为就对不上预期。每一节都该有干净的起点。
+: > "$T/state/st"; : > "$T/sr.log"; : > "$T/calls"
+# order 文件必须带 "(Hardware Port: X, Device: enN)" 行：service_devices 是
+# 从这儿拿服务名的。上一节（9b）只直调 do_switch，用的是简版
+# "(1) Wi-Fi\n(2) Ethernet"，没有 Device 行——复用同一个 $T 就会继承它，
+# 于是 ACTIVE_*_SVC 为空、svc_router 返回空、探测判 fail、一轮都没切换。
+printf '(1) Ethernet\n(Hardware Port: Ethernet, Device: en0)\n\n(2) Wi-Fi\n(Hardware Port: Wi-Fi, Device: en1)\n' > "$T/order"
+printf 'Hardware Port: Wi-Fi\nDevice: en1\n\nHardware Port: Ethernet\nDevice: en0\n' > "$T/hw2"
+printf 'Wi-Fi|192.168.1.1|192.168.1.5\nEthernet|192.168.1.1|192.168.1.36\n' > "$T/info"
+printf '   route to: default\n  interface: en1\n  gateway: 192.168.1.1\n' > "$T/def_en1"
+# 用 heredoc 而不是 printf：mock 里的 awk 带单引号，塞进 printf 的单引号
+# 字符串里会把外层戳破（第一次就是这么写砸的，报 syntax error near ';;'）。
+cat > "$T/bin/networksetup" <<'MOCKNS'
+#!/bin/bash
+case "${1:-}" in
+    -listnetworkserviceorder) cat "$MOCK_ORDER" ;;
+    -listallhardwareports)    cat "$MOCK_HW" ;;
+    -getinfo) awk -F'|' -v s="$2" '$1==s{print "Router: "$2}' "$MOCK_INFO" ;;
+    *) exit 0 ;;
+esac
+MOCKNS
+chmod +x "$T/bin/networksetup"
+# 探测全 OK：不依赖真实 ping/curl，直接让 probe_dev 判 ok
+printf '#!/bin/bash\nexit 0\n' > "$T/bin/ping"; chmod +x "$T/bin/ping"
+# dev_active 靠 ifconfig 判断有没有 IP。不接管它就会去问真 ifconfig，
+# 结果取决于真机状态——测试就漂了（第一次写这个 e2e 时漏了它，
+# 于是 dev_active 全 false、探测全 na、want 为空、flap 被归零，
+# 看起来像"cmd_watch 累计不了 flap"，其实是探测压根没跑）。
+cat > "$T/bin/ifconfig" <<'MOCKIF'
+#!/bin/bash
+case "$1" in
+    en0|en1)
+        echo "$1: flags=8863<UP> mtu 1500"
+        echo -e "\tinet 192.168.1.5 netmask 0xffffff00"
+        exit 0 ;;
+esac
+exec /sbin/ifconfig "$@"
+MOCKIF
+chmod +x "$T/bin/ifconfig"
+_wf() {
+    # STATE_FILE 必须在 source **之后** export：脚本第 64 行无条件赋值
+    # STATE_FILE=/var/db/smartroute/state，先 export 会被它清掉，
+    # 于是状态全写到真实路径、测试读的临时文件始终是空的。
+    # 代价是 SVC_ORDER_BAK（第 633 行由 STATE_FILE 目录算出）仍指着真实路径，
+    # reorder_first 会往那儿写——无权限，失败即可，stderr 已抑制。
+    bash -c ". '$T/sr.sh'; trap - EXIT INT TERM HUP
+        export PATH='$T/bin:/usr/bin:/bin:/usr/sbin:/sbin'
+        export MOCK_ORDER='$T/order' MOCK_HW='$T/hw2' MOCK_INFO='$T/info'
+        export MOCK_CALLS='$T/calls' MOCK_DEFAULT='$1'
+        export LOG_FILE='$T/sr.log' STATE_FILE='$T/state/st' STATE_WRITABLE=1
+        export LOCK_DIR='$T/lock' NOTIFY=1 MODE=wifi; cmd_watch" >/dev/null 2>&1
+}
+# 先抖几轮：系统每轮都把默认路由判回 en0，我们切到 en1。
+# 每轮前把 last_switch 设成 60 秒前——必须是个**近期**时间，不能清零：
+#   · 清零（0）能让冷却放行，但 flap_gap 用的是同一个字段，
+#     now-0 是个巨大值、超过 1800 秒窗口，于是走 else 分支把计数重置成 1，
+#     看起来像"累计不起来"（第一次写这个测试就这么栽的）。
+#   · 60 秒前：> COOLDOWN(45s) 冷却放行，< 1800s 仍在 flap 窗口内。
+# 4 轮而不是 3 轮：第 1 轮在攒 streak（滞回要求连续 OK_N=2 次才判可用），
+# 那一轮 want 为空、不切换。所以 3 轮只累计到 2，4 轮才到 3。
+for _i in 1 2 3 4; do
+    sed -i '' "s/^last_switch=.*/last_switch=$(( $(date +%s) - 60 ))/" "$T/state/st" 2>/dev/null
+    _wf "$T/def_en0"
+done
+_fc3="$(awk -F= '$1=="flap_count"{print $2}' "$T/state/st")"
+[ "${_fc3:-0}" -ge 3 ] 2>/dev/null \
+    && ok "cmd_watch 连续抖之后 flap_count=$_fc3" \
+    || bad "cmd_watch 没能累计 flap，实际 ${_fc3:-空}"
+# 现在系统不再改回了：默认路由守住 en1，want==cur，不需要切换
+_wf "$T/def_en1"
+_fc4="$(awk -F= '$1=="flap_count"{print $2}' "$T/state/st")"
+[ "${_fc4:-x}" = "0" ] && ok "不需要切换时归零（假警报会消失）" \
+    || bad "应归零，实际 ${_fc4:-空}"
+grep -q "默认路由已稳定" "$T/sr.log" && ok "归零时记了日志" || bad "归零没留痕"
 rm -rf "$T"
+
+echo "== 10. 问题解决后 flap 计数必须归零（假警报比没警报更糟）=="
+# 用户按提示改了局域网网段，系统不再反复判回以太网了。
+# 若计数不清，状态页永远挂着"macOS 已 51 次把默认路由改回以太网"——
+# 一个永不消失的假警报会让人怀疑工具在说谎，然后不再看任何提示。
+awk '/^cmd_watch\(\)/,/^}/' smartroute.sh | grep -q 'state_set flap_count 0' \
+    && ok "不需要切换时会清掉 flap 计数" || bad "flap 计数永不清零，假警报常驻"
+awk '/^cmd_watch\(\)/,/^}/' smartroute.sh | grep -q '清除选路不稳定计数' \
+    && ok "清了会记一笔日志（用户能追溯）" || bad "清了不留痕"
+# 关键细节：不能用"没调用 do_switch 就重置"——
+# 冷却期里也不切换，但那正是抖得最厉害的时候，清了等于擦掉证据。
+# 必须是 elif（与"需要切换"互斥），而不是无条件放在末尾。
+awk '/^cmd_watch\(\)/,/^}/' smartroute.sh | grep -q 'elif.*state_get flap_count' \
+    && ok "重置走 elif（与"需要切换"互斥，冷却期内不会误清）" \
+    || bad "重置条件不对，可能在冷却期内擦掉证据"
 
 echo
 echo "结果: $PASS 通过, $FAIL 失败"
