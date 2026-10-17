@@ -1902,7 +1902,7 @@ MSG
 
     # 抓基线字节数，下载完算增量，才能说出"每条线实际扛了多少"。
     # 在切段之前抓：抓晚了会把前面探测那几下算进去。
-    local T rc=0 eth_before=0 wifi_before=0 t_start_s t_start_ns
+    local T rc=0 eth_before=0 wifi_before=0 t_start_s t_start_ns t_end_ns
     t_start_s="$(date +%s)"
     # 同时记秒和纳秒：纳秒用于精确算吞吐（小文件不会被低估），
     # 秒作为 date +%s%N 不可用时的退路。
@@ -2151,6 +2151,12 @@ MSG
         _i=$(( _i + 1 ))
     done
     eval "cat $_catlist" > "$out" || die "合并失败"
+    # 下载耗时的终点必须是**合并完成这一刻**，不能放到报告之后取。
+    # 中间隔着两次 netstat、state 读、一堆 echo，100-300ms 起步；
+    # 对纳秒计时要救的"小文件"场景，这正好构成 10-30% 的偏差——
+    # 用户看到的是一个被系统性低估的数字，而且低估量取决于
+    # 报告打了多少行，不可复现。
+    t_end_ns="$(date +%s%N)"
     echo "完成: ${out}（$(fmt_bytes "$size")，${total_chunks} 片 / ${n} 连接）"
 
     # 【实测分摊】拿刚才的基线算增量，报告每条线实际扛了多少字节。
@@ -2214,8 +2220,9 @@ MSG
     local t_dur bps
     # 纳秒计时：date +%s%N 在 macOS 可用（bash 3.2 没有 EPOCHREALTIME）。
     # 不用整秒：亚秒级的小文件下载，整秒会把 t_dur 当成 1，吞吐被严重低估。
-    local t_ns_now
-    t_ns_now="$(date +%s%N)"
+    # t_end_ns 在合并完成时就取好了（见上），这里直接复用——
+    # 重新取一次会把报告本身的耗时算进下载耗时。
+    local t_ns_now="$t_end_ns"
     case "$t_ns_now" in ''|*[!0-9]*) t_ns_now=0 ;; esac
     if [ "$t_ns_now" -gt "$t_start_ns" ] && [ "$t_start_ns" -gt 0 ]; then
         t_dur=$(( (t_ns_now - t_start_ns) / 1000000 ))     # 毫秒

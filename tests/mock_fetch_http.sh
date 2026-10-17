@@ -157,6 +157,35 @@ echo "$out" | grep -q "tmpfiles=0" \
     && ok "无临时文件残留" || bad "有临时文件残留: $(echo "$out" | grep tmpfiles)"
 rm -rf "$W"
 
+echo "== 8b. 吞吐计时的终点是合并完成，不是报告之后（P2-14）=="
+# t_start 在抓基线时取，结束时间若放到整段分摊报告之后取，中间隔着
+# 两次 netstat、state 读、一堆 echo。100-300ms 对纳秒计时要救的
+# "小文件"场景正好是 10-30% 偏差，而且取决于报告打了多少行、不可复现。
+grep -q 't_end_ns="$(date +%s%N)"' smartroute.sh \
+    && ok "合并完成时就取结束时间" || bad "结束时间取得太晚"
+# 合并（eval cat）必须在 t_end_ns 之前
+ML="$(grep -n 'eval "cat \$_catlist"' smartroute.sh | head -1 | cut -d: -f1)"
+EL="$(grep -n 't_end_ns="$(date +%s%N)"' smartroute.sh | head -1 | cut -d: -f1)"
+[ -n "$ML" ] && [ -n "$EL" ] && [ "$EL" -gt "$ML" ] \
+    && ok "结束计时在合并之后（第 $EL > $ML 行）" || bad "结束计时位置不对"
+# 全程只应**调用**两次纳秒时间戳：起点（t_start_ns）和终点（t_end_ns）。
+# 只数 ="$(date +%s%N)" 这种真实调用，注释里提到的不算。
+NOWS="$(grep -c '="$(date +%s%N)"' smartroute.sh)"
+[ "$NOWS" -eq 2 ] \
+    && ok "全程只调用两次时间戳（起点+终点）" || bad "调用了 $NOWS 次时间戳"
+# 报告段（local t_dur bps 之后）不允许再真实调用
+RL="$(grep -n 'local t_dur bps' smartroute.sh | head -1 | cut -d: -f1)"
+AFTER="$(awk -v n="$RL" 'NR>n && /=\"\$\(date \+%s%N\)\"/' smartroute.sh | wc -l | tr -d ' ')"
+[ "$AFTER" -eq 0 ] \
+    && ok "报告段不再取时间戳" || bad "报告段调用了 $AFTER 次"
+grep -q 't_ns_now="\$t_end_ns"' smartroute.sh \
+    && ok "报告段复用 t_end_ns" || bad "报告段没有复用"
+# 行为验证：同一个文件下两次，吞吐量级应当一致（不会因为报告长短乱跳）
+_v1="$(bash smartroute.sh fetch "$B/file/x" -o "$T/j1.bin" -n 2 --no-balance-check 2>&1 | grep -o '吞吐: [0-9.]* Mbps')"
+_v2="$(bash smartroute.sh fetch "$B/file/x" -o "$T/j2.bin" -n 2 --no-balance-check 2>&1 | grep -o '吞吐: [0-9.]* Mbps')"
+echo "    两次实测: $_v1 / $_v2"
+[ -n "$_v1" ] && [ -n "$_v2" ] && ok "两次都产出了吞吐数字" || bad "没产出吞吐数字"
+
 echo "== 9. 一个分片失败，其余 worker 要停手（P2-12）=="
 # 以前失败的 worker 自己 return 1，兄弟继续认领到队列空，父进程 wait
 # 全部。于是某片失败时整个文件照下（每段最长 600s），最后才报"已放弃"

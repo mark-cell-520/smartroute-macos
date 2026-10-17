@@ -192,8 +192,13 @@ grep -q "两边都要查" smartroute.sh \
     && ok "注释说明为什么必须查两边" || bad "没说为什么要查两边"
 grep -q "无法判断并发是否带来收益" smartroute.sh \
     && ok "缓存过期时明说无法判断（不下错结论）" || bad "过期时仍下结论"
-grep -q 't_ns_now="$(date +%s%N)"' smartroute.sh \
+# 纳秒计时的终点在合并完成时取（t_end_ns），报告段复用。
+# 以前结束时间放在整段分摊报告之后，两次 netstat + state 读 + echo
+# 的 100-300ms 正好是小文件场景 10-30% 的偏差，而且不可复现。
+grep -q 't_end_ns="$(date +%s%N)"' smartroute.sh \
     && ok "用纳秒计时（小文件吞吐不被低估）" || bad "还是整秒计时"
+grep -q 't_ns_now="\$t_end_ns"' smartroute.sh \
+    && ok "报告段复用终点时间，不把报告耗时算进下载" || bad "报告段重新取了时间"
 
 echo "== 9. HTTP 错误不能被误诊成 Range 不兼容 =="
 # 以前 _fetch_seg 没加 --fail：404 时 curl 返回 0、错误页写进分片，
