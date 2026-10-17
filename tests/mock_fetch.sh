@@ -33,6 +33,49 @@ case "$D" in
 esac
 EOF
 chmod +x "$T/bin/netstat"
+
+# curl 替身。按参数分两种行为：
+#   -D -            → 探测大小，打响应头带 content-length
+#   -o <真实文件>    → 往里写 MOCK_DL_BYTES 字节
+# 每次调用都往 MOCK_CURL_LOG 记一行，用来数"到底发了几个 HTTP 请求"。
+cat > "$T/bin/curl" <<'MOCKCURL'
+#!/bin/bash
+# 四种调用要分开处理，否则 cmd_fetch 的探测会取不到大小、走错分支：
+#   -D -           越界 Range 探测 → 必须给 Content-Range: bytes */N
+#                  （只给 content-length 的话 cr_size=0）
+#   -I             HEAD → 给 Content-Length
+#   -o <真实文件>   真正下载 → 写 MOCK_DL_BYTES 字节，退出码 MOCK_CURL_RC
+#   -o /dev/null -w  补问状态码 → 给 MOCK_HTTP_CODE
+out=""; dump=0; wmode=0; headreq=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o) out="$2"; shift 2 ;;
+        -D) dump=1; shift ;;
+        -I) headreq=1; shift ;;
+        -w) wmode=1; shift 2 ;;
+        *)  shift ;;
+    esac
+done
+[ -n "$MOCK_CURL_LOG" ] && echo "call" >> "$MOCK_CURL_LOG"
+if [ "$dump" = "1" ]; then
+    echo "HTTP/2 206"
+    echo "content-range: bytes */${MOCK_FILE_SIZE:-104857600}"
+    exit 0
+fi
+if [ "$headreq" = "1" ]; then
+    echo "HTTP/2 200"
+    echo "content-length: ${MOCK_FILE_SIZE:-104857600}"
+    exit 0
+fi
+if [ -n "$out" ] && [ "$out" != "/dev/null" ]; then
+    head -c "${MOCK_DL_BYTES:-104857600}" /dev/zero > "$out" 2>/dev/null
+    exit "${MOCK_CURL_RC:-0}"
+fi
+[ "$wmode" = "1" ] && printf '%s' "${MOCK_HTTP_CODE:-200}"
+exit 0
+MOCKCURL
+chmod +x "$T/bin/curl"
+export MOCK_CURL_LOG="$T/curl.log"
 # 注意：不能把 stderr 丢到 /dev/null——die 的用法提示全在 stderr，
 # 丢了以后"参数校验"这几条断言会全假失败（最早就是这么错的）。
 ev() { bash -c ". '$T/sr.sh'; trap - EXIT INT TERM HUP
@@ -274,6 +317,51 @@ grep -q '\${_spawned:-1} 连接' smartroute.sh \
     && ok "完成行报实际连接数" || bad "完成行仍报上限"
 grep -q "小文件切太细反而更慢，这是有意的" smartroute.sh \
     && ok "说明为什么小文件不切细" || bad "没解释小文件行为"
+
+echo "== 14. 读分片大小前必须有 -f 守卫（重定向顺序 bug）=="
+# 教训：wc -c < "$d/p$idx" 2>/dev/null 挡不住"文件打不开"。
+# bash 从左到右处理重定向，< 先执行——文件不存在时 shell 自己报错，
+# 而那一刻 2>/dev/null 还没生效，错误漏到 stderr，用户看到：
+#   smartroute.sh: line NNN: /tmp/smartroute_fetch.XXXX/p5: No such file or directory
+# 实测发生过，完全不知所谓。改成 -f 守卫，根本不去开这个文件。
+# 必须排除注释行：上面那段"注意：不能写 wc -c < ... 2>/dev/null"的说明
+# 本身就含这个模式，不排除会自己打自己。
+_leak="$(grep -nE 'wc -c < [^|]*2>/dev/null' smartroute.sh | grep -vE '^[0-9]+:[[:space:]]*#')"
+if [ -n "$_leak" ]; then
+    bad "仍有 wc -c < ... 2>/dev/null（重定向顺序错，错误会漏到 stderr）: $_leak"
+else
+    ok "没有 wc -c < ... 2>/dev/null 模式（注释里的说明已排除）"
+fi
+[ "$(grep -cF '[ -f "$d/p$idx" ] && got=' smartroute.sh)" = "2" ] \
+    && ok "两处读分片大小都有 -f 守卫" \
+    || bad "读分片大小缺 -f 守卫: $(grep -cF '[ -f "$d/p$idx" ] && got=' smartroute.sh)/2"
+
+echo "== 15. -n 1 不切分：一个 HTTP 请求下完整文件 =="
+# 切了片是自找麻烦。100MB 文件被切成 64 片、发 64 个请求：
+#   1) 按请求数限流的服务端直接 429（实测 proof.ovh.net 累计下约 2GB 后，
+#      浏览器单请求打得开，64 个请求全军覆没）
+#   2) 任一片失败整体失败，失败面从 1 变 64
+#   3) 64 次 TLS 握手，纯开销
+# 单连接的吞吐上限由链路决定，切分一分都提不上去。
+: > "$MOCK_CURL_LOG"
+n1out="$(ev "cmd_fetch http://x/f.bin -o $T/n1.bin -n 1")"
+echo "$n1out" | grep -q "切成" && bad "n=1 仍然切分了" || ok "n=1 不切分"
+echo "$n1out" | grep -q "单连接下载" && ok "说明了是单连接" || bad "没说明单连接: $(echo "$n1out" | head -3)"
+# 3 次：1 次越界 Range 探测（拿 Content-Range）+ 1 次 HEAD + 1 次真正下载。
+# 切分路径这里会是 2 + 64 = 66 次——这就是要省掉的东西。
+n1calls=$(wc -l < "$MOCK_CURL_LOG" | tr -d ' ')
+[ "$n1calls" = "3" ] && ok "只发了 3 个 HTTP 请求（2 探测 + 1 下载）" || bad "发了 $n1calls 个请求，切分没省掉"
+[ -f "$T/n1.bin" ] && ok "输出文件已生成" || bad "输出文件没生成"
+[ "$(wc -c < "$T/n1.bin" 2>/dev/null | tr -d ' ')" = "104857600" ] \
+    && ok "下载字节数正确" || bad "字节数不对: $(wc -c < "$T/n1.bin" 2>/dev/null | tr -d ' ')"
+echo "$n1out" | grep -q "实测分摊" && ok "单连接也报每条线扛了多少" || bad "单连接没报分摊，无法验证走了哪条线"
+
+# n=1 失败时必须报出 HTTP 状态码，否则用户只知道"失败"，
+# 分不清该换源还是该降 -n——这两种处理完全不同。
+: > "$MOCK_CURL_LOG"
+n1fail="$(MOCK_CURL_RC=22 MOCK_HTTP_CODE=429 ev "cmd_fetch http://x/f.bin -o $T/n1f.bin -n 1")"
+echo "$n1fail" | grep -q "429" && ok "失败时报出 HTTP 429" || bad "失败时没报状态码: $(echo "$n1fail" | tail -2)"
+echo "$n1fail" | grep -q "浏览器能打开" && ok "给出可执行的排查方向" || bad "没给排查方向"
 
 echo ""
 echo "结果: $((PASS - FAIL)) 通过, $FAIL 失败"

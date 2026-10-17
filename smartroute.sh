@@ -2169,6 +2169,9 @@ MSG
     [ "$_show_start" -gt 2 ] && _show_start=2
     if [ "$n" -gt "$_show_start" ]; then
         echo "大小 $(fmt_bytes "$size")，最多 $n 条连接（先起 $_show_start 条，按服务端表现逐步加）…"
+    elif [ "$n" -eq 1 ]; then
+        # n=1 时不走切分（见下面的快路径），说"并行下载"是自相矛盾
+        echo "大小 $(fmt_bytes "$size")，单连接下载…"
     else
         echo "大小 $(fmt_bytes "$size")，$n 个连接并行下载…"
     fi
@@ -2227,6 +2230,50 @@ MSG
     #
     # 认领用 mkdir 做原子锁：同一片只有一个 worker 能建成目录，天然无锁。
     # 不用共享计数器 + flock——macOS 默认没有 flock，自己写锁又是轮询忙等。
+    # ── -n 1：单连接就该是单连接，不要切分 ──
+    #
+    # 切了片是自找麻烦。100MB 文件会被切成 64 片、发 64 个 HTTP 请求：
+    #   1) 按请求数限流的服务端直接 429——实测 proof.ovh.net 在我们累计下了
+    #      约 2GB 之后就这样：浏览器单请求打得开，64 个请求全军覆没
+    #   2) 任何一片失败就整体失败，失败面从 1 个变成 64 个
+    #   3) 64 次 TLS 握手，纯开销
+    # 单连接的吞吐上限由链路决定，切分一分都提不上去——想提速该加 -n，
+    # 不是把一条连接拆成六十四条。
+    if [ "$n" -eq 1 ]; then
+        echo "单连接下载（不切分，一个 HTTP 请求）…"
+        if curl -fL --retry 3 --retry-delay 1 --connect-timeout 10 \
+                --max-time 3600 -o "$out" "$url" 2>/dev/null; then
+            local _n1got=0
+            [ -f "$out" ] && _n1got="$(wc -c < "$out" | tr -d ' ')"
+            echo "完成: ${out}（$(fmt_bytes "${_n1got:-0}")，1 连接）"
+            # 单连接也必须报每条线扛了多少字节。少了这个，用户无法判断这一笔
+            # 下载究竟走了哪条线，也就无法验证"切到 Wi-Fi"是否真的生效——
+            # 而"证据"是这个工具唯一不该省的东西。
+            local _n1eth=0 _n1wifi=0 _n1de _n1dw _n1all
+            [ -n "$ACTIVE_ETH_DEV" ]  && _n1eth="$(_if_bytes "$ACTIVE_ETH_DEV")"
+            [ -n "$ACTIVE_WIFI_DEV" ] && _n1wifi="$(_if_bytes "$ACTIVE_WIFI_DEV")"
+            case "$_n1eth"  in ''|*[!0-9]*) _n1eth=0 ;; esac
+            case "$_n1wifi" in ''|*[!0-9]*) _n1wifi=0 ;; esac
+            _n1de=$(( _n1eth - eth_before ));  [ "$_n1de" -lt 0 ] && _n1de=0
+            _n1dw=$(( _n1wifi - wifi_before )); [ "$_n1dw" -lt 0 ] && _n1dw=0
+            _n1all=$(( _n1de + _n1dw ))
+            echo "  实测分摊: 有线 +$(fmt_bytes "$_n1de")  Wi-Fi +$(fmt_bytes "$_n1dw")"
+            [ "$_n1all" -gt $(( _n1got * 3 )) ] && [ "$_n1got" -gt 0 ] && {
+                echo "  ⚠️  窗口内两个接口共 $(fmt_bytes "$_n1all")，远大于本次 $(fmt_bytes "$_n1got")，"
+                echo "     说明期间还有其他程序在联网，上面的数字包含那部分流量。"
+            }
+            return 0
+        fi
+        # curl 自己不说状态码。补问一次，否则用户只知道"失败"，
+        # 分不清该换源还是该降 -n——这两种的处理完全不同。
+        local _n1code
+        _n1code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 -r 0-0 "$url" 2>/dev/null)"
+        echo "下载失败（curl 退出码非 0${_n1code:+，服务端 HTTP ${_n1code}}）"
+        echo "原因：URL 写错、文件不存在、需要登录/鉴权，或服务端临时故障。"
+        echo "      先确认这个 URL 用浏览器能打开。Range 不兼容才该考虑降 -n。"
+        return 1
+    fi
+
     local chunk total_chunks
     total_chunks=128
     [ "$total_chunks" -gt "$size" ] && total_chunks="$size"
@@ -2270,7 +2317,14 @@ MSG
                     -o "$d/p$idx" -w '%{http_code}' "$u" 2>/dev/null)"
             rc=$?
             if [ "$rc" -eq 0 ]; then
-                got="$(wc -c < "$d/p$idx" 2>/dev/null | tr -d ' ')"
+                # 注意：不能写 wc -c < "$d/p$idx" 2>/dev/null。
+                # bash 按从左到右处理重定向，< 先执行——文件打不开时
+                # shell 自己报的错发生在 2>/dev/null 生效**之前**，
+                # 于是漏到 stderr，用户看到一行
+                #   smartroute.sh: line NNN: .../p5: No such file or directory
+                # 完全不知所谓。用 -f 守卫挡住，根本不去开这个文件。
+                got=0
+                [ -f "$d/p$idx" ] && got="$(wc -c < "$d/p$idx" | tr -d ' ')"
                 [ "$got" = $(( en - st + 1 )) ] && return 0
             elif [ -n "$http" ] && [ "$http" != "000" ] && [ "$http" -ge 400 ] 2>/dev/null; then
                 # HTTP 错误：重试同样的请求不会有不同结果，立刻失败并带上状态码
@@ -2300,7 +2354,14 @@ MSG
             [ "$en" -gt $(( sz - 1 )) ] && en=$(( sz - 1 ))
             want=$(( en - st + 1 ))
             if ! _fetch_seg "$idx" "$st" "$en" "$u" "$d"; then
-                got="$(wc -c < "$d/p$idx" 2>/dev/null | tr -d ' ')"
+                # 注意：不能写 wc -c < "$d/p$idx" 2>/dev/null。
+                # bash 按从左到右处理重定向，< 先执行——文件打不开时
+                # shell 自己报的错发生在 2>/dev/null 生效**之前**，
+                # 于是漏到 stderr，用户看到一行
+                #   smartroute.sh: line NNN: .../p5: No such file or directory
+                # 完全不知所谓。用 -f 守卫挡住，根本不去开这个文件。
+                got=0
+                [ -f "$d/p$idx" ] && got="$(wc -c < "$d/p$idx" | tr -d ' ')"
                 printf '%s %s %s\n' "$idx" "$want" "${got:-0}" > "$d/fail_$idx"
                 return 1
             fi
