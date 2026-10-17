@@ -112,6 +112,13 @@ struct NetworkSnapshot {
     /// 「网速优先」挑 Wi-Fi 就是实实在在的提升。
     var linkSpeedEth: String = ""
     var linkSpeedWifi: String = ""
+    /// 以太网协商速率与网卡标称能力，单位 Mb/s；0 表示读不到。
+    /// 用户看到「有线 100M、Wi-Fi 432M」就问为什么不能相加成 532M。真相往往
+    /// 是链路只协商到 100baseTX，而网卡其实是 2.5GbE——差的不是软件，是网线
+    /// 或路由器端口。修好它一条有线就能跑满千兆宽带，比任何软件聚合都强。
+    /// 不把这个差距摆到用户眼前，他会一直跟软件较劲。
+    var ethNegotiatedMbps: Int = 0
+    var nicMaxMbps: Int = 0
     var services: [ServiceEntry] = []
     var defaultDevice: String = ""
     var defaultGateway: String = ""
@@ -440,16 +447,49 @@ final class NetworkModel: ObservableObject {
         // 1) 这正是它唯一有意义的场合（不同网关时速率差会被"两条独立上游"覆盖）
         // 2) system_profiler 一次要约 1.7 秒。每次都跑会让每次刷新都慢这么多，
         //    而绝大多数网络根本不是同网关，白等。
-        if !snapshot.sameGateway.isEmpty {
+        // 网卡能力与协商速率：SPEthernetDataType 约 0.4 秒，远低于
+        // SPAirPortDataType 的约 1.8 秒，所以每次都拿，不等同网关——
+        // 「网线只谈到 100M」这个差距在任何网络下都值得知道。
+        do {
             let ethDev = interfaces.first(where: { $0.role == "以太网" && $0.active })?.device ?? ""
-            let wifiDev = interfaces.first(where: { $0.role == "Wi-Fi" && $0.active })?.device ?? ""
             if !ethDev.isEmpty {
+                // 一次调用拿两样：BSD Device Name 后面的 Maximum Link Speed。
+                // "2.5 Gb/s" -> 2500，"1 Gb/s" -> 1000，"100 Mb/s" -> 100。
+                let raw = Shell.run("system_profiler SPEthernetDataType 2>/dev/null", timeout: 6).out
+                var dev = ""
+                for line in raw.split(separator: "\n", omittingEmptySubsequences: false) {
+                    let t = line.trimmingCharacters(in: .whitespaces)
+                    if t.hasPrefix("BSD Device Name:") {
+                        dev = String(t.dropFirst("BSD Device Name:".count))
+                            .trimmingCharacters(in: .whitespaces)
+                    } else if t.hasPrefix("Maximum Link Speed:"), dev == ethDev {
+                        let v = String(t.dropFirst("Maximum Link Speed:".count))
+                            .trimmingCharacters(in: .whitespaces)
+                        let parts = v.split(separator: " ")
+                        if parts.count == 2, let n = Double(parts[0]) {
+                            snapshot.nicMaxMbps = parts[1].hasPrefix("Gb") ? Int(n * 1000) : Int(n)
+                        }
+                        break
+                    }
+                }
                 // getMedia 输出两行（Current: / Active:），要的是 Active 那行。
                 // 直接取整个输出会把 "Current: autoselect" 一起带进来。
                 let o = Shell.run("networksetup -getMedia \(ethDev) | awk -F': *' '/^Active:/{print $2; exit}'", timeout: 5).out
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 if !o.isEmpty { snapshot.linkSpeedEth = o }
+                // "100baseTX <full-duplex...>" -> 100。解析不出留 0，
+                // 界面要能区分「0」和「不知道」，不能说成"只跑到 0M"。
+                let m = snapshot.linkSpeedEth
+                if m.hasPrefix("1000base") { snapshot.ethNegotiatedMbps = 1000 }
+                else if m.hasPrefix("2500base") || m.hasPrefix("2.5gbase") { snapshot.ethNegotiatedMbps = 2500 }
+                else if m.hasPrefix("100base") { snapshot.ethNegotiatedMbps = 100 }
+                else if m.hasPrefix("10base") { snapshot.ethNegotiatedMbps = 10 }
             }
+        }
+        if !snapshot.sameGateway.isEmpty {
+            let wifiDev = interfaces.first(where: { $0.role == "Wi-Fi" && $0.active })?.device ?? ""
+            // linkSpeedEth 已在上面无条件取过，这里不再重复——
+            // 重复一次就是多跑一条 networksetup，而且两处还可能不一致。
             if !wifiDev.isEmpty {
                 // Transmit Rate 是个裸数字（如 432），补上单位才有意义
                 let o = Shell.run("system_profiler SPAirPortDataType 2>/dev/null | awk -F': *' '/Transmit Rate/{print $2; exit}'", timeout: 8).out

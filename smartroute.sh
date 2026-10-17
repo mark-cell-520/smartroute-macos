@@ -1063,7 +1063,27 @@ cmd_status() {
     # Transmit Rate 和噪声底。用户最初的疑问"网线 100M、Wi-Fi 标称 1000M，
     # 为什么不走 Wi-Fi"，答案就在这里。
     if [ -n "$ACTIVE_ETH_DEV" ]; then
-        echo "以太网链路   : $(link_media "$ACTIVE_ETH_DEV" 2>/dev/null || echo 未知)"
+        local _em _es _emax
+        _em="$(link_media "$ACTIVE_ETH_DEV" 2>/dev/null)"
+        _es="$(link_speed_mbps "$_em")"
+        _emax="$(nic_max_speed "$ACTIVE_ETH_DEV")"
+        echo "以太网链路   : ${_em:-未知}"
+        # 链路速率远低于网卡能力时，必须说清楚"这不是软件问题"。
+        # 用户看到"有线 100M、Wi-Fi 432M"就会问为什么不能相加成 532M——
+        # 真相是网卡能跑 2.5G，链路只谈到 100M，差的是网线或路由器端口。
+        # 修好它一条有线就能跑满千兆宽带，比两条线做软件聚合更强。
+        # 含糊其辞的后果是用户一直跟软件较劲，还反复重装。
+        # 阈值取 1000 而不是"任何差距"：宽带通常就是千兆，1000baseT 已经跑满，
+        # 此时报「网卡支持 2500M」是噪音——换了线也快不了，上游封死了。
+        # 真正值得报警的是"硬件够却够不到千兆"（100baseTX 只用 2 对线，
+        # 线序坏一对就掉下来），那种情况换根线立刻有 10 倍收益。
+        if [ -n "$_es" ] && [ -n "$_emax" ] && [ "$_es" -lt 1000 ] && [ "$_emax" -ge 1000 ]; then
+            echo "⚠️  以太网只协商到 ${_es}M，而网卡支持 ${_emax}M"
+            echo "    这不是本工具的限制，是网线或路由器端口："
+            echo "    • 换一根 Cat5e 以上网线（100baseTX 只需 2 对线通，1000baseT 要 4 对全通）"
+            echo "    • 或把网线插到路由器的千兆口"
+            echo "    修好之后：一条有线即可跑满千兆宽带，强于任何两条线的软件聚合"
+        fi
     fi
     if [ -n "$ACTIVE_WIFI_DEV" ]; then
         # 一次 system_profiler 拿全四项（它一次要约 1.7 秒，分两次调白等一倍）
@@ -3062,6 +3082,38 @@ fmt_bps() {   # $1=字节/秒
 link_media() {   # $1=设备
     [ -n "$1" ] || return 1
     networksetup -getMedia "$1" 2>/dev/null | sed -n 's/^Active:[[:space:]]*//p' | head -1
+}
+
+# 从链路串（"100baseTX <full-duplex...>"）解析协商速率，单位 Mb/s。
+# 解析不出输出空——调用方必须能区分"0"和"不知道"。
+link_speed_mbps() {   # $1=link_media 输出
+    case "$1" in
+        2500base*|2.5gbase*|2.5Gbase*) echo 2500 ;;
+        1000base*|1000Base*)           echo 1000 ;;
+        100base*)                      echo 100 ;;
+        10base*)                       echo 10 ;;
+        *)                             echo "" ;;
+    esac
+}
+
+# 网卡标称最大链路速率（Mb/s）。
+#
+# 为什么要读它：用户看到"有线 100M、Wi-Fi 432M"就问为什么不能相加成 532M。
+# 真相往往是链路只协商到 100baseTX，而网卡其实是 2.5GbE——差的不是软件，
+# 是网线或路由器端口。修好它一条线就能跑满千兆宽带，比任何软件聚合都强。
+# 不说出来，用户会一直跟软件较劲。
+nic_max_speed() {   # $1=BSD 设备名 -> stdout: Mb/s；读不到输出空
+    [ -n "$1" ] || return 0
+    system_profiler SPEthernetDataType 2>/dev/null | awk -v want="$1" '
+        /BSD Device Name:/   { dev=$4; next }
+        /Maximum Link Speed:/ && dev == want {
+            v = $4; u = $5
+            if (v + 0 <= 0) exit
+            if (u ~ /^Gb/) printf "%d\n", v * 1000
+            else if (u ~ /^Mb/) printf "%d\n", v
+            exit
+        }
+    '
 }
 
 # 缓存 helpers：state 里存 "设备:值:时间戳"

@@ -141,6 +141,35 @@ struct StatusView: View {
 还能做的：两个接口仍有速率差异时，用「选路模式 → 网速优先」挑更快的那条。
 """)
                 }
+                // 【链路能力差距】以太网协商速率远低于网卡能力时必须报警。
+                // 用户看到「有线 100M、Wi-Fi 432M」就问为什么不能相加成 532M。
+                // 真相是网卡能跑 2.5G、链路只谈到 100M，差的是网线或路由器端口。
+                // 修好它一条有线就能跑满千兆宽带，比任何软件聚合都强。
+                // 放在这里（默认落地页）而不是双网并发页：用户正在看的就是这页，
+                // 结论放错页等于没说。这个坑本轮已经犯过一次。
+                // 阈值与 smartroute.sh 的 cmd_status 必须一致（1000M）：宽带通常
+                // 就是千兆，1000baseT 已跑满，此时报「网卡支持 2500M」是噪音——
+                // 换了线也快不了，上游封死了。两边阈值不一致会出现"终端说有问题、
+                // App 说没有"，用户不知道该信谁。
+                if model.snapshot.ethNegotiatedMbps > 0,
+                   model.snapshot.ethNegotiatedMbps < 1000,
+                   model.snapshot.nicMaxMbps >= 1000 {
+                    Card {
+                        VStack(alignment: .leading, spacing: Theme.gapXS) {
+                            Label("以太网只跑到 \(model.snapshot.ethNegotiatedMbps)M，网卡支持 \(model.snapshot.nicMaxMbps)M",
+                                  systemImage: "cable.connector")
+                                .font(.headline).foregroundStyle(.orange)
+                            Text("""
+                                这不是本工具的限制，是网线或路由器端口。100baseTX 只需要                                 2 对线通，1000baseT 要 4 对全通——线序坏一对就会掉到 100M。
+                                """)
+                                .font(.caption).foregroundStyle(.secondary)
+                            Text("""
+                                换一根 Cat5e 以上网线，或插到路由器千兆口。修好之后一条有线                                 即可跑满千兆宽带，强于任何两条线的软件聚合。
+                                """)
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
                 // 链路速率对比。只在同网关时显示——这正是它唯一有意义的场合，
                 // 也与 NetworkModel 里的取值条件一致（不同网关时不取，省 1.7 秒）。
                 if !model.snapshot.sameGateway.isEmpty,
