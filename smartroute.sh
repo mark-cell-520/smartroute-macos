@@ -468,9 +468,18 @@ find_active() {
 
 # ---------------- 路由操作（兼容不同参数顺序） ----------------
 route_add_host() {   # $1=目标IP $2=设备 $3=网关
-    route add -host "$1" -interface "$2" "$3" >/dev/null 2>&1 && return 0
-    route add -host "$1" "$3" -interface "$2" >/dev/null 2>&1 && return 0
-    route add -host "$1" "$3" >/dev/null 2>&1 && return 0
+    # 加成功就记一笔：本次进程真的往路由表里加了东西。
+    # EXIT trap 靠这个标志决定要不要 cleanup_probe_routes——没加过就清什么，
+    # 而无条件清会删掉守护进程探测途中的路由（见 _smartroute_cleanup 的注释）。
+    if route add -host "$1" -interface "$2" "$3" >/dev/null 2>&1; then
+        PROBE_ROUTES_ADDED=1; return 0
+    fi
+    if route add -host "$1" "$3" -interface "$2" >/dev/null 2>&1; then
+        PROBE_ROUTES_ADDED=1; return 0
+    fi
+    if route add -host "$1" "$3" >/dev/null 2>&1; then
+        PROBE_ROUTES_ADDED=1; return 0
+    fi
     # 目标路由已存在（同网段双宿主、残留路由，或与守护进程的探测并发时会出现）：
     # 已有路由的网关与本次一致，说明就是同一条上网路径，复用即可
     local cur
@@ -3094,13 +3103,39 @@ balance_status() {
 
 [ "$(uname -s)" = "Darwin" ] || die "本工具仅支持 macOS"
 
-trap 'cleanup_probe_routes >/dev/null 2>&1; rm -rf "$LOCK_DIR" 2>/dev/null' EXIT INT TERM HUP
+# 退出时的清理必须**有条件**，不能无条件做两件事。
+#
+# 以前是无条件 cleanup_probe_routes + rm -rf "$LOCK_DIR"，于是任何一条
+# root 命令退出都会踩到正在运行的守护进程：
+#   · sudo smartroute status / test / doctor / report / balance status
+#   · acquire_lock 抢不到锁时的 exit 0
+# 这些进程根本没加过探测路由、也没持锁，退出时却把守护进程的锁删了、
+# 把探测途中的主机路由删了。后果是锁形同虚设：随后并发的 watch 互相
+# 加/删同一批 /32 路由，探测走了默认路由（也就是测了另一个接口），
+# 可能把默认路由切到没有外网的口。
+# /var/run 是 root:daemon 组可写——非 root 删不动，root 一删就中，
+# 而本机守护进程是常驻的，这个场景现实存在。
+#
+# 两条判据分开：
+#   PROBE_ROUTES_ADDED —— 本次进程真加过探测路由才准清。
+#                          由 route_add_host 成功时置 1（见该函数）。
+#   LOCK_HELD           —— 本次进程真拿到锁才准删锁目录。
+#                           由 _lock_try 成功时置 1。
+# 两个变量在脚本执行期始终存在（非 root 下不会拿到锁、也不会加路由，
+# 两个都是 0，清理自然不发生），所以不用 set -u 也能安全引用。
+_smartroute_cleanup() {
+    [ "${PROBE_ROUTES_ADDED:-0}" = "1" ] && cleanup_probe_routes >/dev/null 2>&1
+    [ "${LOCK_HELD:-0}" = "1" ] && rm -rf "$LOCK_DIR" 2>/dev/null
+    return 0
+}
+trap '_smartroute_cleanup' EXIT INT TERM HUP
 
 # 返回 0=拿到锁，1=被别人占着。三种抢锁方式都基于它，
 # 避免"退出码语义"在三个函数里各写一遍、各自漂移。
 _lock_try() {
     if mkdir "$LOCK_DIR" 2>/dev/null; then
         echo $$ > "$LOCK_DIR/pid"
+        LOCK_HELD=1          # 见下面 EXIT trap 的注释：只有真持锁才准删
         return 0
     fi
     local pid
@@ -3112,6 +3147,7 @@ _lock_try() {
     rm -rf "$LOCK_DIR"
     if mkdir "$LOCK_DIR" 2>/dev/null; then
         echo $$ > "$LOCK_DIR/pid"
+        LOCK_HELD=1
         return 0
     fi
     return 1
@@ -3392,10 +3428,36 @@ wifi_scan() {
         }
         END { for (k in best) printf "%d\t%s\t%s\n", best[k], k, ch[k] }' \
         | sort -s -t"$(printf '\t')" -k1,1nr | awk -F"$(printf '\t')" '{print $2" "$1" "$3}'
+    # stdout 只有网络行，不带统计。这个契约被 tests/mock_wifi_scan.sh 锁定
+    # （整串相等比较），不能往里加 @unknown 行。
+    # 需要 unknown 数量的调用方见 wifi_nearby——它不走命令替换，
+    # 所以能直接读到 WIFI_SCAN_UNKNOWN。
 }
 
-# 附近有信号的已保存网络（按信号排序）。-> stdout: "SSID rssi channel"
-wifi_nearby() { wifi_scan "$(wifi_saved_list | tr '\n' ' ')" "${1:-0}"; }
+# 附近有信号的已保存网络（按信号排序）。-> stdout: "SSID rssi channel"，
+# 末行 "@unknown N" 是有几个网络没能确认在不在范围（由 wifi_scan 透传）。
+#
+# 为什么要把 unknown 打到 stdout：调用方是 near="$(wifi_nearby ...)"，
+# 命令替换在子 shell 里跑，函数内对 WIFI_SCAN_UNKNOWN 的累加父进程收不到。
+# 于是"有 N 个没能确认（系统扫描冷却，不是故障）"这句提示从不出现，
+# 用户以为全查过了——而快速扫描模式下恰恰是大部分没确认。
+wifi_nearby() {
+    # 末行 "@unknown N" 是有几个网络没能确认在不在范围。
+    #
+    # 为什么必须绕开命令替换：wifi_scan 在子 shell 里累加 WIFI_SCAN_UNKNOWN，
+    # near="$(wifi_scan ...)" 这种写法父进程收不到。但不能把统计塞进
+    # wifi_scan 的 stdout——它的契约是"只有网络行"（既有测试整串比较）。
+    # 所以这里把 wifi_scan 的输出重定向到临时文件：不用子 shell，
+    # WIFI_SCAN_UNKNOWN 在同一个 shell 里累加，读完再打出来。
+    local _f _rc
+    _f="$(mktemp "${TMPDIR:-/tmp}/sr_nearby.XXXXXX")" || return 1
+    wifi_scan "$(wifi_saved_list | tr '\n' ' ')" "${1:-0}" >"$_f" 2>/dev/null
+    _rc=$?
+    [ -s "$_f" ] && cat "$_f"
+    printf '@unknown %s\n' "${WIFI_SCAN_UNKNOWN:-0}"
+    rm -f "$_f"
+    return $_rc
+}
 
 # 一次 system_profiler 拿全：信号、信道、协商速率、噪声底。
 # -> stdout: "<rssi> <channel> <rate> <noise>"，读不到输出空
@@ -3558,7 +3620,13 @@ wifi_rank_candidates() {   # $1=空格分隔候选 -> stdout: 重排后的候选
     echo
 }
 
-wifi_try_candidates() {   # $1=候选列表 $2=每个等几秒 -> stdout: 成功的 SSID；另设 WIFI_TRY_* 汇总
+# stdout 契约：**只有**成功的 SSID（没有就空）。tests/mock_wifi.sh 依赖这个。
+# 失败汇总走 WIFI_TRY_STATS_FILE 指向的临时文件（见函数末尾）——
+# 因为调用方是 got="$(wifi_try_candidates ...)"，命令替换在子 shell 里跑，
+# 函数内对 WIFI_TRY_TOTAL 等的赋值父进程收不到，直接设变量会让汇总永远
+# 显示"试了 个"、三个分类全空，[ "" -gt 0 ] 还抛 stderr。
+# 而把统计打到 stdout 又会破坏上面那个契约，所以用文件。
+wifi_try_candidates() {   # $1=候选列表 $2=每个等几秒 -> stdout: 成功的 SSID 或空
     local cands="$1" wait_s="${2:-6}" ssid gw
     WIFI_TRY_TOTAL=0; WIFI_TRY_OUTOFRANGE=0; WIFI_TRY_NOINET=0; WIFI_TRY_JOINFAIL=0
     [ -n "$cands" ] || cands="$(wifi_saved_list | tr '\n' ' ')"
@@ -3610,7 +3678,49 @@ wifi_try_candidates() {   # $1=候选列表 $2=每个等几秒 -> stdout: 成功
         log "wifi tryall 全失败，且原网络被断开，尝试恢复"
         wifi_power_cycle "$ACTIVE_WIFI_DEV"
     fi
+    # 统计写到一个文件里，由调用方读。不能打到 stdout——本函数的契约是
+    # "stdout 只有成功的 SSID"（tests/mock_wifi.sh 第 5 节整串判空，
+    # 加了统计行就永远不为空）；也不能只设 WIFI_TRY_* 变量——调用方是
+    # got="$(wifi_try_candidates ...)"，命令替换在子 shell 里跑，父进程
+    # 收不到，于是失败汇总永远显示"试了 个"、三个分类全是空的。
+    # 临时文件是唯一两条都满足的通道。
+    if [ -n "${WIFI_TRY_STATS_FILE:-}" ]; then
+        printf 'total=%s oor=%s ni=%s jf=%s\n' \
+            "$WIFI_TRY_TOTAL" "$WIFI_TRY_OUTOFRANGE" "$WIFI_TRY_NOINET" "$WIFI_TRY_JOINFAIL" \
+            >"$WIFI_TRY_STATS_FILE" 2>/dev/null
+    fi
     return 1
+}
+
+# 读 wifi_try_candidates 写进临时文件的统计。
+# 为什么用文件而不是变量/stdout：调用方是 got="$(wifi_try_candidates ...)"，
+# 命令替换在子 shell 里跑，函数内设的 WIFI_TRY_* 变量父进程收不到（于是
+# 失败汇总永远显示"试了 个"、三个分类全空）；而统计也不能打进 stdout——
+# 那会破坏"stdout 只有 SSID"的契约（tests/mock_wifi.sh 第 5 节整串判空）。
+# 文件是唯一两条都满足的通道。
+wifi_try_read_stats() {   # $1=统计文件路径 -> 设置 _WT_TOTAL/_WT_OOR/_WT_NI/_WT_JF
+    local st=""
+    [ -n "${1:-}" ] && [ -f "$1" ] && st="$(cat "$1" 2>/dev/null)"
+    _WT_TOTAL=0; _WT_OOR=0; _WT_NI=0; _WT_JF=0
+    [ -n "$st" ] || return 0
+    local kv
+    for kv in $st; do
+        case "$kv" in
+            total=*) _WT_TOTAL="${kv#total=}" ;;
+            oor=*)   _WT_OOR="${kv#oor=}" ;;
+            ni=*)    _WT_NI="${kv#ni=}" ;;
+            jf=*)    _WT_JF="${kv#jf=}" ;;
+        esac
+    done
+    # 空值和脏值都必须归零。空串拼起来还是空串，匹配不上 *[!0-9]*，
+    # 所以下面先逐项判空——否则 "total=" 这种会让
+    # [ "" -gt 0 ] 抛 integer expression expected，正是要消除的那类 stderr。
+    local _v _x
+    for _v in _WT_TOTAL _WT_OOR _WT_NI _WT_JF; do
+        eval "_x=\${$_v}"
+        case "$_x" in ''|*[!0-9]*) eval "$_v=0" ;; esac
+    done
+    return 0
 }
 
 # Wi-Fi 自动故障转移。
@@ -3639,13 +3749,24 @@ wifi_failover_if_needed() {   # $1=wifi_ok $2=eth_ok $3=wifi_res
     state_set wifi_failover_last "$now"
 
     log "Wi-Fi 故障转移：当前 Wi-Fi 上不了网，开始按优先级试连其它已保存网络"
-    local got
+    local got _sf
+    _sf="$(mktemp "${TMPDIR:-/tmp}/sr_wts.XXXXXX")" || _sf=""
+    WIFI_TRY_STATS_FILE="$_sf"
     got="$(wifi_try_candidates "$(wifi_preferred_candidates)" 6)"
+    WIFI_TRY_STATS_FILE=""
+    wifi_try_read_stats "$_sf"
+    [ -n "$_sf" ] && rm -f "$_sf"
     if [ -n "$got" ]; then
-        log "Wi-Fi 故障转移成功：已切到 $got"
-        notify "smartroute" "已自动切换到可用 Wi-Fi：$got"
+        log "Wi-Fi 故障转移成功：已切到 ${got}（试了 ${_WT_TOTAL} 个）"
+        notify "smartroute" "已自动切换到可用 Wi-Fi：${got}"
     else
-        log "Wi-Fi 故障转移：已保存的 Wi-Fi 都没有外网，放弃本轮"
+        # 汇总必须带原因分类。全是"不在范围"说明旁边就没那些路由器，
+        # 是环境问题；有"连不上"才可能是密码改了——两者的处理完全不同。
+        log "Wi-Fi 故障转移：已保存的 Wi-Fi 都没有外网，放弃本轮（试了 ${_WT_TOTAL} 个：不在范围 ${_WT_OOR}、拿到 IP 但没外网 ${_WT_NI}、连不上 ${_WT_JF}）"
+        if [ "${_WT_TOTAL:-0}" -gt 0 ]; then
+            echo "试连了 ${_WT_TOTAL} 个已保存网络：不在范围 ${_WT_OOR} 个、连上但没外网 ${_WT_NI} 个、连不上 ${_WT_JF} 个"
+            [ "${_WT_JF:-0}" -gt 0 ] && echo "  有网络连不上——可能是密码改了，或信号太弱"
+        fi
     fi
     return 0
 }
@@ -3745,9 +3866,14 @@ cmd_wifi() {
                 --quick|-q) _thorough=0; echo "快速扫描（约 1 秒，部分结果可能未确认）…" ;;
                 *) echo "正在扫描附近的 Wi-Fi（约需 10 秒）…" ;;
             esac
-            local near all far="" s rssi ch
+            local near all far="" s rssi ch nunknown=0
             near="$(wifi_nearby "$_thorough")"
             all="$(wifi_saved_list | tr '\n' ' ')"
+            # @unknown 那行是统计，不能当网络名去打。剥离它并取出数量：
+            # 不剥离的话会显示成一个名为 "@unknown 3" 的网络。
+            nunknown="$(printf '%s\n' "$near" | sed -n 's/^@unknown //p' | tail -1)"
+            near="$(printf '%s\n' "$near" | sed '/^@unknown /d' | sed '/^$/d')"
+            case "${nunknown:-}" in ''|*[!0-9]*) nunknown=0 ;; esac
 
             if [ -n "$near" ]; then
                 echo
@@ -3760,6 +3886,12 @@ cmd_wifi() {
             else
                 echo
                 echo "附近没有已保存的网络在范围。"
+            fi
+            # 有几个没能确认必须说。快速扫描模式（--quick）下大部分网络
+            # 都来不及确认，不说的话用户以为全查过了，会怀疑扫描坏了。
+            if [ "$nunknown" -gt 0 ]; then
+                echo
+                echo "（有 $nunknown 个已保存网络没能确认在不在范围——系统扫描有冷却，不是故障；加 --quick 更快但确认得更少）"
             fi
 
             # 区分"确认不在范围"和"没能确认"——后者别让人以为查过了
@@ -3847,13 +3979,14 @@ cmd_wifi() {
             # 用扫描结果把候选排个序：附近有信号的按信号强弱优先，
             # 够不着的排最后。排序错了只是多花几秒，不会漏掉能用的网络——
             # 所以够不着的一样会试，只是最后试。
-            local got ordered
+            local got ordered _sf
             ordered="$(wifi_rank_candidates "$(wifi_saved_list | tr '\n' ' ')")"
+            _sf="$(mktemp "${TMPDIR:-/tmp}/sr_wts.XXXXXX")" || _sf=""
+            WIFI_TRY_STATS_FILE="$_sf"
             got="$(wifi_try_candidates "$ordered" 6)"
-            # 有几个网络没能确认在不在范围——如实告诉用户，别让他以为全查过了
-            if [ "${WIFI_SCAN_UNKNOWN:-0}" -gt 0 ]; then
-                echo "（有 $WIFI_SCAN_UNKNOWN 个网络没能确认在不在范围，已一并试过）"
-            fi
+            WIFI_TRY_STATS_FILE=""
+            wifi_try_read_stats "$_sf"
+            [ -n "$_sf" ] && rm -f "$_sf"
             if [ -n "$got" ]; then
                 echo "✅ 找到可用的网络：$got"
                 [ "$NOTIFY" = "1" ] && notify "SmartRoute" "已切换到可用 Wi-Fi：$got"
@@ -3863,11 +3996,11 @@ cmd_wifi() {
             # 失败要把原因说清楚。原来一律报"都没有外网"，
             # 但绝大多数是"不在范围"（旁边没这个路由器），那是正常的；
             # 真正值得用户处理的是"找到了却连不上"。
-            echo "❌ 没找到能上网的网络。试了 $WIFI_TRY_TOTAL 个："
-            [ "$WIFI_TRY_OUTOFRANGE" -gt 0 ] && echo "   · $WIFI_TRY_OUTOFRANGE 个不在范围（旁边没有这个路由器，属正常）"
-            [ "$WIFI_TRY_JOINFAIL" -gt 0 ] && echo "   · $WIFI_TRY_JOINFAIL 个找到了但连不上（密码可能改过了）"
-            [ "$WIFI_TRY_NOINET"   -gt 0 ] && echo "   · $WIFI_TRY_NOINET 个能连上但没有外网（可能要网页认证）"
-            if [ "$WIFI_TRY_JOINFAIL" -gt 0 ]; then
+            echo "❌ 没找到能上网的网络。试了 ${_WT_TOTAL} 个："
+            [ "${_WT_OOR}" -gt 0 ] && echo "   · ${_WT_OOR} 个不在范围（旁边没有这个路由器，属正常）"
+            [ "${_WT_JF}" -gt 0 ] && echo "   · ${_WT_JF} 个找到了但连不上（密码可能改过了）"
+            [ "${_WT_NI}" -gt 0 ] && echo "   · ${_WT_NI} 个能连上但没有外网（可能要网页认证）"
+            if [ "${_WT_JF}" -gt 0 ]; then
                 echo
                 echo "提示：连不上的那些网络，请在系统菜单栏的 Wi-Fi 里重新输一次密码，"
                 echo "     之后这里就能一键切换了。"
