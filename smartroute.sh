@@ -2016,7 +2016,11 @@ MSG
     # 不一致（报了 31402 字节却返回 87533），这两种的处理完全不同。
     _fetch_worker() {   # $1=队列目录 $2=总片数 $3=URL $4=分片目录 $5=片大小 $6=文件大小
         local q="$1" total="$2" u="$3" d="$4" cs="$5" sz="$6" idx st en want got
-        while [ "${_fetch_aborted:-0}" != "1" ] && idx="$(_claim_chunk "$q" "$total")"; do
+        # 中断（用户 Ctrl-C）或别处失败（stop 标志）都要停手。
+        # 用 ${d} 而不是 ${T}：${d} 是本函数的参数，不依赖 cmd_fetch 的局部
+        # 变量通过动态作用域透进来——那在重构时很容易悄悄失效。
+        while [ "${_fetch_aborted:-0}" != "1" ] && [ ! -f "$d/stop" ] \
+              && idx="$(_claim_chunk "$q" "$total")"; do
             st=$(( idx * cs ))
             en=$(( st + cs - 1 ))
             # 最后一片可能超出文件末尾，截断
@@ -2047,10 +2051,40 @@ MSG
         _fetch_worker "$T/q" "$total_chunks" "$url" "$T" "$chunk" "$size" &
         pids+=("$!")
     done
-    local p
+    # 有分片失败时立刻让其余 worker 停手。
+    #
+    # 以前不这样做：失败的 worker 自己 return 1，兄弟 worker 继续认领
+    # 直到队列空，父进程 wait 全部。后果是某片 404 时**整个文件照下**
+    # （每段最长 600s），最后才报"已放弃"——消息和"其实全下完了"的
+    # 行为互相矛盾，白费带宽和时间。用户等半天拿到一个不能用的结果。
+    #
+    # 实现：第一个失败的 worker 创建 $T/stop，所有 worker 的认领循环
+    # 检查这个标志；父进程 poll 而不是干等，发现 stop 就把剩余 pid kill 掉。
+    local p _stop_seen=0
     for p in ${pids[@]+"${pids[@]}"}; do
+        while kill -0 "$p" 2>/dev/null; do
+            if [ -f "$T/stop" ]; then
+                _stop_seen=1
+                break 2
+            fi
+            sleep 0.2
+        done
         wait "$p" || rc=1
+        # 这个 worker 失败了 → 立 stop，别让其他人再白下
+        if [ ! -f "$T/stop" ] && [ "$rc" -ne 0 ]; then
+            : > "$T/stop"
+        fi
     done
+    if [ "$_stop_seen" = "1" ]; then
+        # 把还在跑的 worker 杀掉。它们的 curl 会随之退出（父进程被 kill
+        # 时子进程不自动死，必须显式处理）。
+        local _k
+        for _k in ${pids[@]+"${pids[@]}"}; do
+            kill "$_k" 2>/dev/null
+        done
+        wait 2>/dev/null
+        rc=1
+    fi
     if [ "${_fetch_aborted:-0}" = "1" ]; then
         # 用户主动取消。不能说成"下载失败（已重试 3 次）"——零次重试，
         # 是用户自己打断的，那句话是假的。
@@ -2318,6 +2352,7 @@ other_nets() {
 }
 
 write_pf_rules() {   # $1=设备A $2=网关A $3=设备B $4=网关B $5=额外排除网段 $6=只走的设备(fastest)
+    local TMP_ANCHOR=""
                      # $7=权重A $8=权重B（按容量重复网关，近似加权轮询；缺省 1:1）
     local d1="$1" gw1="$2" d2="$3" gw2="$4" excl="${5:-}" only="${6:-}"
     local wA="${7:-1}" wB="${8:-1}"
@@ -2344,6 +2379,9 @@ write_pf_rules() {   # $1=设备A $2=网关A $3=设备B $4=网关B $5=额外排�
     if [ "$only" = "$d1" ]; then d2="$d1"; gw2="$gw1"; fi
     if [ "$only" = "$d2" ]; then d1="$d2"; gw1="$gw2"; fi
     mkdir -p "$(dirname "$PF_ANCHOR_FILE")" 2>/dev/null || return 1
+    # 临时文件和最终文件同目录：mv 才是原子 rename，跨文件系统会退化成
+    # 拷贝（非原子，中途失败会留下半套规则）
+    TMP_ANCHOR="${PF_ANCHOR_FILE}.tmp.$$"
     # 排除清单：局域网网段 + VPN/拨号网段 + 链路本地/组播/环回
     # 用 table 而非列表字面量：macOS 的 pf 不允许对 { a b c } 这样的列表取反
     list="$lan1"
@@ -2406,9 +2444,23 @@ write_pf_rules() {   # $1=设备A $2=网关A $3=设备B $4=网关B $5=额外排�
         if [ -n "$excl" ]; then
             echo "# 已排除 VPN/拨号网段: $excl"
         fi
-    } > "$PF_ANCHOR_FILE" || return 1
-    # 自校验语法：pfctl 加载失败只报 "syntax error" 不给原因，先在这里挡一道
-    pfctl -n -f "$PF_ANCHOR_FILE" >/dev/null 2>&1 || return 1
+    } > "$TMP_ANCHOR" || { rm -f "$TMP_ANCHOR"; return 1; }
+    # 自校验语法：pfctl 加载失败只报 "syntax error" 不给原因，先在这里挡一道。
+    #
+    # 必须先写临时文件、校验通过再 mv 落位，不能直接覆盖 ${PF_ANCHOR_FILE}。
+    # 直接覆盖的问题是：校验失败时，磁盘上的 anchor 文件已经是被判非法的
+    # 那一套，而内核里跑的却还是上一套好规则。于是
+    #   · balance status 的"规则内容"把文件当生效内容打印 → 显示一套
+    #     根本没跑的规则，用户照着排查完全偏离方向
+    #   · 之后每次 pfctl -f 都继续失败
+    #   · 最糟：如果有人（或系统）在那之后重新加载 pf，就会把非法规则
+    #     装进内核，分流直接失效
+    # 校验失败时保留旧文件不动，状态至少还是自洽的。
+    if ! pfctl -n -f "$TMP_ANCHOR" >/dev/null 2>&1; then
+        rm -f "$TMP_ANCHOR"
+        return 1
+    fi
+    mv "$TMP_ANCHOR" "$PF_ANCHOR_FILE" || { rm -f "$TMP_ANCHOR"; return 1; }
     return 0
 }
 

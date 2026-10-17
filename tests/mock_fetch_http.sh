@@ -125,5 +125,63 @@ else
     grep -q "错误:" "$T/g.log" && bad "空文件报错: $(tail -1 "$T/g.log")" || ok "空文件未崩溃"
 fi
 
+echo "== 8. 规则文件必须先校验再落位（P2-11）=="
+# 直接覆盖 anchor 文件的问题是：pfctl -n 校验失败时，磁盘上已经是被判
+# 非法的规则，而内核跑的却是上一套好规则。于是 balance status 的
+# "规则内容"显示一套根本没跑的规则，用户照着排查完全偏离方向；
+# 之后每次 pfctl -f 继续失败；最糟的是若有人重新加载 pf，
+# 就会把非法规则装进内核，分流直接失效。
+W="$(mktemp -d /tmp/sr_w.XXXXXX)"
+cat > "$W/run.sh" <<RUN
+. '$T/sr.sh'; trap - EXIT INT TERM HUP
+export PATH='/usr/bin:/bin:/usr/sbin:/sbin' LOCK_DIR='$T/lock'
+svc_router() { echo 192.168.1.1; }; other_nets() { echo; }
+dev_subnet() { echo 192.168.1.0/24; }; eth_wifi_same_gateway() { return 0; }
+pf_enabled() { return 1; }
+export STATE_FILE='$T/state/st' PF_ANCHOR_FILE='$W/r.conf' PF_ANCHOR='smartroute'
+pfctl() { return 0; }
+write_pf_rules en0 192.168.1.1 en1 192.168.1.1 '' '' 1 4 >/dev/null 2>&1
+md5sum "$W/r.conf" 2>/dev/null | cut -d' ' -f1 > "$W/good.md5"
+pfctl() { case "\$*" in *-n*-f*) return 1 ;; *) return 0 ;; esac; }
+write_pf_rules en0 192.168.1.1 en1 192.168.1.1 '' '' 4 1 >/dev/null 2>&1
+echo "rc=\$?"
+md5sum "$W/r.conf" 2>/dev/null | cut -d' ' -f1 > "$W/now.md5"
+echo "same=\$(cmp -s "$W/good.md5" "$W/now.md5" && echo yes || echo no)"
+echo "tmpfiles=\$(ls "$W"/r.conf.tmp.* 2>/dev/null | wc -l | tr -d ' ')"
+RUN
+out="$(bash "$W/run.sh" 2>&1)"
+echo "$out" | grep -q "rc=1" && ok "pfctl -n 校验失败时返回 1" || bad "校验失败没报错"
+echo "$out" | grep -q "same=yes" \
+    && ok "校验失败时保留旧规则（不落非法规则）" || bad "旧规则被覆盖成非法规则"
+echo "$out" | grep -q "tmpfiles=0" \
+    && ok "无临时文件残留" || bad "有临时文件残留: $(echo "$out" | grep tmpfiles)"
+rm -rf "$W"
+
+echo "== 9. 一个分片失败，其余 worker 要停手（P2-12）=="
+# 以前失败的 worker 自己 return 1，兄弟继续认领到队列空，父进程 wait
+# 全部。于是某片失败时整个文件照下（每段最长 600s），最后才报"已放弃"
+# ——消息和"其实全下完了"的行为矛盾，白费带宽和时间。
+grep -q '\[ ! -f "\$d/stop" \]' smartroute.sh \
+    && ok "worker 认领循环检查 stop 标志" || bad "worker 不认 stop 标志"
+grep -q ': > "\$T/stop"' smartroute.sh \
+    && ok "首个失败即创建 stop 标志" || bad "没有创建 stop 标志"
+grep -q "_stop_seen" smartroute.sh \
+    && ok "父进程轮询 stop 并 kill 剩余 worker" || bad "父进程不轮询，仍会干等全部"
+grep -q "白费带宽和时间" smartroute.sh \
+    && ok "注释写清了不停手的后果" || bad "没说清后果"
+# 行为验证：lying 源（字节校验必失败）应当在几秒内结束，不会跑满 600s
+_s0=$(date +%s)
+bash smartroute.sh fetch "$B/lying" -o "$T/h.bin" -n 8 --no-balance-check >"$T/h.log" 2>&1
+_s1=$(date +%s)
+if [ $(( _s1 - _s0 )) -le 20 ]; then
+    ok "失败时 ${_s0}→${_s1} 秒内结束（没把整个文件下完）"
+else
+    bad "失败后仍跑了 $(( _s1 - _s0 )) 秒"
+fi
+# 正常下载不能被 stop 机制误伤
+bash smartroute.sh fetch "$B/file/x" -o "$T/i.bin" -n 8 --no-balance-check >"$T/i.log" 2>&1
+[ -f "$T/i.bin" ] && [ "$(wc -c < "$T/i.bin" | tr -d ' ')" = "5000" ] \
+    && ok "正常 8 连接下载不受 stop 机制影响" || bad "正常下载被误伤"
+
 echo ""
 echo "结果: $PASS 通过, $FAIL 失败"
