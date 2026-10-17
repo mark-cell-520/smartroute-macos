@@ -363,5 +363,49 @@ n1fail="$(MOCK_CURL_RC=22 MOCK_HTTP_CODE=429 ev "cmd_fetch http://x/f.bin -o $T/
 echo "$n1fail" | grep -q "429" && ok "失败时报出 HTTP 429" || bad "失败时没报状态码: $(echo "$n1fail" | tail -2)"
 echo "$n1fail" | grep -q "浏览器能打开" && ok "给出可执行的排查方向" || bad "没给排查方向"
 
+echo "== 16. 分片绑接口：不依赖 pf 也让两条线一起扛 =="
+# 背景：_fetch_seg 的 curl 原来不带 --interface，所有分片都走默认路由。
+# 于是"双网并发"完全依赖 pf——而 pf 要么没加载（要 root），要么按
+# round-robin 盲分，会把一半连接赶到更慢的接口。实测这台机器就是这样：
+# MODE=wifi 时有线那条 100 Mbps 完全闲着。
+#
+# 显式 --interface 不依赖 pf：每个分片自己选出口。本机两接口同网段同网关，
+# 实测 curl --interface en0 / en1 同时下载都正常（各 ~27-33 Mbps）。
+grep -q 'curl -sS -L --fail --max-time 600 --range "${st}-${en}" \\
+                    $ifpre \\' smartroute.sh \
+    && ok "_fetch_seg 会把接口参数传给 curl" || bad "_fetch_seg 没有传接口参数"
+grep -qF 'local ifpre=""' smartroute.sh \
+    && ok "接口参数默认为空（不绑）" || bad "没有 ifpre 默认值"
+grep -qF 'dev="$(_spread_pick "$idx")"' smartroute.sh \
+    && ok "worker 按片号选接口" || bad "worker 没有按片号选接口"
+grep -qF '_fetch_seg "$idx" "$st" "$en" "$u" "$d" "$dev"' smartroute.sh \
+    && ok "选到的接口传给了 _fetch_seg" || bad "接口没传给 _fetch_seg"
+
+# _spread_pick 的行为：两个设备时必须轮询，一个设备时恒返回它，空时不绑
+_sp="$(ev '
+    _spread_devs="en0 en1"; _spread_n=2
+    _spread_pick() { [ -z "$_spread_devs" ] && { echo ""; return 0; }
+        local i="$1" k=0 d want; want=$(( i % _spread_n ))
+        for d in $_spread_devs; do
+            if [ "$k" -eq "$want" ]; then echo "$d"; return 0; fi
+            k=$(( k + 1 )); done; echo ""; }
+    for i in 0 1 2 3 4 5; do _spread_pick $i; done')"
+[ "$_sp" = "$(printf 'en0\nen1\nen0\nen1\nen0\nen1')" ] \
+    && ok "两个设备按片号轮询（0/2/4→en0，1/3/5→en1）" || bad "轮询不对: $(echo $_sp | tr '\n' ' ')"
+
+_sp1="$(ev '_spread_devs="en1"; _spread_n=1
+    _spread_pick() { [ -z "$_spread_devs" ] && { echo ""; return 0; }
+        local i="$1" k=0 d want; want=$(( i % _spread_n ))
+        for d in $_spread_devs; do
+            if [ "$k" -eq "$want" ]; then echo "$d"; return 0; fi
+            k=$(( k + 1 )); done; echo ""; }
+    for i in 0 1 2; do _spread_pick $i; done')"
+[ "$_sp1" = "$(printf 'en1\nen1\nen1')" ] \
+    && ok "只有一个设备时全部给它" || bad "单设备分配错: $(echo $_sp1 | tr '\n' ' ')"
+
+# 探测未通过时必须退回不绑——硬绑会让每个分片都失败，比不绑糟得多
+grep -qF '[ "$_spread_ok" = "1" ] || _spread_devs=""' smartroute.sh \
+    && ok "探测失败时退回不绑" || bad "探测失败没有退回，会全军覆没"
+
 echo ""
 echo "结果: $((PASS - FAIL)) 通过, $FAIL 失败"

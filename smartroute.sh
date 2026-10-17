@@ -2274,6 +2274,50 @@ MSG
         return 1
     fi
 
+    # ── 分片绑接口：让两条线一起扛一个文件 ──
+    #
+    # 为什么必须显式绑：_fetch_seg 的 curl 原来不带 --interface，所有分片都走
+    # 默认路由。于是"双网并发"完全依赖 pf 把连接分摊到两个接口——而 pf 要么
+    # 没加载（要 root），要么按 round-robin 盲分，会把一半连接赶到更慢的接口。
+    #
+    # 显式 --interface 不依赖 pf：每个分片自己选出口。本机两个接口同网段同网关，
+    # 实测 curl --interface en0 / --interface en1 同时下载都正常（各 ~27-33 Mbps）。
+    # 按片号轮询分配，不需要知道两条线各多快，也不需要测速——这是自平衡的。
+    local _spread_devs="" _spread_n=0 _spread_ok=1 _d
+    if [ -n "$ACTIVE_ETH_DEV" ] && [ -n "$ACTIVE_WIFI_DEV" ]; then
+        _spread_devs="$ACTIVE_ETH_DEV $ACTIVE_WIFI_DEV"
+    elif [ -n "$ACTIVE_ETH_DEV" ]; then
+        _spread_devs="$ACTIVE_ETH_DEV"
+    elif [ -n "$ACTIVE_WIFI_DEV" ]; then
+        _spread_devs="$ACTIVE_WIFI_DEV"
+    fi
+    for _d in $_spread_devs; do _spread_n=$(( _spread_n + 1 )); done
+    # 先验证 --interface 真的能用，不能用就退回不绑（走默认路由）。
+    # 硬绑会让每个分片都失败，那比不绑糟得多。探测只取 1 字节，很便宜。
+    if [ "$_spread_n" -gt 1 ]; then
+        for _d in $_spread_devs; do
+            curl -s --interface "$_d" --max-time 8 -o /dev/null -r 0-0 \
+                 "$url" 2>/dev/null || _spread_ok=0
+        done
+        [ "$_spread_ok" = "1" ] || _spread_devs=""
+    fi
+    if [ -n "$_spread_devs" ]; then
+        echo "  分片将分摊到 $(echo $_spread_devs | tr ' ' '/')（显式绑接口，不依赖 pf）"
+    else
+        echo "  分片走默认路由（只有一条可用链路，或 --interface 探测未通过）"
+    fi
+    # 片号 -> 设备名。空表示不绑。
+    _spread_pick() {   # $1=片号 -> stdout: 设备名
+        [ -z "$_spread_devs" ] && { echo ""; return 0; }
+        local i="$1" k=0 d want
+        want=$(( i % _spread_n ))
+        for d in $_spread_devs; do
+            if [ "$k" -eq "$want" ]; then echo "$d"; return 0; fi
+            k=$(( k + 1 ))
+        done
+        echo ""
+    }
+
     local chunk total_chunks
     total_chunks=128
     [ "$total_chunks" -gt "$size" ] && total_chunks="$size"
@@ -2308,12 +2352,17 @@ MSG
     # 以前没加 --fail：HTTP 404 时 curl 返回 0、把错误页写进分片文件，
     # 于是走到"字节数不符"分支，重试 3 次后报"服务端 Range 行为不一致"——
     # 诊断完全错误，用户会跑去换源，而真正的原因只是 URL 写错了。
-    _fetch_seg() {   # $1=分片号 $2=start $3=end $4=URL $5=目录
-        local idx="$1" st="$2" en="$3" u="$4" d="$5" try got http rc
+    _fetch_seg() {   # $1=分片号 $2=start $3=end $4=URL $5=目录 $6=设备(空=不绑)
+        local idx="$1" st="$2" en="$3" u="$4" d="$5" dev="${6:-}" try got http rc
+        # 不用数组拼 --interface：bash 3.2 下空数组展开有坑，而设备名
+        # （en0/en1）不可能含空格，未加引号的 $ifpre 展开是安全的。
+        local ifpre=""
+        [ -n "$dev" ] && ifpre="--interface $dev"
         for try in 1 2 3; do
             # --fail 让 4xx/5xx 返回非 0；-w 把状态码写出来，即使失败也有值
             # （连不上时是 000，正好和 HTTP 错误区分开）。
             http="$(curl -sS -L --fail --max-time 600 --range "${st}-${en}" \
+                    $ifpre \
                     -o "$d/p$idx" -w '%{http_code}' "$u" 2>/dev/null)"
             rc=$?
             if [ "$rc" -eq 0 ]; then
@@ -2342,7 +2391,7 @@ MSG
     # 笼统的"下载失败"会让用户以为是网络问题；实测多数是服务端 Range 行为
     # 不一致（报了 31402 字节却返回 87533），这两种的处理完全不同。
     _fetch_worker() {   # $1=队列目录 $2=总片数 $3=URL $4=分片目录 $5=片大小 $6=文件大小
-        local q="$1" total="$2" u="$3" d="$4" cs="$5" sz="$6" idx st en want got
+        local q="$1" total="$2" u="$3" d="$4" cs="$5" sz="$6" idx st en want got dev
         # 中断（用户 Ctrl-C）或别处失败（stop 标志）都要停手。
         # 用 ${d} 而不是 ${T}：${d} 是本函数的参数，不依赖 cmd_fetch 的局部
         # 变量通过动态作用域透进来——那在重构时很容易悄悄失效。
@@ -2353,7 +2402,12 @@ MSG
             # 最后一片可能超出文件末尾，截断
             [ "$en" -gt $(( sz - 1 )) ] && en=$(( sz - 1 ))
             want=$(( en - st + 1 ))
-            if ! _fetch_seg "$idx" "$st" "$en" "$u" "$d"; then
+            # 按片号轮询绑接口。放在 worker 里算而不是按 worker 分工：
+            # 按 worker 分工的话，4 个 worker 里 2 个绑 en0、2 个绑 en1，
+            # 一旦某条线慢，它上面那两个 worker 就拖着整个下载；
+            # 按片号轮询则快的 worker 认领更多片，天然自平衡。
+            dev="$(_spread_pick "$idx")"
+            if ! _fetch_seg "$idx" "$st" "$en" "$u" "$d" "$dev"; then
                 # 注意：不能写 wc -c < "$d/p$idx" 2>/dev/null。
                 # bash 按从左到右处理重定向，< 先执行——文件打不开时
                 # shell 自己报的错发生在 2>/dev/null 生效**之前**，
