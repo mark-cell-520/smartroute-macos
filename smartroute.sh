@@ -55,6 +55,9 @@ FASTEST_SWITCH_RATIO=20     # 判定"明显更快"的延迟差阈值（百分比
                             # 避免在两条差不多的线路间来回切
 FASTEST_RECHECK=12          # fastest 模式下守护进程重新测延迟的轮询次数（每轮约 20 秒）
 WEIGHT_RECHECK=30           # weighted 模式下重测吞吐、更新配比的轮询次数（每轮约 20 秒）
+VALIDATE_MIN_BYTES=65536    # balance_validate 判定"某侧真的在扛"的字节下限
+                           # Wi-Fi 关联着就有 mDNS/ARP/DHCP/iCloud 心跳，
+                           # 只判 >0 会把背景流量当成分流生效的证据。
                            # 30 轮 ≈ 10 分钟。测速本身有 SPEED_RECHECK(300s) 缓存兜底，
                            # 不会每个轮询都真下载；但轮询太频会反复 pfctl -f 重建 anchor。
 WIFI_FAILOVER=0             # Wi-Fi 上不了网时，自动试连其它已保存的 Wi-Fi（1 开启）
@@ -95,7 +98,16 @@ conf_value_ok() {
     local key="$1" val="$2"
     case "$key" in
         MODE)          case "$val" in auto|ethernet|wifi|speed|latency) ;; *) return 1 ;; esac ;;
-        BALANCE_MODE)  case "$val" in round-robin|fastest) ;; *) return 1 ;; esac ;;
+        # weighted 必须在白名单里。以前漏了它，而 balance_on 自己会
+        # conf_set_auto BALANCE_MODE weighted ——于是工具写进去的值，
+        # 下一次重新加载配置时（守护进程每 20 秒、或任何新进程）被解析层
+        # 丢弃、回落默认 round-robin。后果：
+        #   · smartroute config 同屏自相矛盾："当前生效配置"显示 round-robin，
+        #     下方"配置文件内容"显示 weighted
+        #   · set BALANCE_MODE=weighted 被拒（提示"只能是 round-robin|fastest"），
+        #     尽管这个值是工具自己生成的
+        #   · weighted 会话之后裸跑 balance on，静默变成 round-robin
+        BALANCE_MODE)  case "$val" in round-robin|fastest|weighted) ;; *) return 1 ;; esac ;;
         OK_N|FAIL_N|COOLDOWN|PING_TIMEOUT|NC_TIMEOUT|FASTEST_SWITCH_RATIO|FASTEST_RECHECK|WIFI_FAILOVER_COOLDOWN|SPEED_TEST_TIMEOUT|SPEED_RECHECK|LATENCY_RECHECK|SPEED_SWITCH_RATIO)
                        case "$val" in ''|*[!0-9]*) return 1 ;; esac ;;
         TLS_PROBE|NOTIFY|AUTO_WIFI_POWER|BALANCE|WIFI_FAILOVER)
@@ -113,7 +125,7 @@ conf_value_ok() {
 conf_value_hint() {   # $1=key -> stdout: 说明
     case "$1" in
         MODE)          echo "MODE 只能是 auto|ethernet|wifi|speed|latency" ;;
-        BALANCE_MODE)  echo "BALANCE_MODE 只能是 round-robin|fastest" ;;
+        BALANCE_MODE)  echo "BALANCE_MODE 只能是 round-robin|fastest|weighted" ;;
         OK_N|FAIL_N|COOLDOWN|PING_TIMEOUT|NC_TIMEOUT|FASTEST_SWITCH_RATIO|FASTEST_RECHECK|WIFI_FAILOVER_COOLDOWN|SPEED_TEST_TIMEOUT|SPEED_RECHECK|LATENCY_RECHECK|SPEED_SWITCH_RATIO)
                        echo "$1 必须是非负整数" ;;
         TLS_PROBE|NOTIFY|AUTO_WIFI_POWER|BALANCE|WIFI_FAILOVER)
@@ -194,7 +206,7 @@ usage() {
   log [N]      查看最近日志（log 40 或 log --lines 40，默认 50 行）
 
 双网并发 / 分流:
-  balance on [round-robin|fastest]
+  balance on [round-robin|fastest|weighted]
                 开启双网并发分流（需 sudo；两个接口都要有外网，自动验证，失败自动还原）
                   round-robin  新连接在两个接口间轮询，带宽可叠加（默认）
                   fastest      先测两边延迟，只走更快的那条；守护进程定期重测，变慢自动改道
@@ -1723,8 +1735,21 @@ cmd_fetch() {   # $1=URL [-o 输出] [-n 连接数] [--no-balance-check]
     local url="" out="" n=8 check=1 a
     while [ $# -gt 0 ]; do
         case "$1" in
-            -o|--output) out="$2"; shift 2 ;;
-            -n|--conns)  n="$2"; shift 2 ;;
+            # 两个必须校验的地方：
+            #  1) 后面还有没有参数。没有时 bash 的 shift 2 失败且**不移位**，
+            #     while 循环原地打转——无输出、CPU 打满、永远卡死。
+            #  2) 参数值不能以 - 开头。否则 "-o --no-balance-check" 会把
+            #     选项名当成文件名，真的建出一个叫 "--no-balance-check" 的文件；
+            #     "-n --no-balance-check" 则报一句"连接数必须是正整数"，
+            #     完全指不到真正的原因（漏写了值）。
+            -o|--output)
+                [ $# -ge 2 ] || die "-o/--output 需要一个参数（输出文件名）"
+                case "$2" in -*) die "-o/--output 的参数不能以 - 开头: $2（是不是漏写了文件名？）" ;; esac
+                out="$2"; shift 2 ;;
+            -n|--conns)
+                [ $# -ge 2 ] || die "-n/--conns 需要一个参数（连接数）"
+                case "$2" in -*) die "-n/--conns 的参数不能以 - 开头: $2（是不是漏写了连接数？）" ;; esac
+                n="$2"; shift 2 ;;
             --no-balance-check) check=0; shift ;;
             -h|--help)
                 cat <<'USAGE'
@@ -1791,7 +1816,15 @@ MSG
     local probe_hdr probe_code size="" cr_size="" head_size=""
     probe_hdr="$(curl -sS -L -D - -o /dev/null --range 999999999- --max-time 20 "$url" 2>/dev/null)"
     [ -n "$probe_hdr" ] || die "取不到响应（网络不通或 URL 无效）"
-    probe_code="$(printf '%s\n' "$probe_hdr" | awk 'NR==1{print $2; exit}')"
+    # 必须取**最后一条**状态行，不是第一条。
+    # curl -L -D - 会把重定向链上每一跳的响应头都打出来，NR==1 拿到的是
+    # 第一跳的 302，而不是最终响应的 416/206。
+    # 实测：本地 302→416 服务，首行是 "HTTP/1.0 302 Found"，末行才是
+    # "HTTP/1.0 416 Requested Range Not Satisfiable"。
+    # 后果曾是：所有会跳转的 URL（github release、bit.ly、绝大多数 CDN 直链）
+    # 都被判成"服务端不支持 Range"，双网叠加静默退化成单连接，
+    # 还提示用户"换一个支持 Range 的源"——一个自信的错判。
+    probe_code="$(printf '%s\n' "$probe_hdr" | awk '/^HTTP\//{c=$2} END{print c+0}')"
     # Content-Range: bytes */31402 —— 斜杠后就是总大小。
     # 取冒号之后的全部内容，不能用 $2：值形如 "bytes */31402"，
     # $2 是单位 "bytes"、$3 才是 "*/31402"。用 $2 会永远拿不到大小，
@@ -1871,6 +1904,15 @@ MSG
     T="$(mktemp -d /tmp/smartroute_fetch.XXXXXX)" || die "建不了临时目录"
     # 无论成功失败都要清理，否则 /tmp 里堆一堆分片。
     #
+    # 三个 trap 各自的职责（缺一个就会出问题）：
+    #   RETURN      —— 函数正常返回时清理（语义见下）。
+    #   INT/TERM/HUP—— 用户按 Ctrl-C 或进程被杀时清理。
+    #   EXIT        —— die 走到 exit 时清理。**必须加**：die 调 exit，
+    #                   而 exit 不触发 RETURN。以前只挂了前两类，
+    #                   于是每条 die 路径都泄漏 /tmp/smartroute_fetch.XXXXXX
+    #                   （10GB 文件坏一个分片就留下约 10GB，静默吃盘），
+    #                   而错误信息还写着"临时文件已清理"——谎报。
+    #
     # 关于 RETURN trap 的语义（实测确认，改动前先看这里）：
     # bash 的 RETURN trap 只在**设置它的那个函数**返回时触发，不会被它调用的
     # 函数继承——所以下面 _claim_chunk/_fetch_seg/_fetch_worker 返回时不会
@@ -1880,7 +1922,13 @@ MSG
     # 等助手函数移到 cmd_fetch 外面（变成先定义、后设 trap），RETURN trap
     # 就会在助手函数返回时触发、把 $T 删掉，下载全线失败。
     # 要外移助手函数的话，请把清理改成显式调用 + 只保留 INT/TERM/HUP 信号 trap。
-    trap 'rm -rf "$T"' RETURN INT TERM HUP
+    #
+    # 中断处理：以前 Ctrl-C 后 trap 只删临时目录，父进程继续 wait 全部
+    # worker（每段最长 600s），最后打一句"有分片下载失败（已重试 3 次）"
+    # ——事实上零次重试、是用户主动取消，纯假消息。
+    # 现在置 _fetch_aborted 标志让 worker 停下，wait 之后据此说"已取消"。
+    trap '_fetch_aborted=1; rm -rf "$T"' INT TERM HUP
+    trap 'rm -rf "$T"' RETURN EXIT
 
     # ── 工作队列，而不是固定切分 ──
     #
@@ -1956,7 +2004,7 @@ MSG
     # 不一致（报了 31402 字节却返回 87533），这两种的处理完全不同。
     _fetch_worker() {   # $1=队列目录 $2=总片数 $3=URL $4=分片目录 $5=片大小 $6=文件大小
         local q="$1" total="$2" u="$3" d="$4" cs="$5" sz="$6" idx st en want got
-        while idx="$(_claim_chunk "$q" "$total")"; do
+        while [ "${_fetch_aborted:-0}" != "1" ] && idx="$(_claim_chunk "$q" "$total")"; do
             st=$(( idx * cs ))
             en=$(( st + cs - 1 ))
             # 最后一片可能超出文件末尾，截断
@@ -1991,6 +2039,12 @@ MSG
     for p in ${pids[@]+"${pids[@]}"}; do
         wait "$p" || rc=1
     done
+    if [ "${_fetch_aborted:-0}" = "1" ]; then
+        # 用户主动取消。不能说成"下载失败（已重试 3 次）"——零次重试，
+        # 是用户自己打断的，那句话是假的。
+        echo "已取消（临时文件已清理）。"
+        return 1
+    fi
     if [ "$rc" -ne 0 ]; then
         # 把失败原因说清楚：是连接不通，还是服务端 Range 行为不一致。
         # 后者要换源，前者才该降低 -n——笼统一句"下载失败"等于让用户瞎猜。
@@ -2143,8 +2197,15 @@ MSG
     # 结论必须建立在**新鲜**的测速值上。缓存可能已过期（SPEED_RECHECK=300s），
     # 拿 5 分钟前的速度判"聚合没赚到"，会把一次正常的慢下载说成功能无效——
     # 比不说更糟。过期就不下结论，只说明为什么没结论。
+    #
+    # 两边都要查：_fast 取两者之大，只要有一边是旧的，"上限"就是错的。
+    # 只查一边等于没查——旧的那一边正好可能是被当成上限的那个。
     local _fresh=1
-    [ -n "$_pe" ] && _metric_fresh "speed_$ACTIVE_ETH_DEV" "$SPEED_RECHECK" && _fresh=0
+    if [ -n "$_pe" ] && [ -n "$_pw" ] \
+       && _metric_fresh "speed_$ACTIVE_ETH_DEV" "$SPEED_RECHECK" \
+       && _metric_fresh "speed_$ACTIVE_WIFI_DEV" "$SPEED_RECHECK"; then
+        _fresh=0
+    fi
     if [ -n "$_pe" ] && [ -n "$_pw" ] && [ "${_pe:-0}" -gt 0 ] 2>/dev/null \
        && [ "${_pw:-0}" -gt 0 ] 2>/dev/null && [ "$_fresh" = "0" ]; then
         # 超过快线单独速度的 80% 就算"基本吃满了快线"
@@ -2399,19 +2460,38 @@ balance_validate() {   # $1=设备A $2=IP-A $3=设备B $4=IP-B $5=只走的设�
     o2b="$(netstat -I "$d2" -b 2>/dev/null | sed -n '2p' | awk '{print $10}')"
     if [ -n "$o1a" ] && [ -n "$o1b" ] && [ -n "$o2a" ] && [ -n "$o2b" ]; then
         g1=$((o1b - o1a)); g2=$((o2b - o2a))
-        local bad_if="" bad_g=0
+        # 只有"字节数 > 0"是不够的。Wi-Fi 只要关联着就永远有背景流量
+        # （mDNS/ARP/DHCP/iCloud 心跳），实测几百字节起步。
+        # 于是 pf route-to 根本没生效时，这一侧也"有流量"——验证通过、
+        # 打出"✅ 已开启"，而用户拿着这份假证据去排查其他方向，
+        # 比没有检查更糟。
+        #
+        # 两个条件同时满足才算这一侧真的在扛：
+        #   · 绝对量够大：>= VALIDATE_MIN_BYTES（64KB）。
+        #     10 个连通性探测本身就会产生远大于此的出站流量，
+        #     所以真分流时轻松超过；纯背景心跳到不了。
+        #   · 占比别太低：>= 10%。防止一侧扛了 4GB、另一侧 70KB
+        #     这种"看起来分流了、其实全在一条线上"的情况。
+        local bad_if="" bad_g=0 _tot=$(( g1 + g2 )) _min_pct=10
+        local _p1=0 _p2=0
+        [ "$_tot" -gt 0 ] && { _p1=$(( g1 * 100 / _tot )); _p2=$(( g2 * 100 / _tot )); }
+        # 某一侧是否"真的在扛"
+        _d1_ok() { [ "$g1" -ge "$VALIDATE_MIN_BYTES" ] && [ "$_p1" -ge "$_min_pct" ]; }
+        _d2_ok() { [ "$g2" -ge "$VALIDATE_MIN_BYTES" ] && [ "$_p2" -ge "$_min_pct" ]; }
         if [ "$only" = "$d1" ]; then
-            [ "$g1" -le 0 ] && { bad_if="$d1"; bad_g="$g1"; }
+            _d1_ok || { bad_if="$d1"; bad_g="$g1"; }
         elif [ "$only" = "$d2" ]; then
-            [ "$g2" -le 0 ] && { bad_if="$d2"; bad_g="$g2"; }
+            _d2_ok || { bad_if="$d2"; bad_g="$g2"; }
         else
-            if   [ "$g1" -le 0 ] && [ "$g2" -le 0 ]; then bad_if="$d1/$d2"; bad_g="0/0"
-            elif [ "$g1" -le 0 ]; then bad_if="$d1"; bad_g="$g1"
-            elif [ "$g2" -le 0 ]; then bad_if="$d2"; bad_g="$g2"; fi
+            if   ! _d1_ok && ! _d2_ok; then bad_if="$d1/$d2"; bad_g="$g1/$g2"
+            elif ! _d1_ok; then bad_if="$d1"; bad_g="$g1"
+            elif ! _d2_ok; then bad_if="$d2"; bad_g="$g2"; fi
         fi
         if [ -n "$bad_if" ]; then
             log "并发分流验证失败: 流量未走预期接口 ($bad_if +$bad_g 字节, $d1 +$g1 / $d2 +$g2)"
-            echo "验证失败：流量没有走预期接口（$d1 +$g1 字节，$d2 +$g2 字节），已自动还原" >&2
+            echo "验证失败：流量没有走预期接口（$d1 +$g1 字节/${_p1}%，$d2 +$g2 字节/${_p2}%），已自动还原" >&2
+            echo "         （判定标准：单侧至少 ${VALIDATE_MIN_BYTES} 字节且占比 ≥10%；" >&2
+            echo "           低于此更可能是背景心跳，不是分流生效）" >&2
             echo "提示：本机 macOS 的 pf 可能未对出站流量生效 route-to。" >&2
             return 1
         fi
@@ -2432,7 +2512,7 @@ balance_on() {
         die "检测到全流量 VPN（默认路由或 0/1+128/1 由 VPN 持有），无法安全分流，请先断开 VPN"
     fi
 
-    # 模式: balance on [round-robin|fastest] [--force]
+    # 模式: balance on [round-robin|fastest|weighted] [--force]
     # --force 要先从参数里摘掉，再解析模式。否则 mode 会变成 "--force"，
     # 落到下面的 *) 直接报"用法"错误——同网关时想强行验证 pf 规则根本用不了。
     local mode="" a
@@ -2630,7 +2710,7 @@ cmd_balance() {
         on|enable|start)  shift; balance_on "$@" ;;
         off|disable|stop) balance_off ;;
         status|st)        balance_status ;;
-        *) die "用法: smartroute balance on [round-robin|fastest] | off | status" ;;
+        *) die "用法: smartroute balance on [round-robin|fastest|weighted] | off | status" ;;
     esac
 }
 

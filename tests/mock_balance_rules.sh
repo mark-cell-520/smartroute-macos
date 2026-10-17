@@ -53,10 +53,16 @@ cat > "$T/bin/netstat" <<'EOF'
 if [ "${1:-}" = "-rn" ]; then
   cat "$MOCK_ROUTES" 2>/dev/null
 elif [ "${1:-}" = "-I" ]; then
-  # 计数器每次 +1000 模拟流量增长；MOCK_FROZEN 指定的接口不增长
+  # 计数器每次 +70000 模拟流量增长；MOCK_FROZEN 指定的接口不增长。
+  # 为什么是 70000 而不是 1000：balance_validate 用两次采样的差值判断
+  # "某侧是否真的在扛"。以前这里 +1000，于是测试固化了一个错误假设——
+  # "两边都有流量就算分流生效"。而真实情况是 10 个连通性探测
+  # （ping 64B + nc + curl TLS）产生的出站流量就在几十 KB 以上，
+  # 而 Wi-Fi 纯背景心跳（mDNS/ARP/DHCP/iCloud）只有几百字节。
+  # 1000 这个量级正好落在"背景心跳"区间，用来验证分流是错的。
   f="$MOCK_BYTES_DIR/$2"
   b=$(cat "$f" 2>/dev/null || echo 0)
-  if [ "${MOCK_FROZEN:-}" != "$2" ]; then b=$((b + 1000)); echo "$b" > "$f"; fi
+  if [ "${MOCK_FROZEN:-}" != "$2" ]; then b=$((b + 70000)); echo "$b" > "$f"; fi
   printf 'Name  Mtu  Network  Address  Ipkts Ierrs  Ibytes  Opkts Oerrs  Obytes  Coll\n'
   printf '%-6s 1500  <Link>  aa:bb   100  0  %s  50  0  %s  0\n' "$2" "$((b*2))" "$b"
 fi
@@ -204,6 +210,33 @@ echo "== 4. balance_validate =="
 export MOCK_NET_OK=1 MOCK_FROZEN=""
 : > "$MOCK_LOG"
 run "balance_validate en0 192.168.2.36 en1 192.168.1.5" >/dev/null && ok "两接口都有流量时验证通过" || bad "两接口都有流量时应通过"
+
+echo "== 4a. 背景心跳量级的流量 → 应判失败（修 P0-3）=="
+# 以前只判"字节数 > 0"。Wi-Fi 只要关联着就永远有背景流量
+# （mDNS/ARP/DHCP/iCloud 心跳，几百字节起步），于是 pf route-to
+# 根本没生效时这一侧也"有流量"——验证通过、打出"✅ 已开启"，
+# 用户拿着这份假证据去排查其他方向，比没有检查更糟。
+cat > "$T/bin/netstat_small" <<'SMALL'
+#!/bin/bash
+f="$MOCK_BYTES_DIR/$2"
+b=$(cat "$f" 2>/dev/null || echo 0)
+if [ "${MOCK_FROZEN:-}" != "$2" ]; then b=$((b + 300)); echo "$b" > "$f"; fi
+printf 'Name  Mtu  Network  Address  Ipkts Ierrs  Ibytes  Opkts Oerrs  Obytes  Coll\n'
+printf '%-6s 1500  <Link>  aa:bb   100  0  %s  50  0  %s  0\n' "$2" "$((b*2))" "$b"
+SMALL
+chmod +x "$T/bin/netstat_small"
+mkdir -p "$T/bytes_small"; rm -f "$T/bytes_small"/* 2>/dev/null
+out="$(MOCK_BYTES_DIR="$T/bytes_small" PATH="$T/bin_small:$PATH" \
+      bash -c "cp '$T/bin/netstat_small' '$T/bin_small/netstat'; chmod +x '$T/bin_small/netstat'
+        export PATH='$T/bin_small:/usr/bin:/bin:/usr/sbin:/sbin'
+        export LOCK_DIR='$T/lock' STATE_FILE='$T/state/st' PF_ANCHOR_FILE='$T/none'
+        . '$T/sr.sh'; trap - EXIT INT TERM HUP
+        export MOCK_BYTES_DIR='$T/bytes_small'
+        balance_validate en0 192.168.2.36 en1 192.168.1.5" 2>&1)"
+echo "$out" | grep -q "验证失败" \
+    && ok "几百字节的背景心跳判为失败（不当成分流证据）" || bad "背景心跳被当成分流生效"
+echo "$out" | grep -q "判定标准" \
+    && ok "说明了判定标准（单侧 ≥64KB 且占比 ≥10%）" || bad "没说判定标准"
 
 echo "== 4b. 单接口无流量 → 应失败 =="
 export MOCK_FROZEN="en1"

@@ -184,6 +184,12 @@ grep -q 'bps=$(( size \* 8 / t_dur ))' smartroute.sh \
     && bad "还在乘两次 8" || ok "没有重复乘 8"
 grep -q '_metric_fresh "speed_\$ACTIVE_ETH_DEV" "\$SPEED_RECHECK"' smartroute.sh \
     && ok "结论前检查测速缓存是否过期" || bad "拿过期测速值下结论"
+# 两边都要查：_fast 取两者之大，只查一边等于没查——
+# 旧的那一边正好可能是被当成上限的那个。
+[ "$(grep -c '_metric_fresh "speed_' smartroute.sh)" -ge 3 ] \
+    && ok "两边都查新鲜度（ensure_throughput 1 处 + 结论 2 处）" || bad "只查了一边的新鲜度"
+grep -q "两边都要查" smartroute.sh \
+    && ok "注释说明为什么必须查两边" || bad "没说为什么要查两边"
 grep -q "无法判断并发是否带来收益" smartroute.sh \
     && ok "缓存过期时明说无法判断（不下错结论）" || bad "过期时仍下结论"
 grep -q 't_ns_now="$(date +%s%N)"' smartroute.sh \
