@@ -30,7 +30,12 @@
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # ---------------- 默认配置（可被 /etc/smartroute.conf 覆盖） ----------------
-MODE="auto"                 # auto | ethernet | wifi
+MODE="auto"                 # auto | ethernet | wifi | speed | latency
+                            #   auto     可用性优先：一条线没网就切到另一条（滞回，防抖）
+                            #   speed    网速优先：实测吞吐大的赢；一条线没网时同样会切过去
+                            #            （所以它同时覆盖"无网络自动切换"和"网速增加"）
+                            #   latency  延迟优先：实测延迟低的赢，同样带可用性兜底
+                            #   ethernet / wifi  固定一条线，另一条彻底不用
 OK_N=2                      # 连续探测成功 N 次 → 判定“可用”
 FAIL_N=3                    # 连续探测失败 N 次 → 判定“不可用”
 RECONFIRM_DELAY=3           # 当前接口首次探测失败后，多久做一次当场确认（秒）
@@ -233,7 +238,8 @@ usage() {
   status       查看当前网络状态与选路决策（只读）
   test [-v]    手动探测各接口外网连通性（-v 显示分层明细，不切换）
   doctor       一键体检：定位“为什么上不了网”（网关/DNS/HTTPS/门户/网段冲突）
-  set          设置选路模式: auto | ethernet | wifi；也可 set KEY=VALUE（如 NOTIFY=1，普通用户可写用户级配置）
+  set          设置选路模式: auto | ethernet | wifi | speed | latency；也可 set KEY=VALUE（如 NOTIFY=1，普通用户可写用户级配置）
+  boost        一键配好四项能力：无网络自动切换 + 网速优先 + 双网并发 + Wi-Fi 自动寻找
   config       显示当前生效配置（含两个配置文件内容）
   log [N]      查看最近日志（log 40 或 log --lines 40，默认 50 行）
 
@@ -1292,12 +1298,20 @@ cmd_set() {
 
 # 写入配置到指定文件（内部使用）
 conf_set() {   # $1=KEY $2=VALUE $3=目标文件
-    local key="$1" val="$2" target="$3" cu tmp
+    local key="$1" val="$2" target="$3" cu tmp _rc
     if [ -f "$target" ]; then
         # 路径一：同目录临时文件 + 原子替换（最稳，但 /Users/Shared 带 sticky 位时
         # 非属主 mv 会 EPERM）
+        #
+        # grep -v 的退出码必须显式放行 1。grep 返回 1 的语义是"没有行被选中"，
+        # 不是出错。空配置文件（0 字节，或被 truncate 过）走这支时，grep -v
+        # 输出空、返回 1，于是整个 && 链短路，**写入被静默判成失败**——用户看到
+        # "写入 xxx 失败"，而文件其实完好、权限也没问题，完全无法排查。
+        # 只有退出码 >=2 才是真的 grep 出错（文件不存在/不可读）。
         tmp="$3.tmp.$$"
-        if { grep -v "^$key=" "$target" > "$tmp"; } 2>/dev/null && \
+        _rc=0
+        grep -v "^$key=" "$target" > "$tmp" 2>/dev/null || _rc=$?
+        if [ "$_rc" -le 1 ] && \
            printf '%s=%s\n' "$key" "$val" >> "$tmp" 2>/dev/null && \
            mv "$tmp" "$target" 2>/dev/null; then
             :
@@ -1305,7 +1319,9 @@ conf_set() {   # $1=KEY $2=VALUE $3=目标文件
             rm -f "$tmp" 2>/dev/null
             # 路径二：退化成原地覆写（目录不可写但文件本身可写时用）
             tmp="${TMPDIR:-/tmp}/smartroute.conf.$$"
-            if grep -v "^$key=" "$target" > "$tmp" 2>/dev/null && \
+            _rc=0
+            grep -v "^$key=" "$target" > "$tmp" 2>/dev/null || _rc=$?
+            if [ "$_rc" -le 1 ] && \
                printf '%s=%s\n' "$key" "$val" >> "$tmp" 2>/dev/null && \
                cat "$tmp" > "$target" 2>/dev/null; then
                 rm -f "$tmp" 2>/dev/null
@@ -1727,7 +1743,9 @@ valid_dev() {   # $1=设备名 -> 0 存在
 }
 
 cmd_rule() {
-    local sub="${1:-list}"
+    local sub="${1:-list}" _rc
+    # _rc 必须在这里声明：add/del 两个分支都靠它接 grep -v 的退出码，
+    # 不声明就会漏到全局作用域，被别的函数读写造成难以定位的串味。
     case "$sub" in
         add)
             local cidr="$2" dev="$3"
@@ -1740,7 +1758,11 @@ cmd_rule() {
                 printf '# smartroute 分流规则：每行 "CIDR 接口"，守护进程（root）自动应用\n' > "$RULES_FILE" 2>/dev/null \
                     || die "无法创建 $RULES_FILE"
             fi
-            grep -v "^$cidr[[:space:]]" "$RULES_FILE" > "$RULES_FILE.tmp" 2>/dev/null && mv "$RULES_FILE.tmp" "$RULES_FILE"
+            # 同 rule del：空规则文件时 grep -v 返回 1，不能直接用 && 串
+            _rc=0
+            grep -v "^$cidr[[:space:]]" "$RULES_FILE" > "$RULES_FILE.tmp" 2>/dev/null || _rc=$?
+            [ "$_rc" -le 1 ] && mv "$RULES_FILE.tmp" "$RULES_FILE" 2>/dev/null
+            [ "$_rc" -gt 1 ] && { rm -f "$RULES_FILE.tmp"; die "读取 $RULES_FILE 失败"; }
             printf '%s %s\n' "$cidr" "$dev" >> "$RULES_FILE" || die "写入 $RULES_FILE 失败"
             echo "已添加规则: $cidr -> $dev"
             echo "守护进程将在 ≤20 秒内应用；可 sudo smartroute watch 立即应用"
@@ -1749,7 +1771,17 @@ cmd_rule() {
             local cidr="$2"
             [ -n "$cidr" ] || die "用法: smartroute rule del <CIDR>"
             [ -f "$RULES_FILE" ] || die "规则文件不存在（${RULES_FILE}）"
-            grep -v "^$cidr[[:space:]]" "$RULES_FILE" > "$RULES_FILE.tmp" 2>/dev/null && mv "$RULES_FILE.tmp" "$RULES_FILE"
+            # grep -v 返回 1 是"没有行被选中"（删的是最后一条规则时就会这样），
+            # 不是出错。用 && 串起来会让删除最后一条规则时 mv 不执行，
+            # 而下一行照样打印"已删除规则"——规则还在，却告诉用户删好了。
+            _rc=0
+            grep -v "^$cidr[[:space:]]" "$RULES_FILE" > "$RULES_FILE.tmp" 2>/dev/null || _rc=$?
+            if [ "$_rc" -le 1 ]; then
+                mv "$RULES_FILE.tmp" "$RULES_FILE" 2>/dev/null || die "写入 $RULES_FILE 失败"
+            else
+                rm -f "$RULES_FILE.tmp" 2>/dev/null
+                die "读取 $RULES_FILE 失败"
+            fi
             echo "已删除规则: $cidr"
             echo "守护进程将在 ≤20 秒内移除对应路由；可 sudo smartroute watch 立即生效"
             ;;
@@ -2432,6 +2464,101 @@ MSG
         echo "      先跑 sudo smartroute speed（或等守护进程自动测速）后再试。"
     fi
     return 0
+}
+
+# 写一个配置键，成功返回 0。给 cmd_boost 用——它要连续写多个键，
+# 每个都要单独报成功/失败，不能一个失败就 die 把后面的全跳过。
+#
+# 为什么不复用 cmd_set：cmd_set 末尾直接 echo + exit，且参数解析把
+# "speed" 这种裸词映射成 MODE。boost 要的是纯粹的 KEY VALUE 语义。
+# 校验和写入目标的选择则完全复用 cmd_set 的逻辑（conf_value_ok +
+# USER_CONF 优先），否则会出现"set 能写、boost 写不进去"的分裂。
+conf_set_kv() {   # $1=KEY $2=VALUE
+    local key="$1" val="$2" target
+    case " $VALID_KEYS " in
+        *" $key "*) ;;
+        *) echo "  ❌ 不支持的配置项: $key"; return 1 ;;
+    esac
+    conf_value_ok "$key" "$val" || {
+        echo "  ❌ $key 的值不合法: $val"
+        conf_value_hint "$key"
+        return 1
+    }
+    if [ -w "$USER_CONF" ] || [ -w "$(dirname "$USER_CONF")" ]; then
+        target="$USER_CONF"
+    elif [ "$(id -u)" -eq 0 ]; then
+        target="$CONF"
+    else
+        echo "  ❌ 无法写入 ${USER_CONF}（可能属于 root）。请执行: sudo chown \$(id -u) $USER_CONF"
+        return 1
+    fi
+    conf_set "$key" "$val" "$target" || {
+        echo "  ❌ 写入 $target 失败"
+        return 1
+    }
+    return 0
+}
+
+# 一键把用户要的四项能力全部配好：
+#   1) 无网络自动切换 Wi-Fi/有线   → MODE=speed（自带可用性兜底）
+#   2) 网速增加                    → MODE=speed（实测吞吐大的赢）
+#   3) 双网并发                    → BALANCE=1 + weighted
+#   4) Wi-Fi 自动寻找              → WIFI_FAILOVER=1
+#
+# 为什么值得有这么一个命令：这四项散在四个配置键里，其中两项默认关闭、
+# 一项还要额外 sudo 加载 pf 规则。用户要知道该调哪几个旋钮、按什么顺序，
+# 本身就是负担。而且 MODE 该选 auto 还是 speed 取决于"要不要顺便提速"，
+# 选错了需求 2 就静默不生效——这类"配了却没效果"最难排查。
+#
+# 这里明确选 speed 而不是 auto：speed 在只有一条线可用时同样会切过去
+# （见 cmd_watch 的 speed 分支末尾的 elif），所以它同时覆盖需求 1 和 2，
+# 不需要用户在两个模式之间纠结。
+cmd_boost() {
+    local need_root=0
+    echo "配置四项网络能力…"
+    echo ""
+
+    # 1+2) 选路模式。必须真写进配置文件，不能只改当前进程的变量——
+    # 守护进程每轮都重新读配置，只在内存里改下一轮就丢了。
+    conf_set_kv MODE speed      && echo "  ✅ 选路模式 → speed（无网络自动切换 + 网速优先）" \
+                                  || echo "  ❌ 写 MODE 失败"
+    # 4) Wi-Fi 自动寻找。默认关闭，因为"自动连别的 Wi-Fi"是有侵入性的
+    # 动作（可能连到邻居的路由器），所以明确要求用户显式开启——这个命令
+    # 就是显式开启的方式。
+    conf_set_kv WIFI_FAILOVER 1 && echo "  ✅ Wi-Fi 自动寻找 → 开（当前 Wi-Fi 上不了网时试连其它已保存网络）" \
+                                  || echo "  ❌ 写 WIFI_FAILOVER 失败"
+    # 3) 双网并发。配置打开，但 pf 规则要 root 加载，分开说清楚。
+    conf_set_kv BALANCE 1       && echo "  ✅ 双网并发 → 配置已开" \
+                                  || echo "  ❌ 写 BALANCE 失败"
+    conf_set_kv BALANCE_MODE weighted && echo "  ✅ 并发策略 → weighted（按实测吞吐自动配比）" \
+                                  || echo "  ❌ 写 BALANCE_MODE 失败"
+
+    echo ""
+    if [ "$(id -u)" -eq 0 ]; then
+        # root 直接加载，不用用户再敲一条
+        if balance_on weighted; then
+            echo "  ✅ pf 分流规则已加载"
+        else
+            echo "  ❌ pf 规则加载失败，请手动跑: sudo smartroute balance on weighted"
+        fi
+    else
+        need_root=1
+        echo "  ⚠️  还需要一条命令加载 pf 规则（要 root）："
+        echo "      sudo smartroute balance on weighted"
+    fi
+
+    echo ""
+    echo "接下来："
+    if [ "$need_root" = "1" ]; then
+        echo "  1. sudo smartroute balance on weighted   # 加载 pf 分流规则"
+    fi
+    echo "  2. smartroute status                      # 看当前选路和两条线状态"
+    echo "  3. smartroute fetch <支持 Range 的大文件> -o out.bin -n 8"
+    echo "     # 下载完看末尾的 per-interface 字节报告，两边都有量才算并发生效"
+    echo ""
+    echo "说明：-n 是连接数上限，工具会自适应扩连（先起 2 条，服务端扛得住才加）。"
+    echo "      连接数不是越多越好，实测 n=4 是峰值，n=16 吞吐掉一半。"
+    echo "      Cloudflare 的测速端点不认 Range，用它测会退化成单连接——换普通文件源。"
 }
 
 cmd_quality() {   # 每接口 6 个包测延迟/丢包（root 强制走该接口，非 root 只能测默认路由）
@@ -4328,6 +4455,7 @@ main() {
         report|rep)     cmd_report ;;
         quality|q)      cmd_quality ;;
         fetch|dl)       cmd_fetch "$@" ;;
+        boost)          cmd_boost "$@" ;;
         -h|--help|help) usage ;;
         *)              usage ;;
     esac
