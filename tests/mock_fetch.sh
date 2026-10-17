@@ -142,5 +142,115 @@ grep -q "伪造证据比不报更糟" smartroute.sh \
 grep -q 'd_eth" -lt 0 \] && d_eth=0' smartroute.sh \
     && ok "负增量归零" || bad "负增量没处理"
 
+echo "== 7. RETURN trap 只在 cmd_fetch 返回时触发（实测锁定的语义）=="
+# bash 的 RETURN trap 只被设置它的那个函数触发，不继承给被调函数，
+# 所以 _fetch_seg/_fetch_worker 返回时不会误删临时目录。
+# 但这个结论依赖"助手函数在 trap 设置之后定义"——一旦把助手外移，
+# trap 就会在助手返回时删掉 $T、下载全线失败。这里用同样的函数结构锁定。
+cat > "$T/trapcase.sh" <<'CASE'
+T="$1"
+fetch_like() {
+    trap 'rm -rf "$T"' RETURN INT TERM HUP
+    _seg() { echo x > "$T/p0"; return 0; }
+    _worker() { _seg; echo "worker T: $([ -d "$T" ] && echo yes || echo no)"; }
+    _worker &
+    wait $! || echo "worker 失败"
+    echo "wait T: $([ -d "$T" ] && echo yes || echo no)"
+}
+fetch_like
+echo "after T: $([ -d "$T" ] && echo yes || echo no)"
+CASE
+TD="$(mktemp -d /tmp/sr_trap.XXXXXX)"
+tr_out="$(bash "$T/trapcase.sh" "$TD" 2>&1)"
+echo "$tr_out" | grep -q "worker T: yes" \
+    && ok "助手函数返回不触发 RETURN trap" || bad "助手返回就删了临时目录"
+echo "$tr_out" | grep -q "wait T: yes" \
+    && ok "wait 之后临时目录仍在（下载能跑完）" || bad "wait 前临时目录就没了"
+echo "$tr_out" | grep -q "after T: no" \
+    && ok "函数返回时才清理" || bad "没有清理，/tmp 会堆积"
+rm -rf "$TD"
+grep -q "RETURN trap 只在\*\*设置它的那个函数\*\*返回时触发" smartroute.sh \
+    && ok "注释写清了 trap 语义和外移助手函数的后果" || bad "缺关键注释"
+grep -q "要外移助手函数的话" smartroute.sh \
+    && ok "说明了外移助手函数时该怎么改" || bad "没说外移时的改法"
+
+echo "== 8. 吞吐单位必须自洽（修 8 倍虚高）=="
+# size 是字节、t_dur 是秒 → 字节/秒；fmt_bps 入参也是字节/秒（内部 *8）。
+# 以前先 *8 成 bit/s 再交给 fmt_bps，等于乘两次 8：85.5KB/4s 报 1.4 Mbps，
+# 真实值 0.175 Mbps。而且拿 bit/s 和字节/秒的 _fast 比大小，阈值判断也错。
+grep -q 'bps=$(( size \* 1000 / t_dur ))' smartroute.sh \
+    && ok "bps 是字节/秒（没先 *8）" || bad "bps 单位错"
+grep -q 'bps=$(( size \* 8 / t_dur ))' smartroute.sh \
+    && bad "还在乘两次 8" || ok "没有重复乘 8"
+grep -q '_metric_fresh "speed_\$ACTIVE_ETH_DEV" "\$SPEED_RECHECK"' smartroute.sh \
+    && ok "结论前检查测速缓存是否过期" || bad "拿过期测速值下结论"
+grep -q "无法判断并发是否带来收益" smartroute.sh \
+    && ok "缓存过期时明说无法判断（不下错结论）" || bad "过期时仍下结论"
+grep -q 't_ns_now="$(date +%s%N)"' smartroute.sh \
+    && ok "用纳秒计时（小文件吞吐不被低估）" || bad "还是整秒计时"
+
+echo "== 9. HTTP 错误不能被误诊成 Range 不兼容 =="
+# 以前 _fetch_seg 没加 --fail：404 时 curl 返回 0、错误页写进分片，
+# 走到"字节数不符"分支，重试 3 次后报"服务端 Range 行为不一致"，
+# 用户会跑去换源，而真正原因只是 URL 写错。
+grep -q 'curl -sS -L --fail --max-time 600' smartroute.sh \
+    && ok "分片下载带 --fail" || bad "分片下载没带 --fail"
+grep -q "httperr_" smartroute.sh \
+    && ok "HTTP 错误单独记录" || bad "没有单独记录 HTTP 错误"
+grep -q "请先确认这个 URL 用浏览器能打开" smartroute.sh \
+    && ok "HTTP 错误给出可操作建议" || bad "HTTP 错误无可操作建议"
+[ "$(grep -c 'curl -L --fail --progress-bar' smartroute.sh)" -ge 2 ] \
+    && ok "两处回退下载都带 --fail" || bad "回退下载没带 --fail"
+grep -q "这个 URL 打不开" smartroute.sh \
+    && ok "探测阶段区分 HTTP 错误和不支持 Range" || bad "HTTP 错误被说成不支持 Range"
+
+echo "== 10. 权重为 0 会让一条线静默饿死 =="
+# write_pf_rules 不校验 $7/$8：传 0 时那一侧 while 一次都不跑，
+# route-to 里没有它的条目 → 一条线拿到 0 个连接，而函数返回 0、无警告。
+grep -q "权重必须落在 \[1,8\]" smartroute.sh \
+    && ok "有权重校验" || bad "没有权重校验"
+gen_w() {   # $1=wA $2=wB
+    bash -c ". '$T/sr.sh'; trap - EXIT INT TERM HUP
+        export PATH='/usr/bin:/bin:/usr/sbin:/sbin'
+        export LOCK_DIR='$T/lock' STATE_FILE='$T/state/st' PF_ANCHOR_FILE='$T/w.conf' PF_ANCHOR=a
+        svc_router() { echo 192.168.1.1; }; other_nets() { echo; }
+        dev_subnet() { echo 192.168.1.0/24; }; eth_wifi_same_gateway() { return 0; }
+        pfctl() { return 0; }; pf_enabled() { return 1; }
+        write_pf_rules en0 192.168.1.1 en1 192.168.1.1 '' '' '$1' '$2' >/dev/null 2>&1
+        a=\$(grep -o -F '(\$ext1 \$gw1)' '$T/w.conf' | wc -l | tr -d ' ')
+        b=\$(grep -o -F '(\$ext2 \$gw2)' '$T/w.conf' | wc -l | tr -d ' ')
+        echo \"\$a \$b\"" 2>/dev/null
+}
+[ "$(gen_w 0 4)" = "1 4" ] && ok "wA=0 被夹到 1（不饿死 en0）" || bad "wA=0 仍饿死 en0: $(gen_w 0 4)"
+[ "$(gen_w abc 4)" = "1 4" ] && ok "wA 非数字被夹到 1" || bad "非数字权重放行: $(gen_w abc 4)"
+[ "$(gen_w 99 99)" = "8 8" ] && ok "过大权重被夹到 8" || bad "过大权重放行: $(gen_w 99 99)"
+[ "$(gen_w 1 4)" = "1 4" ] && ok "正常权重不受影响" || bad "正常权重被改坏: $(gen_w 1 4)"
+
+echo "== 11. 分摊报告要说明含无关流量 =="
+# 窗口内测的是接口全部字节（其他 app、DNS、系统更新）。总量远超文件大小时
+# 百分比被污染，以前不提示，用户对不上还以为工具算错。
+grep -q "远大于本次下载的" smartroute.sh \
+    && ok "总量异常时明确提示含其他流量" || bad "没有无关流量提示"
+grep -q "要精确测量，请关掉其他下载/同步类程序后重试" smartroute.sh \
+    && ok "给出精确测量的办法" || bad "没给办法"
+
+echo "== 12. -n 上限与合并引号 =="
+# 无上限时 -n 1000 起 1000 个 curl：不会更快，还会拖死机器、
+# 触发系统并发限制，最后表现成"下载失败"。
+grep -q "连接数上限 64" smartroute.sh \
+    && ok "-n 有上限 64" || bad "-n 无上限"
+grep -qF '_catlist="$_catlist \"$T/p$_i\""' smartroute.sh \
+    && ok "合并时分片路径加引号" || bad "合并路径未加引号"
+grep -q 'eval "cat \$_catlist"' smartroute.sh \
+    && ok "用 eval 拼装（片数多也不触 ARG_MAX）" || bad "合并方式有风险"
+
+echo "== 13. 小文件 worker 空转要说清 =="
+# 片数少于 worker 数时多余的 worker 直接退出。不说清楚的话，
+# 用户看到"8 个 worker"会以为有 8 条连接在跑，实际可能只有 1 条。
+grep -q "个连接里有" smartroute.sh \
+    && ok "说明有多少连接空转" || bad "没说 worker 空转"
+grep -q "小文件切太细反而更慢，这是有意的" smartroute.sh \
+    && ok "说明为什么小文件不切细" || bad "没解释小文件行为"
+
 echo ""
 echo "结果: $((PASS - FAIL)) 通过, $FAIL 失败"

@@ -1752,6 +1752,11 @@ USAGE
     [ -n "$url" ] || die "用法: smartroute fetch <URL> [-o 输出] [-n 连接数]"
     case "$n" in ''|*[!0-9]*) die "连接数必须是正整数: $n" ;; esac
     [ "$n" -ge 1 ] || die "连接数至少为 1"
+    # 上限 64。以前没有上限：-n 1000 会起 1000 个 curl 进程，
+    # 不但不会更快（连接数远超过带宽时是纯开销），还会把机器拖死、
+    # 触发沙箱/系统的并发连接限制，最后表现成"下载失败"。
+    # 64 已经远超两条家用宽带的所需连接数。
+    [ "$n" -le 64 ] || die "连接数上限 64（-n $n 太多了）。两条宽带走 8~24 就够"
 
     command -v curl >/dev/null 2>&1 || die "系统缺少 curl"
 
@@ -1811,9 +1816,18 @@ MSG
     if [ "$probe_code" = "416" ] || [ "$probe_code" = "206" ]; then range_ok=1; fi
 
     if [ "$range_ok" != "1" ]; then
+        # HTTP 错误（4xx/5xx）不能一律说成"不支持 Range"。URL 写错、需要登录、
+        # 文件不存在，都会被说成"换一个支持 Range 的源"，用户白换。
+        case "$probe_code" in
+            4*|5*)
+                die "服务端返回 HTTP ${probe_code}，这个 URL 打不开。\
+                    请先确认浏览器能访问它（可能是路径写错、需要鉴权、或文件已删除）。" ;;
+        esac
         echo "服务端不支持 Range（越界范围返回 ${probe_code:-无响应}，期望 416），无法切段。"
         echo "这种情况只能单连接，两条线帮不上——换一个支持 Range 的源即可。"
-        curl -L --progress-bar -o "$out" "$url" || die "下载失败"
+        # --fail 必须加：否则 404/500 时 curl 返回 0，把错误页写进输出文件，
+        # 还报一个"完成"——用户拿到一个内容是错误页的文件，比失败更糟。
+        curl -L --fail --progress-bar -o "$out" "$url" || die "下载失败（HTTP 错误或网络中断）"
         echo "完成: $out"
         return 0
     fi
@@ -1823,7 +1837,7 @@ MSG
     [ "$size" -gt 0 ] || size="$cr_size"
     if [ "$size" -le 0 ]; then
         echo "服务端支持 Range 但取不到总大小，改用单连接下载。"
-        curl -L --progress-bar -o "$out" "$url" || die "下载失败"
+        curl -L --fail --progress-bar -o "$out" "$url" || die "下载失败（HTTP 错误或网络中断）"
         echo "完成: $out"
         return 0
     fi
@@ -1843,15 +1857,29 @@ MSG
 
     # 抓基线字节数，下载完算增量，才能说出"每条线实际扛了多少"。
     # 在切段之前抓：抓晚了会把前面探测那几下算进去。
-    local T rc=0 eth_before=0 wifi_before=0 t_start
-    t_start="$(date +%s)"
+    local T rc=0 eth_before=0 wifi_before=0 t_start_s t_start_ns
+    t_start_s="$(date +%s)"
+    # 同时记秒和纳秒：纳秒用于精确算吞吐（小文件不会被低估），
+    # 秒作为 date +%s%N 不可用时的退路。
+    t_start_ns="$(date +%s%N)"
+    case "$t_start_ns" in ''|*[!0-9]*) t_start_ns=0 ;; esac
     find_active
     [ -n "$ACTIVE_ETH_DEV" ]  && eth_before="$(_if_bytes "$ACTIVE_ETH_DEV")"
     [ -n "$ACTIVE_WIFI_DEV" ] && wifi_before="$(_if_bytes "$ACTIVE_WIFI_DEV")"
     case "$eth_before"  in ''|*[!0-9]*) eth_before=0 ;; esac
     case "$wifi_before" in ''|*[!0-9]*) wifi_before=0 ;; esac
     T="$(mktemp -d /tmp/smartroute_fetch.XXXXXX)" || die "建不了临时目录"
-    # 无论成功失败都要清理，否则 /tmp 里堆一堆分片
+    # 无论成功失败都要清理，否则 /tmp 里堆一堆分片。
+    #
+    # 关于 RETURN trap 的语义（实测确认，改动前先看这里）：
+    # bash 的 RETURN trap 只在**设置它的那个函数**返回时触发，不会被它调用的
+    # 函数继承——所以下面 _claim_chunk/_fetch_seg/_fetch_worker 返回时不会
+    # 误删 ${T}，下载能正常跑完。tests/mock_fetch.sh 第 7 节用同样的函数结构
+    # 锁定了这个行为。
+    # ⚠️ 但这个结论依赖"内部函数在 trap 设置**之后**定义"。若把 _fetch_seg
+    # 等助手函数移到 cmd_fetch 外面（变成先定义、后设 trap），RETURN trap
+    # 就会在助手函数返回时触发、把 $T 删掉，下载全线失败。
+    # 要外移助手函数的话，请把清理改成显式调用 + 只保留 INT/TERM/HUP 信号 trap。
     trap 'rm -rf "$T"' RETURN INT TERM HUP
 
     # ── 工作队列，而不是固定切分 ──
@@ -1893,15 +1921,30 @@ MSG
     # 连接数一多，偶发的超时/重置就从 rare 事件变成几乎每次都有。
     # 不重试的话，8 段里挂 1 段整个下载就废了——用户会觉得功能不可用。
     # 实测 -n 8 时分片会撞上 Recv failure，重试后即可完成。
+    # 下载一个分片。三种失败必须分开，因为处理方式完全不同：
+    #   · HTTP 错误（4xx/5xx）      → 重试没用，直接报出状态码
+    #   · 网络错误（超时/重置/拒连） → 值得重试，偶发抖动
+    #   · 字节数不符                 → 服务端没按 Range 给，重试也许碰对变体
+    # 以前没加 --fail：HTTP 404 时 curl 返回 0、把错误页写进分片文件，
+    # 于是走到"字节数不符"分支，重试 3 次后报"服务端 Range 行为不一致"——
+    # 诊断完全错误，用户会跑去换源，而真正的原因只是 URL 写错了。
     _fetch_seg() {   # $1=分片号 $2=start $3=end $4=URL $5=目录
-        local idx="$1" st="$2" en="$3" u="$4" d="$5" try got
+        local idx="$1" st="$2" en="$3" u="$4" d="$5" try got http rc
         for try in 1 2 3; do
-            if curl -sS -L --max-time 600 --range "${st}-${en}" -o "$d/p$idx" "$u" 2>/dev/null; then
-                # 服务端可能返回 200（忽略 Range）而非 206，此时拿到的是全量。
-                # 用字节数判断：对不上就重试，三次都不对就交给后面的总量校验报错。
+            # --fail 让 4xx/5xx 返回非 0；-w 把状态码写出来，即使失败也有值
+            # （连不上时是 000，正好和 HTTP 错误区分开）。
+            http="$(curl -sS -L --fail --max-time 600 --range "${st}-${en}" \
+                    -o "$d/p$idx" -w '%{http_code}' "$u" 2>/dev/null)"
+            rc=$?
+            if [ "$rc" -eq 0 ]; then
                 got="$(wc -c < "$d/p$idx" 2>/dev/null | tr -d ' ')"
                 [ "$got" = $(( en - st + 1 )) ] && return 0
+            elif [ -n "$http" ] && [ "$http" != "000" ] && [ "$http" -ge 400 ] 2>/dev/null; then
+                # HTTP 错误：重试同样的请求不会有不同结果，立刻失败并带上状态码
+                printf 'HTTP %s\n' "$http" > "$d/httperr_$idx"
+                return 1
             fi
+            # 网络错误或字节数不符：值得再试
             [ "$try" -lt 3 ] && sleep 1
         done
         return 1
@@ -1928,7 +1971,16 @@ MSG
         return 0
     }
 
-    echo "  切成 $total_chunks 片（每片约 $(fmt_bytes "$chunk")），$n 个 worker 认领"
+    # 片数少于 worker 数时，多出来的 worker 一片都认不到、直接退出。
+    # 这在小文件上是正常的（切太细反而更慢），但不说清楚的话，
+    # 用户看到"8 个 worker"会以为有 8 条连接在跑，实际可能只有 1 条。
+    if [ "$total_chunks" -lt "$n" ]; then
+        echo "  切成 $total_chunks 片（每片约 $(fmt_bytes "$chunk")）"
+        echo "  文件较小，只有 $total_chunks 片可下，$n 个连接里有 $(( n - total_chunks )) 个会空转"
+        echo "  （小文件切太细反而更慢，这是有意的；要跑满连接请换个大文件）"
+    else
+        echo "  切成 $total_chunks 片（每片约 $(fmt_bytes "$chunk")），$n 个 worker 认领"
+    fi
     local -a pids=()
     local w
     for w in $(seq 1 "$n"); do
@@ -1942,7 +1994,7 @@ MSG
     if [ "$rc" -ne 0 ]; then
         # 把失败原因说清楚：是连接不通，还是服务端 Range 行为不一致。
         # 后者要换源，前者才该降低 -n——笼统一句"下载失败"等于让用户瞎猜。
-        local _fi _fidx _fwant _fgot _msg=""
+        local _fi _fidx _fwant _fgot _msg="" _n=0
         for _fi in "$T"/fail_*; do
             [ -f "$_fi" ] || continue
             # 不能用 _ 当 read 的目标：bash 里 _ 是特殊变量（上一条命令的最后一个
@@ -1950,11 +2002,30 @@ MSG
             read -r _fidx _fwant _fgot < "$_fi" 2>/dev/null
             [ -n "$_msg" ] && _msg="${_msg}；"
             _msg="${_msg}分片 ${_fidx:-?} 期望 ${_fwant:-?} 字节、实得 ${_fgot:-?} 字节"
+            _n=$(( _n + 1 ))
+            # 最多列 3 条：服务端整体行为不一致时可能几十个分片全挂，
+            # 全列出来会把真正的原因（服务端 Range 不兼容）淹掉。
+            [ "$_n" -ge 3 ] && break
         done
+        [ "$_n" -ge 3 ] && _msg="${_msg}；…等 ${_n} 个分片"
         if [ -n "$_msg" ]; then
             echo "分片大小与请求不符：${_msg}"
             echo "原因：这个服务端的 Range 行为不一致（对同一文件返回不同内容/大小），"
             echo "      多连接下载无法保证拼出原文件，已放弃。请换一个源，或用单连接下载。"
+        fi
+        # HTTP 错误要单独说：那是 URL 或权限问题，不是 Range 兼容性，
+        # 让用户去"换源"只会浪费时间。
+        local _he _hmsg=""
+        for _fi in "$T"/httperr_*; do
+            [ -f "$_fi" ] || continue
+            read -r _ _he < "$_fi" 2>/dev/null
+            [ -n "$_hmsg" ] && _hmsg="${_hmsg}、"
+            _hmsg="${_hmsg}${_he:-未知}"
+        done
+        if [ -n "$_hmsg" ]; then
+            echo "服务端返回了 HTTP 错误：${_hmsg}"
+            echo "原因：URL 写错、文件不存在、需要登录/鉴权，或服务端临时故障。"
+            echo "      重试和降低 -n 都无效——请先确认这个 URL 用浏览器能打开。"
         fi
         die "有分片下载失败（已重试 3 次，临时文件已清理）"
     fi
@@ -1969,7 +2040,17 @@ MSG
         die "分片大小不符（期望 ${size}，实得 ${got}），服务端可能未正确支持 Range"
     fi
 
-    cat $(for i in $(seq 0 $((total_chunks-1))); do printf '%s/p%s ' "$T" "$i"; done) > "$out" || die "合并失败"
+    # 分片路径必须加引号：虽然 mktemp 生成的目录不含空格，但未加引号的
+    # 命令替换一旦遇到空格就会把路径拆成多个参数，cat 报一堆"no such file"，
+    # 而错误信息完全指不到真正的原因。
+    # 用 while read 而不是 $(...)：顺便避免片数很多时触到 ARG_MAX。
+    local _catlist="" _i
+    _i=0
+    while [ "$_i" -lt "$total_chunks" ]; do
+        _catlist="$_catlist \"$T/p$_i\""
+        _i=$(( _i + 1 ))
+    done
+    eval "cat $_catlist" > "$out" || die "合并失败"
     echo "完成: ${out}（$(fmt_bytes "$size")，${total_chunks} 片 / ${n} 连接）"
 
     # 【实测分摊】拿刚才的基线算增量，报告每条线实际扛了多少字节。
@@ -1988,6 +2069,14 @@ MSG
     [ "$d_eth" -lt 0 ] && d_eth=0
     [ "$d_wifi" -lt 0 ] && d_wifi=0
     local d_all=$(( d_eth + d_wifi ))
+    # 窗口内测到的是这两个接口的**全部**字节——包括其他 app、DNS、系统更新、
+    # iCloud 同步。如果总量远超本次下载的文件大小，百分比就被这些无关流量
+    # 污染了。以前不提示，用户会看到一个对不上的比例还以为工具算错了。
+    if [ "$d_all" -gt $(( size * 3 )) ] && [ "$size" -gt 0 ]; then
+        echo "⚠️  测量窗口内两个接口共 ${d_all} 字节，远大于本次下载的 $(fmt_bytes "$size")，"
+        echo "    说明期间还有其他程序在联网。下面的百分比包含那部分流量，仅供参考；"
+        echo "    要精确测量，请关掉其他下载/同步类程序后重试。"
+    fi
     if [ "$d_all" -gt 0 ]; then
         local pct_eth=$(( d_eth * 100 / d_all )) pct_wifi=$(( d_wifi * 100 / d_all ))
         echo "流量分摊（本次下载期间）:"
@@ -2016,19 +2105,48 @@ MSG
     #   接近 快线单独的速度      → 聚合没赚到，瓶颈在上游（同网关时常这样）
     #   明显超过 快线单独的速度  → 聚合真的在叠加
     # 这个结论必须说出来，否则用户花了力气开分流，却不知道有没有收益。
-    local t_end t_dur bps
-    t_end="$(date +%s)"
-    t_dur=$(( t_end - t_start ))
-    [ "$t_dur" -lt 1 ] && t_dur=1
-    bps=$(( size * 8 / t_dur ))
-    echo "本次吞吐: $(fmt_bps "$bps")（${t_dur}s）"
+    #
+    # 单位必须处处自洽：size 是**字节**，t_dur 是秒，所以字节/秒才对；
+    # fmt_bps 的入参也是字节/秒（它内部 *8 转成 bit）。以前在这里先 *8 变成
+    # bit/s 再交给 fmt_bps，等于乘了两次 8——实测 85.5KB/4s 报成 1.4 Mbps，
+    # 真实值 0.175 Mbps，虚高 8 倍。而且拿 bit/s 去和字节/秒的 _fast 比大小，
+    # 阈值判断也是错的。
+    local t_dur bps
+    # 纳秒计时：date +%s%N 在 macOS 可用（bash 3.2 没有 EPOCHREALTIME）。
+    # 不用整秒：亚秒级的小文件下载，整秒会把 t_dur 当成 1，吞吐被严重低估。
+    local t_ns_now
+    t_ns_now="$(date +%s%N)"
+    case "$t_ns_now" in ''|*[!0-9]*) t_ns_now=0 ;; esac
+    if [ "$t_ns_now" -gt "$t_start_ns" ] && [ "$t_start_ns" -gt 0 ]; then
+        t_dur=$(( (t_ns_now - t_start_ns) / 1000000 ))     # 毫秒
+    else
+        # date +%s%N 不可用时退回整秒
+        t_dur=$(( $(date +%s) - t_start_s ))
+        [ "$t_dur" -lt 1 ] && t_dur=1
+        t_dur=$(( t_dur * 1000 ))
+    fi
+    [ "$t_dur" -ge 1 ] || t_dur=1
+    # 字节/秒。用毫秒既避免小文件被低估，也避免除零。
+    bps=$(( size * 1000 / t_dur ))
+    if [ "$t_dur" -ge 1000 ]; then
+        echo "本次吞吐: $(fmt_bps "$bps")（$(( t_dur / 1000 ))s）"
+    else
+        echo "本次吞吐: $(fmt_bps "$bps")（${t_dur}ms）"
+    fi
 
-    find_active 2>/dev/null
+    # ACTIVE_*_DEV 在上面（抓基线时）已经 find_active 过，这里直接复用，
+    # 不再调第二次——find_active 要走 networksetup/ifconfig，约 70ms，白等一趟。
     local _pe _pw _fast
     _pe="$(_metric_val "speed_$ACTIVE_ETH_DEV")"
     _pw="$(_metric_val "speed_$ACTIVE_WIFI_DEV")"
     _fast="$_pe"; [ "${_pw:-0}" -gt "${_pe:-0}" ] 2>/dev/null && _fast="$_pw"
-    if [ -n "$_pe" ] && [ -n "$_pw" ] && [ "${_pe:-0}" -gt 0 ] 2>/dev/null && [ "${_pw:-0}" -gt 0 ] 2>/dev/null; then
+    # 结论必须建立在**新鲜**的测速值上。缓存可能已过期（SPEED_RECHECK=300s），
+    # 拿 5 分钟前的速度判"聚合没赚到"，会把一次正常的慢下载说成功能无效——
+    # 比不说更糟。过期就不下结论，只说明为什么没结论。
+    local _fresh=1
+    [ -n "$_pe" ] && _metric_fresh "speed_$ACTIVE_ETH_DEV" "$SPEED_RECHECK" && _fresh=0
+    if [ -n "$_pe" ] && [ -n "$_pw" ] && [ "${_pe:-0}" -gt 0 ] 2>/dev/null \
+       && [ "${_pw:-0}" -gt 0 ] 2>/dev/null && [ "$_fresh" = "0" ]; then
         # 超过快线单独速度的 80% 就算"基本吃满了快线"
         local _thresh=$(( _fast * 8 / 10 ))
         if [ "$bps" -ge "$_thresh" ]; then
@@ -2039,6 +2157,9 @@ MSG
             echo "结论: 吞吐明显低于单条快线的上限（$(fmt_bps "$_fast")），"
             echo "      还有空间。可试着加大 -n（如 16/24）让更多连接参与分摊。"
         fi
+    elif [ -n "$_pe" ] || [ -n "$_pw" ]; then
+        echo "结论: 没有可用的单线测速值（未测或已过期），无法判断并发是否带来收益。"
+        echo "      先跑 sudo smartroute speed（或等守护进程自动测速）后再试。"
     fi
     return 0
 }
@@ -2127,6 +2248,22 @@ write_pf_rules() {   # $1=设备A $2=网关A $3=设备B $4=网关B $5=额外排�
                      # $7=权重A $8=权重B（按容量重复网关，近似加权轮询；缺省 1:1）
     local d1="$1" gw1="$2" d2="$3" gw2="$4" excl="${5:-}" only="${6:-}"
     local wA="${7:-1}" wB="${8:-1}"
+    # 权重必须落在 [1,8]。以前不校验，调用方传 0 或非数字时：
+    #   · 0        → 那一侧的 while 循环一次都不跑，route-to 里没有它的条目，
+    #                **一条线被完全饿死**，而函数返回 0、没有任何警告。
+    #                用户看到的是"另一条线完全没流量"，却查不到原因。
+    #   · 非数字   → [ "$_k" -lt "abc" ] 直接报错退出循环，同上。
+    #   · 过大     → route-to 列表被撑爆，pfctl 加载变慢，配比也失去意义。
+    # 上限 8 而不是 4：归一化在 balance_on 里已经收敛到 1..4，这里放宽一点
+    # 只是防止调用方手滑，不影响正常路径。
+    local _wi
+    for _wi in wA wB; do
+        local _wv="${!_wi}"
+        case "$_wv" in
+            ''|*[!0-9]*) eval "$_wi=1" ;;
+            *) [ "$_wv" -ge 1 ] || eval "$_wi=1"; [ "$_wv" -le 8 ] || eval "$_wi=8" ;;
+        esac
+    done
     local lan1 lan2 same=0 list
     lan1="$(dev_subnet "$d1")"; lan2="$(dev_subnet "$d2")"
     if [ -n "$lan1" ] && [ "$lan1" = "$lan2" ]; then same=1; fi
