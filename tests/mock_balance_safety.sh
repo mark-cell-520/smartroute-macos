@@ -71,7 +71,7 @@ CLEAR_LINE=$(sed -n "${O},$((O+40))p" smartroute.sh | grep -n 'pfctl -a "$PF_ANC
 if [ -n "$CONF_LINE" ] && [ -n "$CLEAR_LINE" ] && [ "$CONF_LINE" -lt "$CLEAR_LINE" ]; then
     ok "先写配置（第 $CONF_LINE 行）再清规则（第 $CLEAR_LINE 行）"
 else
-    bad "顺序还是反的（配置=$CONF_LINE 清规则=$CLEAR_LINE）"
+    bad "顺序还是反的（配置=$CONF_LINE 清规则=${CLEAR_LINE}）"
 fi
 # 锁在 cmd_balance 的 off 分支拿，不在 balance_off 内部拿——
 # balance_off 也会被安全阀（已持锁）和 balance_on 失败路径调用，再拿会重入。

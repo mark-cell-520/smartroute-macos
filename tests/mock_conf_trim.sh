@@ -88,7 +88,7 @@ grep -Fq 'out="${out##*/}"' smartroute.sh \
 ORDER="$(awk '/out="\$\{url%%#\*\}/ {print index($0, "url%%#*"), index($0, "out##*/")}' smartroute.sh | head -1)"
 _h="$(echo "$ORDER" | cut -d' ' -f1)"; _b="$(echo "$ORDER" | cut -d' ' -f2)"
 [ -n "$_h" ] && [ -n "$_b" ] && [ "$_h" -lt "$_b" ] \
-    && ok "剥 # 在取 basename 之前（位置 $_h < $_b）" || bad "顺序不对（# at $_h, basename at $_b）"
+    && ok "剥 # 在取 basename 之前（位置 $_h < ${_b}）" || bad "顺序不对（# at $_h, basename at ${_b}）"
 grep -q '\[ -n "$out" \] || out="download"' smartroute.sh \
     && ok "空文件名有兜底" || bad "空文件名没兜底"
 # 行为验证：四种 URL 形态

@@ -130,7 +130,7 @@ echo "=== 2. fmt_bps 换算 ==="
 for pair in "0:未知" "1338605:10.7 Mbps" "1993576:15.9 Mbps" "12500000:100 Mbps"; do
     in="${pair%%:*}"; want="${pair##*:}"
     got="$(run "fmt_bps $in")"
-    [ "$got" = "$want" ] && ok "$in B/s → $got" || bad "$in 期望 $want，得到 $got"
+    [ "$got" = "$want" ] && ok "$in B/s → $got" || bad "$in 期望 ${want}，得到 $got"
 done
 
 echo "=== 3. measure_throughput 按接口分别测 ==="

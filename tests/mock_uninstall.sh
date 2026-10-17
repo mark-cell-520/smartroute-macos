@@ -221,7 +221,7 @@ _rmstate_at="$(printf '%s\n' "$_uni_body" | grep -n 'rm -rf /var/db/smartroute' 
 if [ -n "$_restore_at" ] && [ -n "$_rmstate_at" ] && [ "$_restore_at" -lt "$_rmstate_at" ]; then
     ok "还原发生在删状态目录之前（否则备份先没了）"
 else
-    bad "还原在删状态目录之后，备份已被删掉（还原:$_restore_at 删目录:$_rmstate_at）"
+    bad "还原在删状态目录之后，备份已被删掉（还原:$_restore_at 删目录:${_rmstate_at}）"
 fi
 # 服务名逐行读：服务名可能含空格（"Thunderbolt Bridge"），不能按空格拆
 grep -q 'while IFS= read -r _s' "$UNI" && ok "逐行读服务名（容忍空格）" || bad "按空格拆服务名会拆错"

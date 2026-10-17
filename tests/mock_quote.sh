@@ -79,7 +79,7 @@ while IFS= read -r ssid; do
     if [ "$got" = "$ssid" ]; then
         ok "还原一致: [$ssid]"
     else
-        bad "被改坏了: 期望 [$ssid] 得到 [$got]（quote 后是 $q）"
+        bad "被改坏了: 期望 [$ssid] 得到 [$got]（quote 后是 ${q}）"
     fi
 done <<'EOF'
 My Home WiFi

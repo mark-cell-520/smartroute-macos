@@ -84,6 +84,27 @@ else
     ok "已创建，默认 MODE=auto"
 fi
 
+# 用户级配置也要在安装时建出来，而且权限必须是 644。
+#
+# 不安这一行的后果是提权：守护进程以 root 每 20 秒解析
+# /Users/Shared/smartroute.conf，而 /Users/Shared 是 1777。
+# 文件不存在时，**任何本地用户都能建一个**，让 root 按他的配置选路、
+# 测速、开关并发。这不是理论问题——目录权限就在那里。
+#
+# 建出来之后还有第二层：脚本的 conf_parse_file 会拒绝群/他人可写的配置
+# （见 smartroute.sh），所以即使有人事后 chmod 666 也不会生效。
+# 两层都要有：install 负责"不让它被预创建"，解析器负责"不让它被改宽"。
+if [ -f /Users/Shared/smartroute.conf ]; then
+    ok "用户级配置已存在，保留不动"
+else
+    printf '# smartroute 用户级配置（优先级高于 /etc/smartroute.conf）\n' \
+        | sudo tee /Users/Shared/smartroute.conf >/dev/null
+    # 644：属主可写、其他人只读。1777 目录里新建文件默认可能是 644，
+    # 但显式 chmod 不依赖 umask，也不会被用户的 shell 配置改掉。
+    sudo chmod 644 /Users/Shared/smartroute.conf
+    ok "已创建用户级配置 /Users/Shared/smartroute.conf（644）"
+fi
+
 # ---------- 4. 守护进程 ----------
 # 这是整个安装里**唯一不能失败**的一步：守护进程不跑，
 # 自动选路、故障转移、双网并发全都不会发生，而用户完全看不出来。

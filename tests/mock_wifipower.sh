@@ -80,7 +80,7 @@ on_ln=$(grep -n "en1 on"  "$T/calls" | head -1 | cut -d: -f1)
 if [ -n "$off_ln" ] && [ -n "$on_ln" ] && [ "$off_ln" -lt "$on_ln" ]; then
     ok "顺序正确：先 off 后 on"
 else
-    bad "顺序错误（off=$off_ln on=$on_ln）"
+    bad "顺序错误（off=$off_ln on=${on_ln}）"
 fi
 # 结束时电源必须是 on
 [ "$(cat "$T/power")" = "on" ] && ok "结束时 Wi-Fi 电源是开着的" || bad "结束时 Wi-Fi 是关着的: $(cat "$T/power")"

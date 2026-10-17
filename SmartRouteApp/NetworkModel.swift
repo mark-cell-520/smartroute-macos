@@ -778,7 +778,7 @@ final class NetworkModel: ObservableObject {
             "TLS_PROBE","NOTIFY","AUTO_WIFI_POWER","BALANCE","BALANCE_MODE",
             "FASTEST_SWITCH_RATIO","FASTEST_RECHECK","WIFI_FAILOVER","WIFI_PREFERRED",
             "WIFI_FAILOVER_COOLDOWN","SPEED_TEST_URL","SPEED_TEST_TIMEOUT",
-            "SPEED_RECHECK","LATENCY_RECHECK","SPEED_SWITCH_RATIO",
+            "SPEED_RECHECK","LATENCY_RECHECK","SPEED_SWITCH_RATIO","WEIGHT_RECHECK",
         ]
         let modes: Set<String> = ["auto","ethernet","wifi","speed","latency"]
         let boolKeys: Set<String> = ["TLS_PROBE","NOTIFY","AUTO_WIFI_POWER","BALANCE","WIFI_FAILOVER"]
@@ -797,10 +797,16 @@ final class NetworkModel: ObservableObject {
             var ok = true
             switch key {
             case "MODE":        ok = modes.contains(val)
-            case "BALANCE_MODE": ok = (val == "round-robin" || val == "fastest")
+            // 三个值必须和脚本 conf_value_ok 完全一致。以前这里漏了 weighted，
+            // 于是 App 导入/保存 BALANCE_MODE=weighted 被静默拒绝——
+            // 而脚本自己会写这个值（balance on weighted），用户看到的是
+            // "已保存"但实际没生效，而且下次守护进程重载配置又回落 round-robin。
+            case "BALANCE_MODE": ok = (val == "round-robin" || val == "fastest" || val == "weighted")
             case _ where boolKeys.contains(key): ok = (val == "0" || val == "1")
             case _ where intKeys.contains(key):  ok = !val.isEmpty && val.allSatisfy { $0.isNumber }
-            case "SPEED_TEST_URL": ok = !val.isEmpty
+            // 必须和脚本一致地限制 http/https。脚本侧已收紧（该值会被原样交给
+            // curl --interface 下载），App 若放行任意字符串就形成缺口。
+            case "SPEED_TEST_URL": ok = val.hasPrefix("http://") || val.hasPrefix("https://")
             case "WIFI_PREFERRED": ok = !val.contains("\n")
             case "PROBE_TARGETS":  ok = val.allSatisfy { $0.isNumber || $0 == "." || $0 == " " }
             default: break

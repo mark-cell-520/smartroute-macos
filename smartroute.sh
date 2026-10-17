@@ -114,7 +114,11 @@ conf_value_ok() {
                        case "$val" in 0|1) ;; *) return 1 ;; esac ;;
         PROBE_TARGETS) case "$val" in *[!0-9.\ ]*) return 1 ;; esac ;;
         WIFI_PREFERRED) case "$val" in *[$'\n\r']*) return 1 ;; esac ;;
-        SPEED_TEST_URL) [ -n "$val" ] || return 1 ;;
+        # 必须限 http/https。以前只判非空，于是配置文件里可以放任意字符串，
+        # 而它会被原样交给 curl --interface 去下载。攻击者能借此让 root
+        # 的 curl 去打内网地址、或消耗带宽。限制协议后最坏也只是指向一个
+        # 公网 HTTP 地址，与"用户自己配错了测速地址"同级。
+        SPEED_TEST_URL) case "$val" in http://*|https://*) [ -n "$val" ] || return 1 ;; *) return 1 ;; esac ;;
         *) return 1 ;;
     esac
     return 0
@@ -146,6 +150,21 @@ conf_value_hint() {   # $1=key -> stdout: 说明
 conf_parse_file() {   # $1=文件路径
     local f="$1" line k v n=0
     [ -r "$f" ] || return 0
+    # root 守护进程每 20 秒解析这个文件，而它位于 /Users/Shared（1777）。
+    # install.sh 以前从不创建它，于是文件不存在时**任何本地用户都能建一个**，
+    # 让 root 按他的配置选路/测速。即使建了，权限一旦被放宽同样成立。
+    # 这里做纵深防御：群/他人可写的配置直接不解析。
+    # 合法场景不受影响——install.sh 现在会以 644 创建它（见 install.sh），
+    # App 和 smartroute set 写的也是同一属主。
+    local _perm
+    _perm="$(ls -ld "$f" 2>/dev/null | cut -c1-10)"
+    case "$_perm" in
+        ?rw?w?*|????????w*|??????????)
+            # 只精确判 group-write / other-write 两位，避免误伤
+            case "$_perm" in
+                ??????w?*|?????????w) log "跳过配置 ${f}：群/他人可写（${_perm}），拒绝解析" ; return 0 ;;
+            esac ;;
+    esac
     while IFS= read -r line || [ -n "$line" ]; do
         # 去掉行尾 CR（配置文件被 Windows 编辑器改过的情况）
         line="${line%$'\r'}"
