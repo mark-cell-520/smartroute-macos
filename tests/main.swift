@@ -533,6 +533,53 @@ let r2 = Shell.run(restored, timeout: 10)
 eq(r2.out, nasty, "两层叠加后 bash 仍拿到原始值")
 
 print("")
+print("== 18. beginOp 必须配 defer 形式的 endOp ==")
+// inFlight 守卫防的是"并发跑多份 shell 把机器拖垮"。但它有个静默失效模式：
+// 如果 endOp 是在 DispatchQueue.main.async 里手动调的，那么将来任何人在那个
+// 闭包里加一个提前 return，对应的 key 就永远留在 inFlight 里——界面从此停止
+// 刷新，没有报错、没有日志，用户只觉得"数据不动了"。
+// 这种失效比崩溃难查得多，所以要求全部用 defer（对所有返回路径生效）。
+let modelSrc = readSrc("SmartRouteApp/NetworkModel.swift")
+let srcLines = modelSrc.components(separatedBy: "\n")
+var beginCount = 0, deferCount = 0, missing: [String] = []
+for (i, line) in srcLines.enumerated() {
+    // beginOp 的调用形如 guard beginOp("xxx") else { return }
+    if let r = line.range(of: #"beginOp\("([^"]+)"\)"#, options: .regularExpression) {
+        beginCount += 1
+        let key = String(line[r]).replacingOccurrences(of: "beginOp(\"", with: "")
+            .replacingOccurrences(of: "\")", with: "")
+        // 往后扫到下一个 beginOp 为止（那就是另一个函数的守卫了）。
+        // 不能用固定行数窗口：measurements 的 defer 在 23 行后，
+        // 窗口给小了会假阴性——而假阴性会让人去"修"本来正确的代码。
+        var found = false
+        var j = i + 1
+        var limit = srcLines.count
+        var k = i + 1
+        while k < srcLines.count {
+            if srcLines[k].contains("beginOp(") { limit = k; break }
+            k += 1
+        }
+        while j < limit {
+            if srcLines[j].contains("defer") && srcLines[j].contains("endOp(\"\(key)\")") {
+                found = true; break
+            }
+            j += 1
+        }
+        if found { deferCount += 1 } else { missing.append(key) }
+    }
+}
+isTrue(beginCount >= 8, "找到 \(beginCount) 处 beginOp（守卫没有被整体删掉）")
+eqI(deferCount, beginCount, "每处 beginOp 都紧跟 defer 形式的 endOp")
+if !missing.isEmpty {
+    print("  XX 这些 key 没有 defer 保护的 endOp: \(missing.joined(separator: ", "))")
+    failures += 1
+} else {
+    print("  OK 没有裸奔的 inFlight key")
+}
+// 反向：不能有人为了"修好"而把 beginOp 整个删掉
+isTrue(beginCount == deferCount && beginCount > 0, "守卫数量既没减少也没被绕过")
+
+print("")
 print("结果: \(checks - failures) 通过, \(failures) 失败")
 exit(failures == 0 ? 0 : 1)
 

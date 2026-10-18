@@ -170,6 +170,41 @@ echo "      sudo launchctl bootstrap system /Library/LaunchDaemons/com.user.smar
 echo "  · 彻底卸载：  sudo bash \"$(dirname "$0")/uninstall.sh\""
 echo "    （卸载会还原网络服务顺序；DNS/VPN/代理都没动过）"
 echo
+# ── App 版本提醒 ──────────────────────────────────────────────
+# install.sh 从来不碰 /Applications/SmartRoute.app（App 是拖进去的，
+# 见 INSTALL.md）。于是用户跑完 install.sh、看到下面打印"安装完成"，
+# 会以为一切都更新了——而 App 还是几天前的旧版，界面上继续显示旧结论。
+# 这是"假的完成感"：比明说没装更糟，因为它让人不再去查。
+#
+# 这里能做的有限（不能写 /Applications，也不该悄悄覆盖用户的应用），
+# 但至少要把状态说清楚，并给出确切的更新命令。
+APP="/Applications/SmartRoute.app"
+# install.sh 第 13 行已经 cd 到脚本所在目录，所以相对路径可用；
+# 回显时用 pwd 拼成绝对路径，用户照抄命令时不管当前在哪个目录都对。
+NEWAPP=""
+for c in "dist/SmartRoute-2.2/SmartRoute.app" "dist/SmartRoute/SmartRoute.app" "SmartRoute.app"; do
+    if [ -d "$c" ]; then NEWAPP="$(pwd)/$c"; break; fi
+done
+if [ -d "$APP" ]; then
+    APP_BIN="$APP/Contents/MacOS/SmartRoute"
+    if [ -n "$NEWAPP" ] && [ -f "$NEWAPP/Contents/MacOS/SmartRoute" ]; then
+        if cmp -s "$APP_BIN" "$NEWAPP/Contents/MacOS/SmartRoute" 2>/dev/null; then
+            echo "App 版本    : 已是最新（/Applications/SmartRoute.app）"
+        else
+            echo "⚠️  App 是旧版：刚才只更新了命令行部分，/Applications/SmartRoute.app 没动。"
+            echo "    界面上看到的还是旧结论（比如旧的双网并发提示）。更新它："
+            echo "      rm -rf \"$APP\" && cp -R \"$NEWAPP\" /Applications/"
+            echo "      xattr -dr com.apple.quarantine \"$APP\""
+        fi
+    else
+        echo "提示：本次没有可用的 App 构建产物（dist/ 下没有 SmartRoute.app）。"
+        echo "      命令行部分已更新；要同步更新 App 先跑 bash build_release.sh。"
+    fi
+else
+    echo "提示：未检测到 /Applications/SmartRoute.app（只装了命令行部分，这没问题）。"
+    echo "      想要图形界面：bash build_dmg.sh 生成安装包，或解压 dist/ 里的 zip 拖入应用程序。"
+fi
+echo
 echo "常用命令："
 echo "  sudo smartroute status     # 查看当前状态（哪个接口在走、探测结果）"
 echo "  sudo smartroute test -v    # 手动探测两个接口，看分层明细"

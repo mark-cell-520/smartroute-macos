@@ -367,12 +367,18 @@ final class NetworkModel: ObservableObject {
     func refresh() {
         guard beginOp("refresh") else { return }   // 已有一次在跑就跳过，避免堆积
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            // defer 而不是在下面的 main.async 里手动调 endOp。
+            // 手动调法看着能工作，但埋着一整类问题：将来任何人往这个闭包里
+            // 加一个提前 return（比如"collectSnapshot 失败了就退"），
+            // "refresh" 就永远留在 inFlight 里——界面从此静默停止刷新，
+            // 没有报错、没有日志，用户只觉得"数据不动了"。
+            // 这种静默失效比崩溃难查得多。库里另外 7 处都已经用 defer 了。
+            defer { self?.endOp("refresh") }
             guard let self else { return }
             let snap = self.collectSnapshot()
             DispatchQueue.main.async {
                 self.snapshot = snap
                 self.notePoll(signature: self.signature(of: snap))
-                self.endOp("refresh")
             }
         }
     }
@@ -1133,12 +1139,15 @@ final class NetworkModel: ObservableObject {
         // 不防重入的话连点几下就堆积一堆探测进程
         guard beginOp("balance") else { return }
         DispatchQueue.global().async {
+            // 同 refresh：用 defer 保证任何返回路径都释放 inFlight。
+            // 手动调法下，将来加一个提前 return 就会让"balance"永久卡在
+            // inFlight 里，双网并发页从此再也刷不出状态。
+            defer { self.endOp("balance") }
             // 退出码也要看：超时或 die 时 out 里没有 BALANCE=1，
             // 会把 UI 置成"未开启"、按钮变成"开启"——假状态。
             let (out, code) = Shell.run("'\(ScriptLocator.scriptPath)' balance status", timeout: 25)
             let ok = (code == 0 && !out.isEmpty)
             DispatchQueue.main.async {
-                self.endOp("balance")
                 self.balanceStatusText = out
                 // 读失败时**不能**把 balanceOn 置 false。以前就是这么写的，
                 // 于是 balance status 超时（它内含延迟实测，4-5 秒起）时，
