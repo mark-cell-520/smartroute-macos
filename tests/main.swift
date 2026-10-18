@@ -663,6 +663,53 @@ isTrue(vwSrc2.contains("model.fetchCancel()"), "停止按钮接的是真函数")
 // 下载目标路径必须写明，否则用户下载完找不到文件
 isTrue(vwSrc2.contains("/tmp/smartroute-fetch.out"), "卡片写明下载到哪个文件")
 
+print("== 18e. fetch 的提示必须给用户此刻做得到的事 ==")
+// 这一节全部来自实测踩坑，三条：
+//
+// 1) 原提示写着"网关相同且未加 --force"——而 --force 已经被拆掉了
+//    （同网关一律拒绝）。那句话是在让用户执行一条不存在的命令：
+//    他会去查、去试、发现报错，然后回来问"为什么加了 --force 还不行"。
+//    这种提示比不提示更差，消耗的是用户对工具的信任。
+// 2) 原提示写着"没执行 sudo smartroute balance on"——但 fetch 靠 curl
+//    的 --interface 显式绑接口，跟 pf 分流无关；而同网关下 pf 分流已禁用。
+//    让用户去开一堵墙上挂着"会被拒绝"的门。
+// 3) 最常见的原因（文件太小切不出多片）压根没提。实测 1.7MB 文件
+//    → 只切 1 片 → 1 片只能走一条线，必然"只有一条线在扛"，
+//    而这跟 -n 多少、pf 开没开一点关系都没有。
+let shSrc = readSrc("smartroute.sh")
+if let ws = shSrc.range(of: "只有一条线在扛") {
+    let seg = String(shSrc[ws.lowerBound...])
+    var warn = ""
+    if let end = seg.range(of: "\n    fi\n", options: .regularExpression) {
+        warn = String(seg[..<end.lowerBound])
+    } else {
+        warn = String(seg)
+    }
+    isTrue(!warn.contains("--force"), "提示不再让用户加已不存在的 --force")
+    isTrue(!warn.contains("balance on"), "提示不再让用户去开 pf 分流（fetch 不依赖 pf）")
+    isTrue(warn.contains("文件太小"), "提示覆盖最常见原因：文件太小切不出多片")
+    isTrue(warn.contains("不支持 Range"), "提示覆盖第二常见原因：地址不支持 Range")
+    isTrue(warn.contains("min chunk") || warn.contains("1 MB") || warn.contains("1MB"),
+          "提示说明最小片大小，用户能自己算门槛")
+} else {
+    isTrue(false, "取不到「只有一条线在扛」提示段")
+}
+// 探测不能被单次失败静默杀死：早前一次 8 秒超时就让整个多接口分摊退回默认路由，
+// 而用户什么都没做错。现在每个接口试 2 次，且部分失败时只放弃真不能用的那个。
+if let ps = shSrc.range(of: "_spread_try") {
+    isTrue(true, "探测有重试（_spread_try 存在）")
+    let seg = String(shSrc[ps.lowerBound...])
+    // 源码里是 [ "$_spread_try" -lt 2 ]，带引号和空格，别写成紧邻形式
+    isTrue(seg.contains("_spread_try\" -lt 2"), "每个接口试 2 次")
+} else {
+    isTrue(false, "探测没有重试——单次超时会静默关掉整个多接口分摊")
+}
+// UI 默认地址必须支持 Range。Cloudflare 的 __down 忽略 Range（实测），
+// 用它当默认值会让"多连接下载"按钮永远是单连接——名不副实。
+let nmSrc3 = readSrc("SmartRouteApp/NetworkModel.swift")
+isTrue(!nmSrc3.contains("speed.cloudflare.com/__down?bytes=50000000"),
+      "UI 默认地址不再用忽略 Range 的 Cloudflare __down")
+
 print("== 18. beginOp 必须配 defer 形式的 endOp ==")
 // inFlight 守卫防的是"并发跑多份 shell 把机器拖垮"。但它有个静默失效模式：
 // 如果 endOp 是在 DispatchQueue.main.async 里手动调的，那么将来任何人在那个

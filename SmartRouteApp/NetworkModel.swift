@@ -251,7 +251,14 @@ final class NetworkModel: ObservableObject {
     @Published var fetchRunning = false
     @Published var fetchNote = ""
     @Published var fetchNoteFailed = false
-    @Published var fetchURL = "https://speed.cloudflare.com/__down?bytes=50000000"
+    // 默认地址不能再用 Cloudflare 的 __down：实测它**忽略 Range**
+    // （越界 Range 返 200、合法 Range 不返 Content-Range），于是永远只切 1 片、
+    // 永远只走一条线——按钮名叫"多连接下载"，实际是单连接，这是名不副实。
+    // 换成实测支持 Range 的源（越界→416，合法→bytes */N），
+    // 12.7MB 实测切 9 片、en0/en1 各扛 50%/49%。
+    // 体积也选得刚好：最小片 1MB，12.7MB 能切出多片；
+    // 再小（如 1.7MB）就只切 1 片，多连接无从谈起。
+    @Published var fetchURL = "https://mirrors.aliyun.com/debian/dists/stable/main/binary-amd64/Packages.gz"
     @Published var fetchConns = 4
 
     // MARK: 日志页

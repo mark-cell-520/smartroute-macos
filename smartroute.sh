@@ -2412,11 +2412,40 @@ MSG
     # 先验证 --interface 真的能用，不能用就退回不绑（走默认路由）。
     # 硬绑会让每个分片都失败，那比不绑糟得多。探测只取 1 字节，很便宜。
     if [ "$_spread_n" -gt 1 ]; then
+        # 每个接口试 2 次。实测单次探测偶发失败过一次（8 秒超时），
+        # 而原来的写法是"一次失败就整体放弃"——于是多接口分摊被一次
+        # 网络抖动静默关掉，用户看到的是"分片走默认路由"，
+        # 而他什么都没做错。这种静默降级比明说更难排查。
+        # 2 次都失败才认为这个接口真不能用，成本最多多一次 1 字节请求。
         for _d in $_spread_devs; do
-            curl -s --interface "$_d" --max-time 8 -o /dev/null -r 0-0 \
-                 "$url" 2>/dev/null || _spread_ok=0
+            _spread_try=0
+            while [ "$_spread_try" -lt 2 ]; do
+                if curl -s --interface "$_d" --max-time 8 -o /dev/null -r 0-0 \
+                        "$url" 2>/dev/null; then
+                    break
+                fi
+                _spread_try=$(( _spread_try + 1 ))
+                [ "$_spread_try" -lt 2 ] && sleep 1
+            done
+            [ "$_spread_try" -lt 2 ] || _spread_ok=0
         done
-        [ "$_spread_ok" = "1" ] || _spread_devs=""
+        if [ "$_spread_ok" = "1" ]; then
+            :
+        else
+            # 不全清空：只要还有一个接口能用，就绑那个能用的。
+            # 原来是一处失败就把 _spread_devs 整个清空、退回默认路由，
+            # 而"退回默认路由"在两条线都通的情况下是没必要的降级。
+            _spread_devs=""
+            for _d in $ACTIVE_ETH_DEV $ACTIVE_WIFI_DEV; do
+                [ -n "$_d" ] || continue
+                if curl -s --interface "$_d" --max-time 8 -o /dev/null -r 0-0 \
+                        "$url" 2>/dev/null; then
+                    case " $_spread_devs " in *" $_d "*) ;; *) _spread_devs="$_spread_devs $_d" ;; esac
+                fi
+            done
+            _spread_devs="${_spread_devs# }"
+            [ -n "$_spread_devs" ] || _spread_devs=""
+        fi
     fi
     if [ -n "$_spread_devs" ]; then
         echo "  分片将分摊到 $(echo $_spread_devs | tr ' ' '/')（显式绑接口，不依赖 pf）"
@@ -2903,10 +2932,35 @@ MSG
         # 5% 是有效分担的下限：低于它说明这条线基本没参与。
         local _min_pct=5
         if [ "$pct_eth" -lt "$_min_pct" ] || [ "$pct_wifi" -lt "$_min_pct" ]; then
-            echo "  ⚠️  只有一条线在扛，分流未生效。常见原因："
-            echo "     • 没执行 sudo smartroute balance on（新连接全走默认路由）"
-            echo "     • 网关相同且未加 --force（工具默认拒绝同网关分流）"
-            echo "     • 连接数太少：-n 1 或 2 时轮询可能全落在同一条线上，试着 -n 8"
+            # 这一段的建议必须是**用户此刻真能做到的**。原来的三行全是错的：
+            #
+            # 1) "没执行 sudo smartroute balance on" —— 错。fetch 靠 curl
+            #    的 --interface 显式绑接口，跟 pf 分流没关系。同网关下
+            #    pf 分流已禁用（零收益 + 卡壳风险），让用户去开等于让他
+            #    去撞一堵墙，而墙上还挂着"会被拒绝"的告示。
+            # 2) "网关相同且未加 --force" —— **更糟，--force 已经不存在了**。
+            #    这是让用户执行一条不存在的命令。他会去查、会试、会发现
+            #    报错，然后回来问"为什么加了 --force 还是不行"。
+            #    这种提示比不提示更差：它消耗的是用户对工具的信任。
+            # 3) "连接数太少" —— 方向对，但不是最常见的原因。
+            #
+            # 实测最常见的原因是**文件太小，压根没切成多片**：
+            # 实测 1.7MB 的文件（min chunk 1MB）→ 只切 1 片 → 1 片只能走
+            # 一条线，于是必然"只有一条线在扛"。这跟 -n 多少、
+            # pf 开没开，一点关系都没有。
+            echo "  ⚠️  这次只有一条线在扛这个文件。按发生频率从高到低："
+            if [ "${total_chunks:-1}" -le 1 ]; then
+                echo "     • 文件太小，只切出 ${total_chunks:-1} 片——一片只能走一条线。"
+                echo "       本次 $(fmt_bytes "${size:-0}")，最小片大小是 1 MB，"
+                echo "       所以 $(fmt_bytes "${size:-0}") 以下都不可能分摊。换个更大的文件。"
+            fi
+            echo "     • 这个地址不支持 Range：此时脚本会退回单连接（正常现象，不是出错）。"
+            echo "       判断方法：看上面有没有打印「切成 N 片」，N=1 即不支持。"
+            echo "     • 某个接口的 --interface 探测没通过，脚本自动改用能用的接口。"
+            echo "       重试一次通常即可（探测有 8 秒超时，偶发会超时一次）。"
+            echo "     • -n 太小：${n:-?} 条连接时如果片数比连接数多，轮询可能不均。"
+            echo "       试 -n 8（片数 ≥ 连接数时才容易均分）。"
+            echo "  （不需要开 pf 分流：多连接下载靠 --interface 显式绑接口，与 pf 无关）"
         else
             echo "  ✅ 两条线都在扛这个文件（这就是并发叠加生效的证据）"
         fi

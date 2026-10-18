@@ -622,7 +622,11 @@ struct FetchCard: View {
 
                 // 下载文件是 /tmp/smartroute-fetch.out。必须明说——
                 // 否则用户下载完在访达里找不到文件，会以为功能坏了。
-                Text("下载到 /tmp/smartroute-fetch.out")
+                // 默认地址是实测支持 Range 的源。这一句要说明白，否则用户
+                // 换成自家 NAS 或不支持 Range 的地址后，会看到"只有一条线
+                // 在扛"而以为是工具坏了——那是地址的问题，不是工具的。
+                Text("下载到 /tmp/smartroute-fetch.out。地址必须支持 Range（断点续传），否则只会用一条连接；默认地址已确认支持。")
+                    .fixedSize(horizontal: false, vertical: true)
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
 
