@@ -1251,12 +1251,27 @@ final class NetworkModel: ObservableObject {
         let modeArg = (on && mode != nil) ? " \(mode!)" : ""
         DispatchQueue.global().async {
             do {
-                let out = try Privileged.run("'\(script)' balance \(on ? "on\(modeArg)" : "off")")
+                // 必须用 runCapturing 而不是 run。balance on 在同网关时会被
+                // 脚本拒绝（exit 1），拒绝理由写在 stderr 上——而 do shell
+                // script 一遇到非零退出就抛错、把已捕获的输出一起丢掉。
+                // 用 run 的话用户只看到"退出码 1"，真正的原因（同网关、
+                // 有卡死风险、该跑 balance off）一个字都看不到，
+                // 下面 catch 里那几处文本匹配也就全成了死代码。
+                let (out, code) = try Privileged.runCapturing(
+                    "'\(script)' balance \(on ? "on\(modeArg)" : "off")")
                 DispatchQueue.main.async {
                     self.balanceLoading = false
                     self.loadBalance()
-                    self.balanceMessage = on ? "双网并发已开启" : "双网并发已关闭"
-                    if !out.isEmpty { self.balanceMessage = out }
+                    if code == 0 {
+                        self.balanceMessage = on ? "双网并发已开启" : "双网并发已关闭"
+                        if !out.isEmpty { self.balanceMessage += "\n" + out }
+                    } else {
+                        // 失败不许说成成功。以前这里无条件写"已开启"，
+                        // 紧接着 loadBalance() 把开关弹回去——用户同时看到
+                        // "已开启"和开关跳回原位，自相矛盾，而且不知道原因。
+                        self.balanceMessage = "开启失败：\n"
+                            + (out.isEmpty ? "（退出码 \(code)，无输出）" : out)
+                    }
                 }
             } catch {
                 DispatchQueue.main.async {
@@ -1362,12 +1377,32 @@ final class NetworkModel: ObservableObject {
         let script = ScriptLocator.scriptPath
         DispatchQueue.global().async {
             do {
-                let out = try Privileged.run("'\(script)' wifi join \(Shell.quote(ssid))")
+                // 同样必须用 runCapturing：连不上时脚本把原因写在 stderr
+                // （网络不在已保存列表、密码错、接口没激活），裸 run 会把它
+                // 连同样式丢掉，catch 里"只有已保存过的网络才能一键连接"
+                // 那句提示永远匹配不到。
+                let (out, code) = try Privileged.runCapturing("'\(script)' wifi join \(Shell.quote(ssid))")
                 DispatchQueue.main.async {
                     self.wifiJoining = ""
                     self.loadWifi()
-                    self.wifiMessage = out.isEmpty ? "已连接到 \(ssid)" : out
-                    self.wifiMessageFailed = false
+                    if code == 0 {
+                        self.wifiMessage = out.isEmpty ? "已连接到 \(ssid)" : out
+                        self.wifiMessageFailed = false
+                    } else {
+                        // 失败不许说成"已连接到"。runCapturing 把命令包成永远
+                        // 退出 0，所以脚本失败不再抛错——不查 code 的话，
+                        // 连不上也会显示"已连接到 xxx"，是假成功。
+                        var msg = out.isEmpty ? "（退出码 \(code)，无输出）" : out
+                        // 这句提示以前是死代码：它匹配的文本在 stderr 上，
+                        // 而 do shell script 非零退出时把输出一起丢掉。
+                        // 现在 stderr 并进 out 了，匹配才真正生效。
+                        if msg.contains("连接") && msg.contains("失败") {
+                            msg += "\n\n提示：只有「已保存过」的网络才能一键连接（密码在系统钥匙串里）。"
+                            msg += "\n新网络请先在系统菜单栏的 Wi-Fi 里连一次，之后这里就能一键切了。"
+                        }
+                        self.wifiMessage = "切换失败: \(msg)"
+                        self.wifiMessageFailed = true
+                    }
                 }
             } catch {
                 DispatchQueue.main.async {
@@ -1391,11 +1426,15 @@ final class NetworkModel: ObservableObject {
         let script = ScriptLocator.scriptPath
         DispatchQueue.global().async {
             do {
-                let out = try Privileged.run("'\(script)' wifi tryall")
+                let (out, code) = try Privileged.runCapturing("'\(script)' wifi tryall")
                 DispatchQueue.main.async {
                     self.wifiLoading = false
                     self.loadWifi()
-                    self.wifiMessage = out
+                    // 逐个试连失败时脚本会把"试了哪些、为什么不行"写在 stderr。
+                    // 以前这里只显示 out（stdout），失败原因整个看不见，
+                    // 用户只看到按钮转完圈什么都没发生。
+                    self.wifiMessage = (code == 0 ? "" : "试连失败（退出码 \(code)）：\n") + out
+                    self.wifiMessageFailed = (code != 0)
                 }
             } catch {
                 DispatchQueue.main.async {
@@ -1414,12 +1453,19 @@ final class NetworkModel: ObservableObject {
         let script = ScriptLocator.scriptPath
         DispatchQueue.global().async {
             do {
-                _ = try Privileged.run("'\(script)' wifi auto \(on ? "on" : "off")")
+                let (_, code) = try Privileged.runCapturing("'\(script)' wifi auto \(on ? "on" : "off")")
                 DispatchQueue.main.async {
                     self.wifiLoading = false
                     self.loadWifiFailover()
-                    self.wifiPrefMessage = on ? "已开启自动切换" : "已关闭自动切换"
-                    self.wifiPrefMessageFailed = false
+                    // 查退出码。runCapturing 让脚本失败不再抛错，不查 code
+                    // 的话设置失败也会显示"已开启自动切换"——假成功。
+                    if code == 0 {
+                        self.wifiPrefMessage = on ? "已开启自动切换" : "已关闭自动切换"
+                        self.wifiPrefMessageFailed = false
+                    } else {
+                        self.wifiPrefMessage = "设置失败（退出码 \(code)）。展开「详情」看原因，或照上面的手动命令做一遍。"
+                        self.wifiPrefMessageFailed = true
+                    }
                 }
             } catch {
                 DispatchQueue.main.async {

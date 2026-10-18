@@ -356,10 +356,18 @@ _st 192.168.1.1 10.0.0.1 | grep -q "两个接口网关相同" \
     && bad "不同网关时乱警告（狼来了）" || ok "不同网关时不警告"
 
 echo
-echo "== 13. balance on --force：同网关时的强行放行口 =="
-# 同网关时默认拒绝，但得留个口子给"我就是想验证 pf 规则"的人。
-# 这里出过真 bug：--force 没从参数里摘掉，mode 变成 "--force" 后落到
-# 用法检查的 *) 分支直接报错，等于 --force 根本用不了。
+echo "== 13. balance on --force：同网关时一律拒绝（逃生门已拆除）=="
+# 原来同网关默认拒绝、--force 放行，注释写的是"给想验证 pf 规则的人留口子"。
+# 但用户正是照着我们自己印的提示去 --force 的，然后网络卡死：
+# 回包走错接口被 pf 状态表丢弃，网页打不开、一直转圈，
+# 只能自己想到 balance off 才恢复。这个现象被报告过两次。
+#
+# 而同网关下 pf 分流收益实测为零（瓶颈在路由器后面的上游，不在入口）。
+# 零收益 + 已证实的卡死风险 = 这个口子没有理由存在，所以拆掉。
+#
+# --force 仍然要从参数里摘掉：不摘的话它会落进用法检查的 *) 分支被当成
+# mode，直接报"用法"错误（这个 bug 出过一次）。所以断言的是
+# "带 --force 也走到同网关拒绝"，而不是"用法错误"。
 cat > "$T/bin/id" <<'EOF'
 #!/bin/bash
 [ "${1:-}" = "-u" ] && { echo 0; exit 0; }   # 伪装成 root，否则过不了第一道检查
@@ -388,16 +396,21 @@ _verdict() {   # 打印 balance_on 的判定：拒绝 / 放行 / 用法错误 / 
     local out
     out="$(_bo2 "$1")"
     case "$out" in
-        *"不会变快"*)          echo "拒绝" ;;
+        *"会让网页卡壳"*)       echo "拒绝" ;;
         *"已按 --force 强开"*)   echo "放行" ;;
         *"用法"*)              echo "用法错误" ;;
         *)                     echo "其他: $(printf '%s' "$out" | head -1)" ;;
     esac
 }
 [ "$(_verdict '')" = "拒绝" ] && ok "不带 --force 被拒绝" || bad "不带 --force：$(_verdict '')"
-[ "$(_verdict '--force')" = "放行" ] && ok "--force 单独也能识别" || bad "--force 单独：$(_verdict '--force')"
-[ "$(_verdict 'fastest --force')" = "放行" ] && ok "模式在前 --force 在后" || bad "fastest --force：$(_verdict 'fastest --force')"
-[ "$(_verdict '--force fastest')" = "放行" ] && ok "--force 在前 模式在后" || bad "--force fastest：$(_verdict '--force fastest')"
+# 下面三条是新行为的核心：同网关时 --force 一律不再放行。
+# 但 --force 必须仍被从参数里摘掉，否则会落进用法检查报"用法错误"。
+[ "$(_verdict '--force')" = "拒绝" ] && ok "--force 单独也拒绝（且没被当成 mode）" || bad "--force 单独：$(_verdict '--force')"
+[ "$(_verdict 'fastest --force')" = "拒绝" ] && ok "模式在前 --force 在后也拒绝" || bad "fastest --force：$(_verdict 'fastest --force')"
+[ "$(_verdict '--force fastest')" = "拒绝" ] && ok "--force 在前 模式在后也拒绝" || bad "--force fastest：$(_verdict '--force fastest')"
+# 拒绝理由里必须给出替代方案，否则用户只知道不行、不知道该怎么办
+_bo2 '' 2>&1 | grep -q "smartroute fetch" \
+    && ok "拒绝时给出替代方案（fetch -n N）" || bad "拒绝时没说该怎么办"
 [ "$(_verdict 'round-robin')" = "拒绝" ] && ok "合法模式仍被拒（同网关）" || bad "round-robin：$(_verdict 'round-robin')"
 [ "$(_verdict 'bogus')" = "用法错误" ] && ok "非法模式仍报用法错误" || bad "bogus：$(_verdict 'bogus')"
 

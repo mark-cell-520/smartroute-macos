@@ -705,7 +705,11 @@ struct BalanceView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.gapM) {
                 if !model.balanceSameGateway.isEmpty {
-                    Banner(icon: "exclamationmark.triangle.fill", color: .orange, title: "双网并发在此网络下没有收益", message: "网线和 Wi-Fi 的网关都是 \(model.balanceSameGateway)，是同一台路由器出来的——这不是两条 WAN，而是一条 WAN 的两个入口。\n\n分流不会变快（瓶颈在路由器后面那条上游），反而会把一半连接赶到更慢的接口。建议关闭并发分流，改用「选路模式」挑一个更快的接口。")
+                    // 文案要跟上脚本的新行为：同网关时 --force 也不再放行。
+                    // 原来这里只写"没有收益、建议关闭"，而脚本还有 --force 口子，
+                    // 用户从终端强开后网络卡死（已报告两次）。现在脚本一律拒绝，
+                    // 这里要说清"试了也会被拒"，并给出真正有用的替代动作。
+                    Banner(icon: "exclamationmark.triangle.fill", color: .orange, title: "双网并发在此网络下没有收益", message: "网线和 Wi-Fi 的网关都是 \(model.balanceSameGateway)，是同一台路由器出来的——这不是两条 WAN，而是一条 WAN 的两个入口。\n\n分流不会变快（瓶颈在路由器后面那条上游），反而会把一半连接赶到更慢的接口；强开还会让网页卡壳（回包走错接口被 pf 状态表丢弃）。\n\n所以这个组合已被禁用，从终端加 --force 也会被拒绝。\n\n想让两条线一起扛一个文件：用「网速与延迟」页的 fetch 多连接下载，它显式绑接口、不依赖 pf。")
                 }
                 statusCard
                 controlCard
@@ -814,10 +818,15 @@ struct BalanceView: View {
                     .tint(model.balanceOn ? .red : .green)
                     .disabled(model.balanceLoading)
                     if !model.balanceMessage.isEmpty {
+                        // 不能限行。balance on 被拒绝时的理由是一整段
+                        // （同网关说明 + 卡死风险 + 该跑什么命令），
+                        // lineLimit(2) 会把它砍成两句看不懂的残句——
+                        // 而那正是用户唯一能看到拒绝原因的地方。
                         Text(model.balanceMessage)
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                            .lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .textSelection(.enabled)
                     }
                 }
                 if model.balanceOn {

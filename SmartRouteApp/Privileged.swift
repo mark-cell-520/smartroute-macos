@@ -37,6 +37,41 @@ enum Privileged {
     /// 做法：把输出重定向到临时日志，只把退出码打到 stdout，
     /// 再用非特权权限把日志读回来展示。
     /// - Returns: (输出内容, 退出码)
+    /// 像 run 一样执行，但把 stderr 并回 stdout，并取回真实退出码。
+    ///
+    /// 为什么必须有这个：`do shell script` 在命令返回非零时**抛错，并且把
+    /// 已经捕获到的输出一起丢掉**。而 smartroute.sh 的拒绝理由和失败诊断
+    /// 几乎全写在 stderr 上——balance on 因同网关拒绝、wifi join 连不上、
+    /// 脚本被另一个实例占着，等等。用裸 run 的话，调用方只能看到 AppleScript
+    /// 的通用错误（"退出码 1"），脚本辛苦写好的诊断一个字都到不了用户眼前。
+    ///
+    /// 这个盲区让 NetworkModel 里好几处 catch 的提示变成了死代码：它们匹配
+    /// "两个接口都有外网"、"另一个 smartroute 正在运行"、"连接"+"失败" 等
+    /// 文本，而那些文本只在 stderr 上，永远匹配不到。看起来做了容错，
+    /// 实际一次都没生效过。
+    ///
+    /// 和 runWithLog 的区别只在不落盘：那些命令的输出可能很长（balance on
+    /// 的验证过程），写进 /tmp 再读回是白费一道；这里直接在内存里拼。
+    static func runCapturing(_ command: String) throws -> (out: String, code: Int32) {
+        let wrapped = "\(command) 2>&1; echo \"SR_EXIT=$?\""
+        let stdout = try execute(wrapped)
+        var code: Int32 = -1
+        var lines = stdout.components(separatedBy: "\n")
+        // 从后往前找 SR_EXIT= 标记：取退出码，并把这一行从输出里删掉
+        // （不能让用户看到这个内部标记）
+        for i in lines.indices.reversed() {
+            let t = lines[i].trimmingCharacters(in: .whitespaces)
+            if t.hasPrefix("SR_EXIT=") {
+                code = Int32(t.dropFirst("SR_EXIT=".count)) ?? -1
+                lines.remove(at: i)
+                break
+            }
+        }
+        let out = lines.joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return (out, code)
+    }
+
     static func runWithLog(_ command: String, logFile: String) throws -> (out: String, code: Int32) {
         let wrapped = "\(command) > '\(logFile)' 2>&1; echo \"SR_EXIT=$?\""
         let stdout = try run(wrapped)

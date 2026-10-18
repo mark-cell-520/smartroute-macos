@@ -551,6 +551,63 @@ for (inp, _) in streakCases {
     isTrue(!streakText(inp).contains("  "), "streakText(\"\(inp)\") 不含连续空格")
 }
 
+print("== 18c. 提权命令的 stderr 不许被吞（假成功最隐蔽的来源）==")
+// 背景：`do shell script` 在命令返回非零时**抛错，并把已捕获到的输出一起丢掉**。
+// 而 smartroute.sh 的拒绝理由、失败诊断几乎全写在 stderr 上。于是用裸
+// Privileged.run 的调用方只能看到 AppleScript 的通用错误（"退出码 1"），
+// 脚本辛苦写好的诊断一个字都到不了用户眼前。
+//
+// 实测后果：balance on 在同网关时被脚本拒绝（exit 1 + stderr 上一整段
+// 卡死风险说明），App 侧只显示"退出码 1"。用户看不懂，转而去终端
+// --force 强开 → 网络卡死。而 NetworkModel 里那几处 catch 的提示
+// （匹配"两个接口都有外网"等文本）全是死代码——文本从来没到过。
+//
+// 锁住两件事：
+//   1) Privileged 必须提供 runCapturing（取回 stderr + 退出码）
+//   2) 四个面向用户的调用点必须用它，并且必须查退出码
+let privSrc = readSrc("SmartRouteApp/Privileged.swift")
+isTrue(privSrc.contains("static func runCapturing"), "Privileged 提供 runCapturing")
+isTrue(privSrc.contains("2>&1"), "runCapturing 把 stderr 并回 stdout")
+
+let nmSrc = readSrc("SmartRouteApp/NetworkModel.swift")
+// balance on/off：拒绝理由是一整段，丢了用户就只看到"退出码 1"
+isTrue(nmSrc.contains("Privileged.runCapturing("), "NetworkModel 用 runCapturing 而不是裸 run")
+isTrue(nmSrc.contains("wifi join"), "wifi join 路径存在")
+// 拿到退出码就必须查。runCapturing 把命令包成永远退出 0，不查 code 的话
+// 脚本失败不再抛错，会被当成成功——比原来的问题更糟（连异常都没有了）。
+let codeCheckCount = nmSrc.components(separatedBy: "if code == 0").count - 1
+isTrue(codeCheckCount >= 4, "至少 4 处按退出码分支（balance/wifi join/tryall/auto），实际 \(codeCheckCount) 处")
+// 不许再出现"无条件把结果当成功"的写法。
+//
+// 第一版这里写的是全文搜 "if code == 0" 再比位置——**空洞断言**：
+// NetworkModel.swift 第 429 行有一个无关的 if code == 0，位置正好在目标之前，
+// 于是把 balance 的判断删掉、改成 if true，166 项断言照样全过。
+// 已实测复现过这个假绿。
+//
+// 正确做法：只取 setBalance 函数体（从 func setBalance( 扫到下一个顶层 func），
+// 在**这个窗口内**比顺序。窗口不能定长——定长窗口漏 defer 的教训有过一次。
+let balBody: String = {
+    guard let st = nmSrc.range(of: "func setBalance(") else { return "" }
+    let rest = nmSrc[st.lowerBound...]
+    // 下一个顶层函数（行首 4 空格 + func）
+    if let nx = rest.range(of: "\n    func ", options: .regularExpression) {
+        return String(rest[..<nx.lowerBound])
+    }
+    return String(rest)
+}()
+isTrue(!balBody.isEmpty, "取到 setBalance 函数体")
+isTrue(balBody.contains("runCapturing"), "setBalance 用 runCapturing")
+isTrue(balBody.contains("if code == 0"), "setBalance 查退出码")
+if let ci = balBody.range(of: "if code == 0"),
+   let wi = balBody.range(of: "balanceMessage = on ?") {
+    isTrue(ci.lowerBound < wi.lowerBound,
+          "setBalance 里退出码判断在写结果之前（不再无条件说已开启）")
+} else {
+    isTrue(false, "setBalance 里找不到退出码判断或结果写入")
+}
+// 失败分支必须存在，否则 else 是空壳
+isTrue(balBody.contains("开启失败"), "setBalance 有失败分支")
+
 print("== 18. beginOp 必须配 defer 形式的 endOp ==")
 // inFlight 守卫防的是"并发跑多份 shell 把机器拖垮"。但它有个静默失效模式：
 // 如果 endOp 是在 DispatchQueue.main.async 里手动调的，那么将来任何人在那个
