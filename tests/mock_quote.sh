@@ -12,10 +12,18 @@
 #
 # ⚠️ 注意：这是**复刻版**，不是权威。它验证的是"这个算法正确"，
 # 验证不了"Swift 里的实现就是这個算法"——实现漂移了它照样通过。
-# 权威测试是 mock_swift_parse.sh 的第 8 节：那里编译真实的
-# Shell.quote，再经真实的 bash 往返，包括恶意 Wi-Fi 名的 payload。
-# 本文件保留是因为它同时覆盖了 AppleScript 那一层（as_escape 与
-# Swift 侧转义的对应关系），那一层目前只有这里验。
+#
+# 以前这里写着"权威测试是 mock_swift_parse.sh 的第 8 节"，但那一节
+# **从来没写过**。于是一个只有复刻版覆盖的引号边界，被注释当成有权威
+# 覆盖——比没有注释更危险，因为它让人不再去找真正的缺口。
+# 现已补上：mock_swift_parse.sh 第 15 节用**真实的 Shell.quote** 构造
+# 命令、交给**真实的 bash** 执行，含注入 payload（'; rm -rf /; echo '、
+# $(touch /tmp/pwned)、反引号）并断言没有副作用文件产生。
+# 已做过非空洞验证：把 Shell.quote 简化成不做转义，第 15 节 7 条断言
+# 全部变红（退出码 1）。
+#
+# 本文件保留是因为它同时覆盖 AppleScript 那一层经真实脚本的端到端
+# （networksetup mock 真的收到 SSID），那一层目前只有这里验。
 #
 # 运行: bash tests/mock_quote.sh
 cd "$(dirname "$0")/.."

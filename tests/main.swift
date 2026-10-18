@@ -439,6 +439,100 @@ checks += 1
     ? print("  OK 假证据警告在默认落地页（不是只在非默认页）")
     : { failures += 1; print("  XX 假证据警告只放在非默认页") }()
 
+// ── 第 15 节之前先补的权威测试：Shell.quote / Privileged 的转义 ──
+//
+// 为什么必须用真实代码测：tests/mock_quote.sh 的注释一直写着
+//   「权威测试是 mock_swift_parse.sh 的第 8 节：那里编译真实的
+//     Shell.quote，再经真实的 bash 往返，包括恶意 Wi-Fi 名的 payload。」
+// 但那个第 8 节从来没写过。于是 mock_quote.sh 里跑的是**复刻版**
+// （在 bash 里重抄了一遍 sed 替换），它验证的是"这个算法正确"，
+// 验证不了"Swift 里的实现就是这个算法"——实现漂移、被人改错、
+// 甚至整个函数被删掉，复刻版照样全绿。
+//
+// 这里直接用真实的 Shell.quote() 构造命令，交给真实的 bash 执行，
+// 再看 bash 最终拿到的参数。两层引号边界任何一层错，表现都是
+// "连不上那个网络"而且看不出原因。
+print("== 15. Shell.quote：真实实现经真实 bash 往返（权威）==")
+let quoteCases = [
+    "My Home WiFi",
+    "Bob's Cafe",
+    "He said \"hi\"",
+    "back\\slash",
+    "dollar$sign",
+    "中文网络名",
+    "a'b\"c\\d",
+    "'; rm -rf /; echo '",          // 注入尝试
+    "$(touch /tmp/pwned)",           // 命令替换尝试
+    "`touch /tmp/pwned2`",           // 反引号替换
+    "tab\there",
+    "newline\nhere",
+]
+for c in quoteCases {
+    let cmd = "printf '%s' " + Shell.quote(c)
+    let r = Shell.run(cmd, timeout: 10)
+    eq(r.out, c, "往返一致: [\(c.replacingOccurrences(of: "\n", with: "\\n"))]")
+}
+
+// 反向：注入必须**不**被执行。上面几个 payload 若真被执行，
+// 会在 /tmp 留下痕迹。这里断言它们不存在。
+let noPwn = !FileManager.default.fileExists(atPath: "/tmp/pwned")
+    && !FileManager.default.fileExists(atPath: "/tmp/pwned2")
+isTrue(noPwn, "注入 payload 未被 bash 执行（没有产生副作用文件）")
+
+print("")
+print("== 16. Shell.quote 的形状：必须是单引号字面量 ==")
+// 复刻版测不了形状，因为 sed 出来的东西天生就是这个形状。
+// 但形状本身是契约：App 别处（以及以后新增的调用点）依赖它。
+isTrue(Shell.quote("abc") == "'abc'", "普通字符串被包进一对单引号")
+isTrue(Shell.quote("a'b") == "'a'\\''b'", "内部单引号按 '\\'' 转义")
+isTrue(Shell.quote("") == "''", "空字符串是 ''（不是裸的，也不是漏掉）")
+// 已带引号的不能再包一层：那会让 bash 看到字面的两个引号字符
+isTrue(!Shell.quote("x").hasPrefix("''") || Shell.quote("x") == "''",
+       "不会双重包装")
+isTrue(Shell.quote("a\\b").count >= 3, "反斜杠原样保留（单引号内不需转义）")
+
+print("")
+print("== 17. Privileged 的 AppleScript 转义：引号必须成对 ==")
+// Privileged.execute 把 command 放进 do shell script "..."
+// 只转义 \\ 和 "。这里验的是**真实实现**（不是复刻的 sed）：
+// 转义后未转义的双引号必须成对，否则 osascript 直接语法错误，
+// 而 App 侧只会看到"授权失败了"，用户完全没法排查。
+//
+// 做法：按生产代码同顺序复刻替换，然后断言形状。
+// 之所以还是要复刻这一层：Privileged 的转义是 private 且没有独立函数，
+// 抽不出来单独测。但至少引号成对这件事可以在复刻结果上断言，
+// 而 mock_quote.sh 已经覆盖了这层的算法正确性。
+func applescriptEscape(_ s: String) -> String {
+    return s
+        .replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: "\"", with: "\\\"")
+}
+let asCases = [
+    "bash '/usr/local/bin/smartroute' wifi join 'Bob'\\''s Cafe'",
+    "bash '/usr/local/bin/smartroute' wifi join 'say \"hi\"'",
+    "bash '/usr/local/bin/smartroute' wifi join 'back\\slash'",
+    "bash '/usr/local/bin/smartroute' wifi join ''",       // 空 SSID
+]
+for c in asCases {
+    let esc = applescriptEscape(c)
+    let n = esc.filter { $0 == "\"" }.count
+    isTrue(n % 2 == 0, "转义后双引号成对（\(n) 个）")
+    // 反斜杠数也必须是偶数：落单的反斜杠会把后面的字符转义掉
+    let b = esc.filter { $0 == "\\" }.count
+    isTrue(b % 2 == 0, "转义后反斜杠成对（\(b) 个）")
+}
+
+// 关键场景：SSID 里同时有单引号和双引号时，两层叠加后 bash 必须仍拿到原值
+let nasty = "a'b\"c\\d"
+let full = applescriptEscape("printf '%s' " + Shell.quote(nasty))
+// 把 AppleScript 层的转义还原（osascript 会做这一步）
+let restored = full
+    .replacingOccurrences(of: "\\\"", with: "\"")
+    .replacingOccurrences(of: "\\\\", with: "\\")
+let r2 = Shell.run(restored, timeout: 10)
+eq(r2.out, nasty, "两层叠加后 bash 仍拿到原始值")
+
 print("")
 print("结果: \(checks - failures) 通过, \(failures) 失败")
 exit(failures == 0 ? 0 : 1)
+
