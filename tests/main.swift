@@ -608,6 +608,61 @@ if let ci = balBody.range(of: "if code == 0"),
 // 失败分支必须存在，否则 else 是空壳
 isTrue(balBody.contains("开启失败"), "setBalance 有失败分支")
 
+print("== 18d. fetch 一键入口：不许有骗人的按钮和假成功 ==")
+// 这页加了一张「多连接下载」卡。三个容易滑倒的地方，逐个锁住：
+//
+// 1) 「停止」按钮必须真有对应动作。界面上放了按钮而 model 没有
+//    fetchCancel()，编译能过（SwiftUI 的 Button action 是闭包，
+//    调不存在的方法会报错——所以这条主要防将来有人删了函数却留着按钮），
+//    但真正要防的是"函数存在却什么都不做"：那比不放按钮更糟，
+//    用户以为卡死了。
+// 2) 长任务必须用 runWithLog。fetch 是大文件下载，stdout 会被
+//    do shell script 的系统超时（约 2 分钟）截断甚至杀掉，
+//    而且杀的时候不抛错——表现为按钮转完圈什么都没发生。
+// 3) 必须显示脚本打印的「实测分摊」。曲线同时起伏不能证明流量被
+//    分摊到两个接口（Wi-Fi 关联着就永远有背景心跳），那一行是唯一证据。
+let nmSrc2 = readSrc("SmartRouteApp/NetworkModel.swift")
+isTrue(nmSrc2.contains("func fetchCancel()"), "NetworkModel 提供 fetchCancel")
+// fetchCancel 必须真的杀进程 + 清半成品，不能是空函数
+if let fs = nmSrc2.range(of: "func fetchCancel()") {
+    let seg = String(nmSrc2[fs.lowerBound...])
+    if let end = seg.range(of: "\n    func ") {
+        let body = String(seg[..<end.lowerBound])
+        // 必须匹配**可执行代码里的** pkill，不能只搜字符串——注释里
+        // 也写着 pkill（解释为什么用 pkill 而不是 kill）。早先只搜
+        // "pkill" 时，把整段换成 true 后这条断言仍然是绿的（注释还在），
+        // 只有 rm -f 那条红了。现在限定在 Privileged.run( 之后搜。
+        isTrue(body.contains("Privileged.run(\n") && body.contains("pkill -f"),
+              "fetchCancel 真的杀进程（不留后台下载）")
+        isTrue(body.contains("rm -f /tmp/smartroute-fetch.out"),
+              "fetchCancel 删掉半成品文件（不留假文件）")
+    } else {
+        isTrue(false, "取不到函数体结尾")
+    }
+}
+// fetchMulti 必须用 runWithLog，不能把大文件下载往 stdout 里灌
+if let fs = nmSrc2.range(of: "func fetchMulti()") {
+    let seg = String(nmSrc2[fs.lowerBound...])
+    if let end = seg.range(of: "\n    func ") {
+        let body = String(seg[..<end.lowerBound])
+        isTrue(body.contains("runWithLog"), "fetchMulti 用 runWithLog（长任务不能走 stdout）")
+        isTrue(body.contains("实测分摊"), "fetchMulti 显示实测分摊行（唯一的分摊证据）")
+        isTrue(body.contains("if code == 0"), "fetchMulti 查退出码")
+        isTrue(body.contains("max(2,"), "fetchMulti 连接数下限 2（1 条时切片无意义）")
+        isTrue(body.contains("guard !url.isEmpty"),
+              "fetchMulti 本地校验 URL 非空（别让用户白输一次管理员密码）")
+    } else {
+        isTrue(false, "取不到函数体结尾")
+    }
+}
+// 界面：卡片存在、消息区不限行（实测分摊那行可能很长）
+let vwSrc2 = readSrc("SmartRouteApp/Views.swift")
+isTrue(vwSrc2.contains("FetchCard(model: model)"), "SpeedView 挂上了 FetchCard")
+isTrue(vwSrc2.contains("struct FetchCard: View"), "FetchCard 已定义")
+isTrue(vwSrc2.contains("model.fetchCancel()"), "停止按钮接的是真函数")
+// 下载目标路径必须写明，否则用户下载完找不到文件
+isTrue(vwSrc2.contains("/tmp/smartroute-fetch.out"), "卡片写明下载到哪个文件")
+
 print("== 18. beginOp 必须配 defer 形式的 endOp ==")
 // inFlight 守卫防的是"并发跑多份 shell 把机器拖垮"。但它有个静默失效模式：
 // 如果 endOp 是在 DispatchQueue.main.async 里手动调的，那么将来任何人在那个

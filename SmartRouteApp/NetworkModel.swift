@@ -244,6 +244,15 @@ final class NetworkModel: ObservableObject {
     @Published var speedRecheck = 300
     @Published var latencyRecheck = 60
     @Published var remeasuring = false
+    // fetch 多连接下载：长任务，必须落盘看日志。
+    // 不能用 stdout 传结果——do shell script 有系统级超时（约 2 分钟），
+    // 大文件下载会被直接杀掉，而且杀的时候不抛错，表现为按钮转完圈
+    // 什么都没发生。所以统一写 /tmp 下的日志文件，再读回来显示。
+    @Published var fetchRunning = false
+    @Published var fetchNote = ""
+    @Published var fetchNoteFailed = false
+    @Published var fetchURL = "https://speed.cloudflare.com/__down?bytes=50000000"
+    @Published var fetchConns = 4
 
     // MARK: 日志页
     @Published var logAutoRefresh = true
@@ -1521,6 +1530,80 @@ final class NetworkModel: ObservableObject {
     }
 
     /// 立即重新测量（用户等不及 SPEED_RECHECK 时点这个）
+    /// 多连接下载，显式把连接分摊到各接口（不依赖 pf，所以没有卡壳问题）
+    ///
+    /// 为什么值得有一键入口：同网关时 pf 分流已禁用（零收益 + 卡壳风险），
+    /// 而实测分摊 en0/en1 比全挤 en0 快 50-60%。fetch 是唯一还能拿到这个
+    /// 收益的路径，但它原来只在命令行里，用户根本不知道存在。
+    func fetchMulti() {
+        let url = fetchURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        // 空 URL 不能静默开始：脚本会报"取不到响应"，但那要等提权之后才发生，
+        // 用户白输一次管理员密码。先在本地挡掉。
+        guard !url.isEmpty else {
+            fetchNote = "请先填下载地址。"
+            fetchNoteFailed = true
+            return
+        }
+        // 连接数下限 2：1 条连接时 fetch 内部会退化成单段单请求（脚本里
+        // -n 1 不切片），点这个按钮就没意义了。
+        let n = max(2, min(16, fetchConns))
+        fetchConns = n
+        fetchRunning = true
+        fetchNote = ""
+        fetchNoteFailed = false
+        let script = ScriptLocator.scriptPath
+        let log = "/tmp/smartroute-fetch.log"
+        DispatchQueue.global().async {
+            do {
+                // runWithLog 而不是 run：
+                //  · run 只给字符串，拿不到退出码 → 失败会被当成成功
+                //  · 更要紧的是 fetch 是长任务，stdout 会被 do shell script
+                //    的系统超时截断/杀掉，而且杀的时候不抛错
+                // 落盘 + 读回，两个问题一起解。
+                let (_, code) = try Privileged.runWithLog(
+                    "'\(script)' fetch '\(Shell.quote(url))' -o /tmp/smartroute-fetch.out -n \(n)",
+                    logFile: log)
+                DispatchQueue.main.async {
+                    self.fetchRunning = false
+                    if code == 0 {
+                        // 从日志里抓「实测分摊」行——那是唯一能证明流量真的
+                        // 分摊到两个接口的证据。曲线同时起伏不能证明（Wi-Fi
+                        // 关联着就永远有背景心跳）。
+                        var note = "下载完成。"
+                        if let data = FileManager.default.contents(atPath: log),
+                           let text = String(data: data, encoding: .utf8) {
+                            for line in text.components(separatedBy: "\n") {
+                                if line.contains("实测分摊") {
+                                    note += "\n" + line.trimmingCharacters(in: .whitespaces)
+                                    break
+                                }
+                            }
+                        }
+                        self.fetchNote = note
+                        self.fetchNoteFailed = false
+                    } else {
+                        // 失败必须给原因。URL 不支持 Range 时脚本会退回单连接
+                        // （那不是失败，是退出码 0），所以这里 code != 0 一般是
+                        // 网络不通、URL 无效、或两个接口都没外网。
+                        self.fetchNote = "下载失败（退出码 \(code)）。常见原因：地址无效、网络不通、或两个接口当前都没有外网。详情见 \(log)"
+                        self.fetchNoteFailed = true
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.fetchRunning = false
+                    switch error {
+                    case PrivilegedError.cancelled:
+                        self.fetchNote = "已取消授权，没有开始下载。"
+                    default:
+                        self.fetchNote = "下载失败：\(error.localizedDescription)"
+                    }
+                    self.fetchNoteFailed = true
+                }
+            }
+        }
+    }
+
     func remeasureNow() {
         remeasuring = true
         measurementsNote = ""
@@ -1558,6 +1641,37 @@ final class NetworkModel: ObservableObject {
                         self.measurementsNote = "重新测量失败：\(error.localizedDescription)"
                     }
                 }
+            }
+        }
+    }
+
+    /// 停止正在进行的多连接下载
+    ///
+    /// 为什么要专门做：界面上放了「停止」按钮，就不能让它点了没反应——
+    /// 那比不放按钮更糟（用户以为卡死了）。do shell script 一旦跑起来，
+    /// 在它自己返回前无法从 App 侧中断，只能从外部杀掉目标进程。
+    ///
+    /// 两个必须做的清理：
+    ///   · 杀掉 curl 子进程。只杀外层 shell 的话 curl 会继续下载，
+    ///     按钮显示停了、磁盘还在涨。
+    ///   · 删掉 /tmp/smartroute-fetch.out 的半成品。留着的话用户过两天
+    ///     在 /tmp 翻到一个不完整的文件，会以为下载成功过。
+    func fetchCancel() {
+        guard fetchRunning else { return }
+        let script = ScriptLocator.scriptPath
+        DispatchQueue.global().async {
+            // pkill -f 匹配完整命令行：fetch 的每个 worker 是独立 curl，
+            // 且带 --interface，所以只杀外层 bash 是杀不干净的。
+            // -o 的输出文件名是特征串，用它来锁定这一次下载的进程，
+            // 避免误杀用户自己起的 curl。
+            _ = try? Privileged.run(
+                "pkill -f 'curl.*smartroute-fetch.out' 2>/dev/null; "
+                    + "pkill -f 'smartroute.sh fetch' 2>/dev/null; "
+                    + "rm -f /tmp/smartroute-fetch.out /tmp/smartroute-fetch.out.* 2>/dev/null; true")
+            DispatchQueue.main.async {
+                self.fetchRunning = false
+                self.fetchNote = "已停止，下载到一半的文件已删除。"
+                self.fetchNoteFailed = false
             }
         }
     }

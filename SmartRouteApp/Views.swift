@@ -467,6 +467,10 @@ struct SpeedView: View {
                 ForEach(model.monitoredDevices, id: \.self) { dev in
                     SpeedCard(model: model, dev: dev)
                 }
+                // 多连接下载入口。放在这里而不是「并发」页：同网关时 pf 分流
+                // 已禁用，这页是用户找"怎么让下载更快"最自然的地方；
+                // 且它要看的实测分摊结论就该和速率曲线放在一起。
+                FetchCard(model: model)
                 qualityCard
                 // 用户装完最想知道的是"网变快了吗"。原来这页只有实时曲线，
                 // 没有基线也没有对比——没下载时曲线贴近 0，用户反而觉得没变快。
@@ -576,6 +580,84 @@ struct SpeedView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
+/// 多连接下载：显式把连接分摊到两个接口，不依赖 pf 分流
+///
+/// 为什么单独做一张卡：实测同网关时把连接分摊 en0/en1 比全挤 en0 快 50-60%
+/// （首轮 15.2 vs 9.3 Mbps，次轮 24.1 vs 18.6 Mbps），而 pf 分流已被禁用
+/// （零收益 + 卡壳风险）。fetch 是唯一还能拿到这个收益的路径，
+/// 但它原来只在命令行里，用户根本不知道存在。
+struct FetchCard: View {
+    @ObservedObject var model: NetworkModel
+
+    var body: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 10) {
+                Label("多连接下载（把连接分摊到两个接口）",
+                      systemImage: "arrow.triangle.branch")
+                    .font(.headline)
+
+                Text("和「双网并发」的区别：双网并发靠 pf 按连接轮询分配，在你的同网关网络下已禁用；这个是把同一个文件切成几段，每段显式绑定到一个接口上下载。不经过 pf，所以没有网页卡壳的问题。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                TextField("下载地址", text: $model.fetchURL)
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(model.fetchRunning)
+
+                HStack {
+                    Text("连接数")
+                        .foregroundStyle(.secondary)
+                    Stepper(value: $model.fetchConns, in: 2...16, step: 1) {
+                        Text("\(model.fetchConns) 条")
+                            .monospacedDigit()
+                    }
+                    .disabled(model.fetchRunning)
+                    Spacer()
+                }
+
+                // 下载文件是 /tmp/smartroute-fetch.out。必须明说——
+                // 否则用户下载完在访达里找不到文件，会以为功能坏了。
+                Text("下载到 /tmp/smartroute-fetch.out")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+
+                HStack {
+                    Button {
+                        model.fetchMulti()
+                    } label: {
+                        if model.fetchRunning {
+                            ProgressView().scaleEffect(0.7).frame(width: 16, height: 16)
+                            Text("下载中…")
+                        } else {
+                            Text("开始下载")
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(model.fetchRunning)
+
+                    if model.fetchRunning {
+                        Button("停止") { model.fetchCancel() }
+                            .buttonStyle(.bordered)
+                    }
+                    Spacer()
+                }
+
+                if !model.fetchNote.isEmpty {
+                    // 不许限行：成功时要显示脚本打印的「实测分摊」行，
+                    // 那是证明流量真的分摊到两个接口的唯一证据。
+                    Text(model.fetchNote)
+                        .font(.caption)
+                        .foregroundStyle(model.fetchNoteFailed ? .red : .secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                }
+            }
+            .padding()
         }
     }
 }
