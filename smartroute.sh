@@ -2321,13 +2321,47 @@ MSG
     else
         echo "  分片走默认路由（只有一条可用链路，或 --interface 探测未通过）"
     fi
+    # ── 接口健康：某条线连续失败就降级，不再往它上面派片 ──
+    #
+    # worker 是子进程，父进程的变量改不到它们之间，所以只能用文件记账
+    # （$T/devfail_<设备>）。这是并发 worker 间共享状态的唯一方式。
+    #
+    # 为什么需要它：以前 _spread_pick 是静态轮询，一条线开始抽风之后，
+    # 剩余分片还源源不断派过去，每一片都要等满 3 次重试才失败；而第一次
+    # 失败就会让父进程建 $T/stop、把整个下载毙掉。降级之后这条线不再接
+    # 新片，已派出去的片也有 _fetch_seg 的兜底，下载能继续下完。
+    FETCH_DEV_FAIL_MAX=2
+    _fetch_dev_fail() {   # $1=设备名（空则什么都不做）
+        [ -n "$1" ] || return 0
+        local f="$T/devfail_$1" n=0
+        [ -f "$f" ] && n="$(cat "$f" 2>/dev/null)"
+        case "$n" in ''|*[!0-9]*) n=0 ;; esac
+        printf '%s\n' "$(( n + 1 ))" > "$f"
+    }
+    _fetch_dev_ok() {     # $1=设备名 -> 0 健康 / 1 已降级（空设备视为健康）
+        [ -n "$1" ] || return 0
+        local f="$T/devfail_$1" n=0
+        [ -f "$f" ] && n="$(cat "$f" 2>/dev/null)"
+        case "$n" in ''|*[!0-9]*) n=0 ;; esac
+        [ "$n" -lt "$FETCH_DEV_FAIL_MAX" ]
+    }
+
     # 片号 -> 设备名。空表示不绑。
     _spread_pick() {   # $1=片号 -> stdout: 设备名
         [ -z "$_spread_devs" ] && { echo ""; return 0; }
         local i="$1" k=0 d want
         want=$(( i % _spread_n ))
         for d in $_spread_devs; do
-            if [ "$k" -eq "$want" ]; then echo "$d"; return 0; fi
+            if [ "$k" -eq "$want" ]; then
+                # 这条线降级了就换另一条，而不是退回不绑：
+                # 不绑走的是默认路由，而默认路由往往正是出问题那条。
+                # 两条都降级才真的不绑（那时默认路由也没得选了）。
+                if _fetch_dev_ok "$d"; then echo "$d"; return 0; fi
+                for d in $_spread_devs; do
+                    if _fetch_dev_ok "$d"; then echo "$d"; return 0; fi
+                done
+                echo ""; return 0
+            fi
             k=$(( k + 1 ))
         done
         echo ""
@@ -2373,10 +2407,22 @@ MSG
         # （en0/en1）不可能含空格，未加引号的 $ifpre 展开是安全的。
         local ifpre=""
         [ -n "$dev" ] && ifpre="--interface $dev"
-        for try in 1 2 3; do
+
+        # 一次尝试。-> 0 成功 / 1 可重试 / 2 HTTP 错误（重试没意义）
+        #
+        # --connect-timeout 10：连接阶段最多等 10 秒。以前没有，
+        #   接口"关联着但不通"时 TCP 握手能挂到系统默认的几十秒。
+        # --speed-limit 20480 --speed-time 20：20 秒内平均低于 20KB/s 就中止。
+        #   这是抓"接口假死"的关键——那种情况下连接建得起来、数据不来，
+        #   只靠 --max-time 要等满整个上限，而用户看到的就是命令卡住。
+        #   真在下载时远高于 20KB/s（实测 27-33 Mbps），不会误伤。
+        # --max-time 300：配合上面两项，从 600 降下来。600 秒的代价是
+        #   假死时要 3 次 × 600 秒才发现，用户早以为软件死了。
+        _fetch_try() {
             # --fail 让 4xx/5xx 返回非 0；-w 把状态码写出来，即使失败也有值
             # （连不上时是 000，正好和 HTTP 错误区分开）。
-            http="$(curl -sS -L --fail --max-time 600 --range "${st}-${en}" \
+            http="$(curl -sS -L --fail --connect-timeout 10 --speed-limit 20480 \
+                    --speed-time 20 --max-time 300 --range "${st}-${en}" \
                     $ifpre \
                     -o "$d/p$idx" -w '%{http_code}' "$u" 2>/dev/null)"
             rc=$?
@@ -2390,14 +2436,48 @@ MSG
                 got=0
                 [ -f "$d/p$idx" ] && got="$(wc -c < "$d/p$idx" | tr -d ' ')"
                 [ "$got" = $(( en - st + 1 )) ] && return 0
-            elif [ -n "$http" ] && [ "$http" != "000" ] && [ "$http" -ge 400 ] 2>/dev/null; then
-                # HTTP 错误：重试同样的请求不会有不同结果，立刻失败并带上状态码
-                printf 'HTTP %s\n' "$http" > "$d/httperr_$idx"
                 return 1
             fi
-            # 网络错误或字节数不符：值得再试
-            [ "$try" -lt 3 ] && sleep 1
+            # 429/503 是"服务端限流/过载"，等一会儿就好——我们实测被
+            # proof.ovh.net 和 hetzner 用 429 打过，多连接下载尤其容易触发。
+            # 当成致命错误会让整个下载立刻毙掉，而那只是需要退避。
+            if [ "$http" = "429" ] || [ "$http" = "503" ]; then
+                return 3
+            fi
+            if [ -n "$http" ] && [ "$http" != "000" ] && [ "$http" -ge 400 ] 2>/dev/null; then
+                # 其它 HTTP 错误：重试同样的请求不会有不同结果，带上状态码收手
+                printf 'HTTP %s\n' "$http" > "$d/httperr_$idx"
+                return 2
+            fi
+            return 1
+        }
+
+        for try in 1 2 3; do
+            _fetch_try
+            case $? in
+                0) return 0 ;;
+                2) return 1 ;;
+                3) [ "$try" -lt 3 ] && sleep $(( try * 5 )) ;;   # 退避：5s/10s
+                *) [ "$try" -lt 3 ] && sleep 1 ;;
+            esac
         done
+
+        # ── 跨接口兜底 ──
+        # 绑定的设备 3 次都没成。以前到这里直接 return 1，父进程会建
+        # $T/stop 把整个下载毙掉——一条线抖一下，整个文件白下。
+        # 现在先记一笔降级（_spread_pick 不再往这条线派新片），
+        # 再**不绑接口**试一次：默认路由一定是通的（单连接下载一直走它）。
+        # 注意不能反过来"先换另一条设备"——另一条可能也在抽风，
+        # 而默认路由是系统自己选的，最可能通。
+        if [ -n "$dev" ]; then
+            _fetch_dev_fail "$dev"
+            ifpre=""
+            _fetch_try
+            case $? in
+                0) return 0 ;;
+                2) return 1 ;;
+            esac
+        fi
         return 1
     }
 
@@ -2532,6 +2612,23 @@ MSG
     fi
     if [ "$_ramped" = "1" ] && [ "$_spawned" -gt "$n_start" ]; then
         echo "  自适应扩连：从 $n_start 条逐步加到 $_spawned 条（服务端扛得住才加）"
+    fi
+    # 哪条线被降级了要说出来。用户看到"分片改走默认路由"之类的结果时，
+    # 有权知道是哪条线在半路上掉了——否则他只看到一个莫名的降速，
+    # 完全没法判断是该重试还是该换环境。
+    if [ -n "$_spread_devs" ]; then
+        local _dem="" _dname _dn
+        for _dname in $_spread_devs; do
+            _dn=0
+            [ -f "$T/devfail_$_dname" ] && _dn="$(cat "$T/devfail_$_dname" 2>/dev/null)"
+            case "$_dn" in ''|*[!0-9]*) _dn=0 ;; esac
+            if [ "$_dn" -ge "$FETCH_DEV_FAIL_MAX" ]; then
+                _dem="$_dem$_dname "
+            fi
+        done
+        if [ -n "$_dem" ]; then
+            echo "  ⚠️  ${_dem% } 连续失败，已停止往它派片（剩余分片改走另一条线/默认路由）"
+        fi
     fi
     if [ "$_stop_seen" = "1" ]; then
         # 把还在跑的 worker 杀掉。它们的 curl 会随之退出（父进程被 kill

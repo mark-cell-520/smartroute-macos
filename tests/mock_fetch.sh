@@ -247,7 +247,7 @@ echo "== 9. HTTP 错误不能被误诊成 Range 不兼容 =="
 # 以前 _fetch_seg 没加 --fail：404 时 curl 返回 0、错误页写进分片，
 # 走到"字节数不符"分支，重试 3 次后报"服务端 Range 行为不一致"，
 # 用户会跑去换源，而真正原因只是 URL 写错。
-grep -q 'curl -sS -L --fail --max-time 600' smartroute.sh \
+grep -q "curl -sS -L --fail --connect-timeout 10 --speed-limit 20480" smartroute.sh \
     && ok "分片下载带 --fail" || bad "分片下载没带 --fail"
 grep -q "httperr_" smartroute.sh \
     && ok "HTTP 错误单独记录" || bad "没有单独记录 HTTP 错误"
@@ -371,9 +371,18 @@ echo "== 16. 分片绑接口：不依赖 pf 也让两条线一起扛 =="
 #
 # 显式 --interface 不依赖 pf：每个分片自己选出口。本机两接口同网段同网关，
 # 实测 curl --interface en0 / en1 同时下载都正常（各 ~27-33 Mbps）。
-grep -q 'curl -sS -L --fail --max-time 600 --range "${st}-${en}" \\
-                    $ifpre \\' smartroute.sh \
-    && ok "_fetch_seg 会把接口参数传给 curl" || bad "_fetch_seg 没有传接口参数"
+# ⚠️ 这里必须写成**单行** pattern。曾经写成跨两行的单引号串：
+#     grep -q 'curl ... --range "${st}-${en}"' ... smartroute.sh
+# grep 把 pattern 里的换行当成"多个 pattern 取或"，于是它实际匹配的是源码里
+# 某一行的 "$ifpre "——跟 --fail、--max-time 一点关系都没有。那条断言因此
+# **永远是空的**：curl 参数全改错了它也照样打 OK。
+# 分成两条单行断言，各自盯一个真实存在的行为。
+grep -q 'curl -sS -L --fail --connect-timeout 10 --speed-limit 20480' smartroute.sh \
+    && ok "_fetch_seg 带 --fail（HTTP 错误不会被误诊成 Range 不兼容）" \
+    || bad "_fetch_seg 没有 --fail，URL 写错会被误诊成服务端 Range 问题"
+grep -qF '$ifpre \' smartroute.sh \
+    && ok "curl 调用里展开接口参数（不绑时为空）" \
+    || bad "接口参数没有传给 curl"
 grep -qF 'local ifpre=""' smartroute.sh \
     && ok "接口参数默认为空（不绑）" || bad "没有 ifpre 默认值"
 grep -qF 'dev="$(_spread_pick "$idx")"' smartroute.sh \
@@ -384,20 +393,34 @@ grep -qF '_fetch_seg "$idx" "$st" "$en" "$u" "$d" "$dev"' smartroute.sh \
 # _spread_pick 的行为：两个设备时必须轮询，一个设备时恒返回它，空时不绑
 _sp="$(ev '
     _spread_devs="en0 en1"; _spread_n=2
+    _fetch_dev_ok() { [ -n "$1" ] || return 0; return 0; }
     _spread_pick() { [ -z "$_spread_devs" ] && { echo ""; return 0; }
         local i="$1" k=0 d want; want=$(( i % _spread_n ))
         for d in $_spread_devs; do
-            if [ "$k" -eq "$want" ]; then echo "$d"; return 0; fi
+            if [ "$k" -eq "$want" ]; then
+                if _fetch_dev_ok "$d"; then echo "$d"; return 0; fi
+                for d in $_spread_devs; do
+                    if _fetch_dev_ok "$d"; then echo "$d"; return 0; fi
+                done
+                echo ""; return 0
+            fi
             k=$(( k + 1 )); done; echo ""; }
     for i in 0 1 2 3 4 5; do _spread_pick $i; done')"
 [ "$_sp" = "$(printf 'en0\nen1\nen0\nen1\nen0\nen1')" ] \
     && ok "两个设备按片号轮询（0/2/4→en0，1/3/5→en1）" || bad "轮询不对: $(echo $_sp | tr '\n' ' ')"
 
 _sp1="$(ev '_spread_devs="en1"; _spread_n=1
+    _fetch_dev_ok() { [ -n "$1" ] || return 0; return 0; }
     _spread_pick() { [ -z "$_spread_devs" ] && { echo ""; return 0; }
         local i="$1" k=0 d want; want=$(( i % _spread_n ))
         for d in $_spread_devs; do
-            if [ "$k" -eq "$want" ]; then echo "$d"; return 0; fi
+            if [ "$k" -eq "$want" ]; then
+                if _fetch_dev_ok "$d"; then echo "$d"; return 0; fi
+                for d in $_spread_devs; do
+                    if _fetch_dev_ok "$d"; then echo "$d"; return 0; fi
+                done
+                echo ""; return 0
+            fi
             k=$(( k + 1 )); done; echo ""; }
     for i in 0 1 2; do _spread_pick $i; done')"
 [ "$_sp1" = "$(printf 'en1\nen1\nen1')" ] \
@@ -406,6 +429,87 @@ _sp1="$(ev '_spread_devs="en1"; _spread_n=1
 # 探测未通过时必须退回不绑——硬绑会让每个分片都失败，比不绑糟得多
 grep -qF '[ "$_spread_ok" = "1" ] || _spread_devs=""' smartroute.sh \
     && ok "探测失败时退回不绑" || bad "探测失败没有退回，会全军覆没"
+
+echo ""
+echo "== 17. 并发稳定性：一条线抽风不该毙掉整个下载 =="
+# 以前四个缺口，任何一个都让"双网并发"比单连接更脆：
+#   1) 一个分片失败 → worker return 1 → 父进程建 $T/stop → 全部 worker 被杀
+#   2) 3 次重试都绑同一个设备，那条线死了就没有第二次机会
+#   3) --max-time 600：接口假死时要 3×600 秒才发现，用户以为软件卡死
+#   4) 429/503 被当成致命错误——实测被 proof.ovh.net 和 hetzner 429 打过
+
+grep -qF 'FETCH_DEV_FAIL_MAX=2' smartroute.sh \
+    && ok "定义了接口降级阈值" || bad "没有降级阈值，坏线会一直被派片"
+grep -qF '_fetch_dev_fail()' smartroute.sh \
+    && ok "有失败记账函数（worker 是子进程，只能用文件共享状态）" \
+    || bad "没有失败记账，降级无从判断"
+grep -qF '_fetch_dev_fail "$dev"' smartroute.sh \
+    && ok "分片在坏设备上失败时记账" || bad "失败了不记账，下次还派给它"
+grep -qF 'ifpre=""' smartroute.sh \
+    && ok "兜底路径会解除绑定改走默认路由" || bad "没有跨接口兜底，一条线抖就全废"
+
+# _fetch_dev_ok 的阈值行为：0/1 次失败算健康，2 次起算降级
+_dv="$(ev 'T=/tmp/sr_fetch_dv; rm -rf $T; mkdir -p $T
+    FETCH_DEV_FAIL_MAX=2
+    _fetch_dev_fail() { [ -n "$1" ] || return 0
+        local f="$T/devfail_$1" n=0; [ -f "$f" ] && n="$(cat "$f" 2>/dev/null)"
+        case "$n" in ""|*[!0-9]*) n=0 ;; esac; printf "%s\n" "$((n+1))" > "$f"; }
+    _fetch_dev_ok() { [ -n "$1" ] || return 0
+        local f="$T/devfail_$1" n=0; [ -f "$f" ] && n="$(cat "$f" 2>/dev/null)"
+        case "$n" in ""|*[!0-9]*) n=0 ;; esac; [ "$n" -lt "$FETCH_DEV_FAIL_MAX" ]; }
+    _fetch_dev_fail en0; _fetch_dev_ok en0 && echo "1次=健康" || echo "1次=降级"
+    _fetch_dev_fail en0; _fetch_dev_ok en0 && echo "2次=健康" || echo "2次=降级"
+    _fetch_dev_ok "" && echo "空设备=健康" || echo "空设备=降级"')"
+[ "$_dv" = "$(printf '1次=健康\n2次=降级\n空设备=健康')" ] \
+    && ok "降级阈值正确（1 次失败仍健康，2 次起降级；空设备恒健康）" \
+    || bad "阈值不对: $(echo $_dv | tr '\n' ' ')"
+
+# _spread_pick 绕路：选中的线降级了就换另一条，两条都降级才不绑
+_spd="$(ev 'T=/tmp/sr_fetch_sp; rm -rf $T; mkdir -p $T
+    _spread_devs="en0 en1"; _spread_n=2; FETCH_DEV_FAIL_MAX=2
+    _fetch_dev_fail() { [ -n "$1" ] || return 0
+        local f="$T/devfail_$1" n=0; [ -f "$f" ] && n="$(cat "$f" 2>/dev/null)"
+        case "$n" in ""|*[!0-9]*) n=0 ;; esac; printf "%s\n" "$((n+1))" > "$f"; }
+    _fetch_dev_ok() { [ -n "$1" ] || return 0
+        local f="$T/devfail_$1" n=0; [ -f "$f" ] && n="$(cat "$f" 2>/dev/null)"
+        case "$n" in ""|*[!0-9]*) n=0 ;; esac; [ "$n" -lt "$FETCH_DEV_FAIL_MAX" ]; }
+    _spread_pick() { [ -z "$_spread_devs" ] && { echo ""; return 0; }
+        local i="$1" k=0 d want; want=$(( i % _spread_n ))
+        for d in $_spread_devs; do
+            if [ "$k" -eq "$want" ]; then
+                if _fetch_dev_ok "$d"; then echo "$d"; return 0; fi
+                for d in $_spread_devs; do
+                    if _fetch_dev_ok "$d"; then echo "$d"; return 0; fi
+                done
+                echo ""; return 0
+            fi
+            k=$(( k + 1 )); done; echo ""; }
+    echo "都没坏: $(_spread_pick 1)"
+    _fetch_dev_fail en1; _fetch_dev_fail en1
+    echo "en1降级: $(_spread_pick 1)"
+    _fetch_dev_fail en0; _fetch_dev_fail en0
+    echo "都降级: $(_spread_pick 1)"')"
+[ "$_spd" = "$(printf '都没坏: en1\nen1降级: en0\n都降级: ')" ] \
+    && ok "en1 降级后改派 en0，两条都降级才不绑" \
+    || bad "绕路逻辑不对: $(echo $_spd | tr '\n' ' ')"
+
+# 429/503 必须可重试，不能当致命错误
+grep -qF 'if [ "$http" = "429" ] || [ "$http" = "503" ]; then' smartroute.sh \
+    && ok "429/503 判定为可退避重试" || bad "429/503 被当致命错误，服务端一限流整个下载就毙"
+grep -qF 'sleep $(( try * 5 ))' smartroute.sh \
+    && ok "退避时长递增（5s/10s）" || bad "没有递增退避，立刻重试只会再吃一个 429"
+
+# 假死检测参数
+grep -qF -- '--speed-limit 20480 --speed-time 20' smartroute.sh \
+    && ok "有低速超时（20 秒低于 20KB/s 即中止）" || bad "没有低速超时，接口假死时要等满 max-time"
+grep -qF -- '--connect-timeout 10' smartroute.sh \
+    && ok "连接阶段 10 秒超时" || bad "没有连接超时，接口不通时握手能挂几十秒"
+grep -qF -- '--max-time 300' smartroute.sh \
+    && ok "单次尝试上限降到 300 秒" || bad "max-time 仍是 600，假死时 3 次要等半小时"
+
+# 降级必须告知用户，不能只是莫名降速
+grep -qF '连续失败，已停止往它派片' smartroute.sh \
+    && ok "降级的接口会报告出来" || bad "降级不报告，用户只看到莫名降速却不知道原因"
 
 echo ""
 echo "结果: $((PASS - FAIL)) 通过, $FAIL 失败"
