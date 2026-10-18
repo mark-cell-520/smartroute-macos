@@ -138,7 +138,18 @@ struct StatusView: View {
 · 路由器出故障时两个接口一起断——自动选路没有可切换的目标
 · 双网并发也不会变快（瓶颈在路由器后面那条上游）
 
-还能做的：两个接口仍有速率差异时，用「选路模式 → 网速优先」挑更快的那条。
+还能做的（按实测收益排序）：
+· 两个接口仍有速率差异时，用「选路模式 → 网速优先」挑更快的那条
+· 想让两条线一起扛一个文件：用智能路由的 fetch 多连接下载。它按接口
+  显式绑连接，不依赖 pf 分流，也没有 pf 分流的网络卡死风险
+
+关于双接口在此网络下的真实收益：IPv4 出口是同一个，带宽不会叠加。
+实测到的是稳定性——两条连接挤在同一条线上时，总有一条被饿到 10-20 秒；
+分到两条线上后最慢 5 秒，波动系数从 48-69% 降到 12%。
+
+⚠️ 「两条实时曲线同时起伏」不能证明流量被分摊：Wi-Fi 只要关联着就永远有
+背景心跳（mDNS/ARP/DHCP/iCloud），pf 没生效时那一侧也「有流量」。
+要看真实分摊，用 fetch 下载后读它打印的「实测分摊」。
 """)
                 }
                 // 【链路能力差距】以太网协商速率远低于网卡能力时必须报警。
@@ -531,9 +542,42 @@ struct SpeedView: View {
     private var hintCard: some View {
         Card {
             VStack(alignment: .leading, spacing: Theme.gapS) {
-                Label("想两个接口同时跑流量？去「双网并发」页开启 pf 分流。", systemImage: "arrow.triangle.branch")
+                // 三处修正，都是实测出来的，不是措辞润色：
+                //
+                // 1) 原来写"唯一办法是去开 pf 分流"。不对——smartroute fetch -n N
+                //    按 --interface 显式绑接口，不依赖 pf 也能让两条线一起扛。
+                //    而同网关拓扑下 pf 分流没有带宽收益，还有网络卡死风险
+                //    （实测发生过：加载规则后整个网络不通，要 balance off 才恢复）。
+                //    把用户往唯一那条又有风险又没收益的路上引，是不对的。
+                //
+                // 2) 原来写"两条曲线同时起伏即证明流量被分摊"。这是**假证据**：
+                //    Wi-Fi 只要关联着就永远有背景流量（mDNS/ARP/DHCP/iCloud 心跳），
+                //    实测几百字节起步。pf route-to 根本没生效时那一侧也"有流量"。
+                //    balance_validate 当初就是为这个才把门槛提到 64KB+10% 的，
+                //    而这里却在教用户看那个假信号——自相矛盾。
+                //
+                // 3) 同网关（同一台路由器）时 IPv4 出口是同一个，两条线不是两条 WAN。
+                //    实测收益不在带宽叠加，在把抖动的尾巴消掉（两条连接挤一条线时
+                //    总有一条被饿到 10-20 秒，分到两条线上最慢 5 秒，波动系数
+                //    48-69% 降到 12%）。说清楚，用户才不会为不存在的带宽失望。
+                Label("想让两条线一起扛一个文件？用智能路由的 fetch 多连接下载。", systemImage: "arrow.triangle.branch")
                     .font(.callout)
-                Text("开启后这里能直接看到两个接口的实时曲线同时起伏，即证明流量被分摊。")
+                Text("它按接口显式绑连接，不依赖 pf 分流，也不会有 pf 分流的网络卡死风险。")
+                    .font(.caption).foregroundStyle(.secondary)
+
+                // 同网关优先取 snapshot 的（每次刷新都有，不用等用户翻开并发页）；
+                // 它为空时再退回 balance status 解析出来的那个。
+                let sameGw = model.snapshot.sameGateway.isEmpty
+                    ? model.balanceSameGateway : model.snapshot.sameGateway
+                if !sameGw.isEmpty {
+                    Label("你的两个接口网关相同（\(sameGw)），不是两条 WAN。", systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                    Text("IPv4 走同一个上游出口，带宽不会叠加。实测收益是稳定性：分到两条线上后，慢尾巴从 10-20 秒降到 5 秒以内。")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+
+                Text("曲线同时起伏不能证明流量被分摊——Wi-Fi 关联着就永远有背景心跳。要看真实分摊，用 fetch 下载后读它打印的「实测分摊」。")
                     .font(.caption).foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)

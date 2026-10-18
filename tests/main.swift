@@ -404,6 +404,7 @@ func structBody(_ name: String) -> String {
 }
 let statusBody = structBody("StatusView")
 let daemonBody = structBody("DaemonView")
+let speedBody = structBody("SpeedView")
 checks += 1
 statusBody.contains("flapCount")
     ? print("  OK flap 提示在 StatusView（默认落地页）")
@@ -417,6 +418,26 @@ checks += 1
 statusBody.contains("sameGateway") && statusBody.contains("flapCount")
     ? print("  OK 状态页同时有原因（同网关）和证据（flap）")
     : { failures += 1; print("  XX 状态页缺其中一项") }()
+// 只告诉用户"没用"而不告诉他能做什么，等于把人挡在门口就不管了。
+// 同网关横幅必须给出可执行的动作，否则用户看完只剩下失望。
+checks += 1
+statusBody.contains("fetch 多连接下载")
+    ? print("  OK 状态页给出了替代做法（fetch 多连接下载，不依赖 pf）")
+    : { failures += 1; print("  XX 状态页只说没用、没给能做什么") }()
+// 假证据警告也必须在默认落地页。这轮实测过：StatusView 原来的提示卡
+// 教用户"看两条曲线同时起伏即证明被分摊"，而 Wi-Fi 关联着就永远有背景
+// 心跳——那正是 balance_validate 当初把门槛提到 64KB+10% 要排除的假信号。
+// 结论放错页等于没说，而教人看假信号比不说更糟。
+checks += 1
+statusBody.contains("不能证明流量被分摊")
+    ? print("  OK 状态页警告了假证据（曲线起伏 ≠ 流量分摊）")
+    : { failures += 1; print("  XX 状态页没警告假证据，用户会拿背景心跳当成效") }()
+// 这三条只在 SpeedView 有是不够的——默认落地页是 StatusView。
+// 曾经把同网关+替代方案写进了 SpeedView，用户不翻页就永远看不到。
+checks += 1
+!speedBody.contains("不能证明流量被分摊") || statusBody.contains("不能证明流量被分摊")
+    ? print("  OK 假证据警告在默认落地页（不是只在非默认页）")
+    : { failures += 1; print("  XX 假证据警告只放在非默认页") }()
 
 print("")
 print("结果: \(checks - failures) 通过, \(failures) 失败")
