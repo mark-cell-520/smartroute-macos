@@ -145,10 +145,47 @@ o="$(ETH_RES=ok WIFI_RES=ok CUR_DEV=en1 MODE_V=ethernet runwatch)"
 rm -f "$T/state/state"; seed_ok wifi 2
 o="$(ETH_RES=ok WIFI_RES=ok CUR_DEV=en0 MODE_V=wifi runwatch)"
 [ "$(want_of "$o")" = "en1" ] && ok "wifi 模式 → 拉到 Wi-Fi" || bad "wifi 模式 want=$(want_of "$o")"
-# 指定的那条本身没网时不能硬切
+# 指定的那条本身没网时不能硬切。
+# 注意这里验的是**行为**（没有切到已死的有线），不是 want 的字面值：
+# 修复前 want 留空、日志打"保持"；修复后显式填 en1，意思是"我知道有线
+# 不可用，就用 Wi-Fi"。两者都不产生切换，但后者把理由写进了日志。
+# 死盯字面值会让这个测试在措辞改进时假失败。
 rm -f "$T/state/state"; seed_streak eth 3
 o="$(ETH_RES=fail WIFI_RES=ok CUR_DEV=en1 MODE_V=ethernet runwatch)"
-[ "$(want_of "$o")" = "保持" ] && ok "ethernet 模式但有线没网 → 保持 Wi-Fi（不硬切）" || bad "有线没网却 want=$(want_of "$o")"
+if grep -q "^switch en0$" "$T/calls.log" 2>/dev/null; then
+    bad "有线没网却切到了有线（把用户扔到死路上）"
+else
+    ok "ethernet 模式但有线没网 → 不硬切（留在能用的 Wi-Fi）"
+fi
+
+echo "== 2b. 偏好接口不可用必须回退（可用性优先于偏好）=="
+# 本轮修的真 bug：ethernet / wifi 两个模式以前写成单行 &&
+#   ethernet) [ "$eth_ok" -eq 1 ] && ... && want="$ACTIVE_ETH_DEV" ;;
+# 偏好设备不可用时 want 直接留空 → 下面 if [ -n "$want" ] 不成立 →
+# 一次切换都不做，机器继续挂在已经上不了网的那条线上。
+# 实测场景：Wi-Fi 关联正常但没外网（认证门户/运营商故障），macOS 不会
+# 自己挪默认路由，于是有线明明是好的，网络却是死的。
+# speed / latency 本来就有 elif 兜底，这两个模式漏了。
+rm -f "$T/state/state"; seed_streak wifi 3; seed_ok eth 2
+o="$(ETH_RES=ok WIFI_RES=fail CUR_DEV=en1 MODE_V=wifi runwatch)"
+[ "$(want_of "$o")" = "en0" ] && ok "wifi 模式但 Wi-Fi 没网 → 回退有线" || bad "Wi-Fi 没网时 want=$(want_of "$o")，应为 en0"
+grep -q "^switch en0$" "$T/calls.log" && ok "真的执行了切换到有线" || bad "算出 want=en0 却没切换"
+rm -f "$T/state/state"; seed_streak eth 3; seed_ok wifi 2
+o="$(ETH_RES=fail WIFI_RES=ok CUR_DEV=en0 MODE_V=ethernet runwatch)"
+[ "$(want_of "$o")" = "en1" ] && ok "ethernet 模式但有线没网 → 回退 Wi-Fi" || bad "有线没网时 want=$(want_of "$o")，应为 en1"
+grep -q "^switch en1$" "$T/calls.log" && ok "真的执行了切换到 Wi-Fi" || bad "算出 want=en1 却没切换"
+# 偏好设备恢复了要切回去，否则回退变成永久降级
+rm -f "$T/state/state"; seed_ok eth 2; seed_ok wifi 2
+o="$(ETH_RES=ok WIFI_RES=ok CUR_DEV=en0 MODE_V=wifi runwatch)"
+[ "$(want_of "$o")" = "en1" ] && ok "Wi-Fi 恢复 → 切回偏好接口" || bad "Wi-Fi 恢复了却不切回，回退变永久降级"
+# 两边都没网时不能瞎切
+rm -f "$T/state/state"; seed_streak eth 3; seed_streak wifi 3
+o="$(ETH_RES=fail WIFI_RES=fail CUR_DEV=en1 MODE_V=wifi runwatch)"
+if grep -q "^switch" "$T/calls.log" 2>/dev/null; then
+    bad "两边都没网还切换"
+else
+    ok "两边都没网 → 不切换（没目标可去）"
+fi
 
 echo "== 3. MODE=speed：网速优先（需求 2）=="
 # Wi-Fi 快 2 倍（超过 SPEED_SWITCH_RATIO=30%）→ 切 Wi-Fi
@@ -300,10 +337,10 @@ n="$(w fail ok en0 10 $((now_s+600)))"
 [ "$(sget flap_backoff)" != "1" ] && ok "断网时不进入退避" || bad "断网时进了退避"
 
 # C) 反过来：正在用 Wi-Fi 而它死了 → 切回以太网。
-#    必须用 MODE=auto。MODE=wifi 是"强制 Wi-Fi"，没有可用性兜底
-#    （Wi-Fi 死了 want 直接为空，压根不切）——那是另一个问题，
-#    这里要验的是"退避不拦真断网"，得给一个允许切换的模式。
-n="$(w ok fail en1 10 $((now_s+600)) 0 auto)"
+#    这里特意用 MODE=wifi 而不是 auto：以前 MODE=wifi 是"强制 Wi-Fi"、
+#    Wi-Fi 死了 want 直接为空压根不切，所以这个用例只能绕道 auto。
+#    本轮已给 ethernet / wifi 补上可用性兜底（见 2b），现在可以正面验了。
+n="$(w ok fail en1 10 $((now_s+600)) 0 wifi)"
 [ "$n" -ge 1 ] && ok "Wi-Fi 真死了：退避让路，立刻切回以太网" || bad "断网时也在退避"
 
 # D) 退避到期 → 给一次机会，并清零重新累计（否则永久放弃）。

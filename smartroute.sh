@@ -1088,8 +1088,30 @@ cmd_watch() {
     # 期望的首选设备
     want=""
     case "$MODE" in
-        ethernet) [ "$eth_ok" -eq 1 ] && [ -n "$ACTIVE_ETH_DEV" ] && want="$ACTIVE_ETH_DEV" ;;
-        wifi)     [ "$wifi_ok" -eq 1 ] && [ -n "$ACTIVE_WIFI_DEV" ] && want="$ACTIVE_WIFI_DEV" ;;
+        # ethernet / wifi 是"偏好"，不是"这条不通就断网"。
+        # 以前写成单行 &&，偏好设备不可用时 want 留空 → 下面
+        # `if [ -n "$want" ]` 不成立 → 一次切换都不做，机器继续挂在
+        # 已经上不了网的那条线上。实测场景：Wi-Fi 关联正常但没外网
+        # （认证门户/运营商故障），macOS 不会自己挪默认路由，于是
+        # 有线明明是好的，网络却是死的。
+        # speed / latency 两个模式本来就有 elif 兜底（见下），
+        # 这两个没有——同一套逻辑漏了两种模式，补上。
+        ethernet)
+            if [ "$eth_ok" -eq 1 ] && [ -n "$ACTIVE_ETH_DEV" ]; then
+                want="$ACTIVE_ETH_DEV"
+            elif [ "$wifi_ok" -eq 1 ] && [ -n "$ACTIVE_WIFI_DEV" ]; then
+                want="$ACTIVE_WIFI_DEV"
+                log "有线优先但有线不可用，回退到 Wi-Fi（可用性优先于偏好）"
+            fi
+            ;;
+        wifi)
+            if [ "$wifi_ok" -eq 1 ] && [ -n "$ACTIVE_WIFI_DEV" ]; then
+                want="$ACTIVE_WIFI_DEV"
+            elif [ "$eth_ok" -eq 1 ] && [ -n "$ACTIVE_ETH_DEV" ]; then
+                want="$ACTIVE_ETH_DEV"
+                log "Wi-Fi 优先但 Wi-Fi 不可用，回退到有线（可用性优先于偏好）"
+            fi
+            ;;
         speed)
             # 网速优先：实测吞吐大的赢。两个都上不了网时交给可用性逻辑兜底
             if [ "$eth_ok" -eq 1 ] && [ "$wifi_ok" -eq 1 ] \
@@ -1274,6 +1296,24 @@ cmd_status() {
     echo
     echo "当前默认路由 : ${cur:-未知} via $(default_gw)"
     echo "选路模式     : $MODE"
+    # 偏好接口不可用、已经回退到另一条线时，必须说出来。
+    # 用户选"Wi-Fi 优先"是偏好，不是"Wi-Fi 不通就断网"；真回退到有线时他
+    # 有权知道——否则他会以为工具没干活，或者更糟：以为自己的 Wi-Fi 是好的。
+    # 状态页是默认落地页，结论放这里才看得见。
+    case "$MODE" in
+        ethernet)
+            [ -n "$cur" ] && [ -n "$ACTIVE_ETH_DEV" ] && [ "$cur" != "$ACTIVE_ETH_DEV" ] && {
+                echo "⚠️  偏好有线，但当前走在 ${cur}（有线不可用，已回退）"
+                echo "    有线恢复后会自动切回；不想等就 smartroute set MODE speed"
+            }
+            ;;
+        wifi)
+            [ -n "$cur" ] && [ -n "$ACTIVE_WIFI_DEV" ] && [ "$cur" != "$ACTIVE_WIFI_DEV" ] && {
+                echo "⚠️  偏好 Wi-Fi，但当前走在 ${cur}（Wi-Fi 不可用，已回退）"
+                echo "    Wi-Fi 恢复后会自动切回；不想等就 smartroute set MODE speed"
+            }
+            ;;
+    esac
     # 机器可读的关键事实。App 需要据此在**状态页**就给出警告，而不只是
     # 在双网并发页（原先后者才会解析 balance status 才知道同网关）。
     # 用户抱怨"故障转移没效果、双网并发也没效果"时，他正在看的是状态页——
