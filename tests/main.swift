@@ -710,6 +710,51 @@ let nmSrc3 = readSrc("SmartRouteApp/NetworkModel.swift")
 isTrue(!nmSrc3.contains("speed.cloudflare.com/__down?bytes=50000000"),
       "UI 默认地址不再用忽略 Range 的 Cloudflare __down")
 
+print("== 18f. 测速必须能看出链路容量差（单连接测速是瞎子）==")
+// 实测（同机同源，交替多轮）：
+//     接口   1 连接    4 连接    8 连接
+//     en0    78.9      91.0      92.1 Mbps   ← 100baseTX 链路封顶
+//     en1    82.3     218.6     270.6 Mbps   ← Wi-Fi 5GHz/160MHz
+//
+// 单连接下两者只差 4%（78.9 vs 82.3）。而 measure_throughput 原来正是
+// 单条 curl——于是"网速优先"模式判定"两条线差不多"，按延迟挑，
+// 很容易挑中有线，**而有线的真实容量只有 Wi-Fi 的 1/3**。
+// 用户看到的现象就是"智能选路选了更慢的那条"，而工具显示一切正常。
+//
+// 单连接测的是 TCP 单流速度（受慢启动/接收窗口/对端限流影响），
+// 不反映链路容量。要多条并发才能把链路压到上限。
+let shSrc2 = readSrc("smartroute.sh")
+if let mt = shSrc2.range(of: "measure_throughput_once()") {
+    let seg = String(shSrc2[mt.lowerBound...])
+    var body = ""
+    if let end = seg.range(of: "\n}", options: .regularExpression) {
+        body = String(seg[..<end.lowerBound])
+    } else {
+        body = String(seg)
+    }
+    // 必须起多条并发连接
+    isTrue(body.contains("for _i in 1 2 3 4"), "测速起 4 条并发连接（单连接是瞎子）")
+    isTrue(body.contains("--interface \"$dev\""), "每条连接都绑到被测接口")
+    isTrue(body.contains("wait"), "等所有连接跑完再汇总")
+    // 部分失败不许按总数算：4 条挂 3 条会把结果低估 4 倍，
+    // 而那是网络抖动，不是真实容量。
+    isTrue(body.contains("n_ok"), "统计成功条数")
+    isTrue(body.contains("s / n") || body.contains("s/n"),
+          "按成功条数求平均，不按总数求和")
+    isTrue(body.contains("[ \"$n_ok\" -gt 0 ]") || body.contains("n_ok\" -gt 0"),
+          "一条都没测到才算失败")
+} else {
+    isTrue(false, "取不到 measure_throughput_once 函数体")
+}
+// 测速源必须是列表 + 降级。单一源是单点故障，本项目已被坑多次：
+// Cloudflare __down 忽略 Range、对国内时段性劣化（15→3 Mbps）、
+// proof.ovh.net 累计 2GB 后限流。源坏时"网速优先"整个静默失灵。
+isTrue(shSrc2.contains("SPEED_TEST_URLS="), "测速源是列表")
+isTrue(shSrc2.contains("for _u in $_urls"), "按列表逐个尝试")
+// 不许再把 Cloudflare 当唯一默认源
+isTrue(!shSrc2.contains("SPEED_TEST_URL=\"https://speed.cloudflare.com/__down?bytes=5000000\"   #"),
+      "默认测速源不再只有 Cloudflare（实测它忽略 Range 且时段性劣化）")
+
 print("== 18. beginOp 必须配 defer 形式的 endOp ==")
 // inFlight 守卫防的是"并发跑多份 shell 把机器拖垮"。但它有个静默失效模式：
 // 如果 endOp 是在 DispatchQueue.main.async 里手动调的，那么将来任何人在那个

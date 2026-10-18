@@ -175,4 +175,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
 if __name__ == '__main__':
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8733
     socketserver.TCPServer.allow_reuse_address = True
-    socketserver.TCPServer(('127.0.0.1', port), Handler).serve_forever()
+    # 必须用 ThreadingTCPServer，不能用 TCPServer。
+    #
+    # TCPServer 一次只处理一个连接：accept 一个、处理完、才 accept 下一个。
+    # 而被测的 fetch 会**先串行探测两个接口、再起多个 worker 并发下载**，
+    # 探测和下载之间还有 keep-alive 连接挂着。单线程桩在这种访问模式下的
+    # 表现是：新连接排在队列里等前一个结束，客户端侧的读超时/读到半截响应
+    # 都变成可能的失败。
+    #
+    # 实测后果：mock_fetch_http 的「302 重定向 URL 被误判为不支持 Range」
+    # 间歇性变红（约 10-20% 概率），而下载本身是完整的、代码逻辑是对的。
+    # 这种抖动最坏——它让人怀疑正确的代码，或者反过来把真 bug 当成抖动放过。
+    #
+    # 线程化后每个连接独立处理，访问模式不再影响结果。
+    # daemon_threads=True：主进程退出时不挂住等子线程，
+    # 否则测试脚本跑完后桩进程不肯退，会占着端口影响下一轮。
+    class Srv(socketserver.ThreadingTCPServer):
+        daemon_threads = True
+        allow_reuse_address = True
+    Srv(('127.0.0.1', port), Handler).serve_forever()

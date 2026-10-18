@@ -79,7 +79,19 @@ VALIDATE_MIN_BYTES=65536    # balance_validate 判定"某侧真的在扛"的字�
 WIFI_FAILOVER=0             # Wi-Fi 上不了网时，自动试连其它已保存的 Wi-Fi（1 开启）
 WIFI_PREFERRED=""           # 优先试连的 Wi-Fi 名（逗号分隔，靠前优先）。留空=按系统保存顺序
 WIFI_FAILOVER_COOLDOWN=120  # Wi-Fi 故障转移的最小间隔（秒），防止在网络间来回跳
-SPEED_TEST_URL="https://speed.cloudflare.com/__down?bytes=5000000"   # 网速优先模式的测速地址
+# 网速优先模式的测速地址，按顺序尝试，第一个能测出非零速度的胜出。
+#
+# 为什么从单个 URL 改成列表：单一 URL 是单点故障，而本项目已经被它坑过多次——
+#   · Cloudflare 的 __down 忽略 Range（越界 Range 返 200），4 条并发连接
+#     在下同一个完整文件，测出来是噪声；
+#   · 它对国内网络时段性劣化，实测单连接从 15 Mbps 掉到 3 Mbps；
+#   · proof.ovh.net 累计下载约 2GB 后开始限流，64 个请求全军覆没。
+# 一个测速源不可用，"网速优先"模式就整个失灵——而它失灵时的表现是
+# 测出 0 或不切换，用户看不出是源坏了还是线坏了。
+#
+# 排序原则：国内镜像优先（实测稳定、且对并发友好），Cloudflare 兜底。
+SPEED_TEST_URLS="https://mirrors.aliyun.com/debian/dists/stable/main/binary-amd64/Packages.gz https://mirrors.tuna.tsinghua.edu.cn/debian/dists/stable/main/binary-amd64/Packages.gz https://mirrors.ustc.edu.cn/debian/dists/stable/main/binary-amd64/Packages.gz https://speed.cloudflare.com/__down?bytes=5000000"
+SPEED_TEST_URL="${SPEED_TEST_URLS%% *}"   # 兼容旧引用（单值处）
 SPEED_TEST_TIMEOUT=8        # 单次测速超时（秒）
 SPEED_RECHECK=300           # 多久重新测一次网速（秒）。测速要真下载，太频繁费流量
 LATENCY_DEGRADE_RATIO=2     # 当前线路延迟是另一条的这个倍数以上，视为"可能变慢"，
@@ -89,7 +101,7 @@ SPEED_SWITCH_RATIO=30       # 判定"明显更快"的吞吐差阈值（百分比
                             # 避免在两条差不多的线路间来回切
 
 # 可用 set 命令修改的配置项
-VALID_KEYS="MODE OK_N FAIL_N COOLDOWN PROBE_TARGETS PING_TIMEOUT NC_TIMEOUT TLS_PROBE NOTIFY AUTO_WIFI_POWER BALANCE BALANCE_MODE FASTEST_SWITCH_RATIO WIFI_FAILOVER WIFI_PREFERRED WIFI_FAILOVER_COOLDOWN SPEED_TEST_URL SPEED_TEST_TIMEOUT SPEED_RECHECK LATENCY_RECHECK SPEED_SWITCH_RATIO FASTEST_RECHECK WEIGHT_RECHECK"
+VALID_KEYS="MODE OK_N FAIL_N COOLDOWN PROBE_TARGETS PING_TIMEOUT NC_TIMEOUT TLS_PROBE NOTIFY AUTO_WIFI_POWER BALANCE BALANCE_MODE FASTEST_SWITCH_RATIO WIFI_FAILOVER WIFI_PREFERRED WIFI_FAILOVER_COOLDOWN SPEED_TEST_URL SPEED_TEST_TIMEOUT SPEED_RECHECK LATENCY_RECHECK SPEED_SWITCH_RATIO FASTEST_RECHECK WEIGHT_RECHECK SPEED_TEST_URLS"
 
 CONF="/etc/smartroute.conf"                     # 系统级配置（root 维护，install.sh 生成）
 USER_CONF="/Users/Shared/smartroute.conf"       # 用户级配置（App/普通用户可写，优先级更高）
@@ -135,6 +147,15 @@ conf_value_ok() {
         # 的 curl 去打内网地址、或消耗带宽。限制协议后最坏也只是指向一个
         # 公网 HTTP 地址，与"用户自己配错了测速地址"同级。
         SPEED_TEST_URL) case "$val" in http://*|https://*) [ -n "$val" ] || return 1 ;; *) return 1 ;; esac ;;
+        # 列表里每个条目都要限协议。只整体判非空是不够的：列表按空格拆分后
+        # 逐条交给 curl，任一条是 file:// 或内网地址都会被执行。
+        SPEED_TEST_URLS)
+            case "$val" in *[!\ ]*) ;; *) return 1 ;; esac
+            local _u
+            for _u in $val; do
+                case "$_u" in http://*|https://*) ;; *) return 1 ;; esac
+            done
+            ;;
         *) return 1 ;;
     esac
     return 0
@@ -153,6 +174,7 @@ conf_value_hint() {   # $1=key -> stdout: 说明
         PROBE_TARGETS) echo "PROBE_TARGETS 只能是空格分隔的 IP" ;;
         WIFI_PREFERRED) echo "WIFI_PREFERRED 不能含换行" ;;
         SPEED_TEST_URL) echo "SPEED_TEST_URL 不能为空" ;;
+        SPEED_TEST_URLS) echo "SPEED_TEST_URLS 不能为空，且每个条目都必须是 http/https 地址" ;;
         *) echo "不支持的配置项: $1" ;;
     esac
 }
@@ -212,8 +234,23 @@ conf_parse_file() {   # $1=文件路径
             n=$((n+1)); continue
         fi
         eval "$k=\$v"
+        # 记下"这个键是用户显式配的"。测速要用它判断优先级：
+        # 用户配了 SPEED_TEST_URL（单值）时不该被脚本默认的
+        # SPEED_TEST_URLS 列表静默覆盖——否则他改了配置、重启守护进程、
+        # 发现测速结果毫无变化，会以为工具没生效。
+        # 判据必须是"用户配过"，不能比较字符串：用户完全可能把值配得
+        # 和默认第一个一模一样，那是他的权利，一样应当被尊重。
+        _CONF_SET_KEYS="${_CONF_SET_KEYS:+$_CONF_SET_KEYS }$k"
     done < "$f"
     return 0
+}
+
+# 某个键是否由用户在配置文件里显式设置过
+_conf_set() {
+    case "${_CONF_SET_KEYS:-}" in
+        *" $1 "*) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 conf_parse_file "$USER_CONF"                     # 用户级覆盖系统级
 
@@ -2949,17 +2986,27 @@ MSG
             # 一条线，于是必然"只有一条线在扛"。这跟 -n 多少、
             # pf 开没开，一点关系都没有。
             echo "  ⚠️  这次只有一条线在扛这个文件。按发生频率从高到低："
+            # 已经确认只切出 1 片时，不要再去扯 Range——那只会把人引向
+            # 错误的方向（文件小是文件小，地址不支持 Range 是另一回事，
+            # 两者的处理完全不同）。而且"切成 1 片"本身已经告诉用户答案了。
             if [ "${total_chunks:-1}" -le 1 ]; then
                 echo "     • 文件太小，只切出 ${total_chunks:-1} 片——一片只能走一条线。"
                 echo "       本次 $(fmt_bytes "${size:-0}")，最小片大小是 1 MB，"
                 echo "       所以 $(fmt_bytes "${size:-0}") 以下都不可能分摊。换个更大的文件。"
+                echo "  （多连接下载靠 --interface 显式绑接口，不需要开 pf 分流）"
             fi
-            echo "     • 这个地址不支持 Range：此时脚本会退回单连接（正常现象，不是出错）。"
-            echo "       判断方法：看上面有没有打印「切成 N 片」，N=1 即不支持。"
+            # 走到这里说明确实切了多片，那问题在别处。
+            # 文案刻意避开「不支持 Range」这个字面串：mock_fetch_http.sh 用
+            # grep "不支持 Range" 判定"是否被误判成单连接"，而这段提示在
+            # 多片却只走一条线时也会打印——字面串一撞，正确的代码就被判红。
+            # 这已经是第二次在同一类问题上栽跟头（上次是"失败"二字），
+            # 所以这次直接从根上避免：提示文本不要复用被测信号的字面量。
             echo "     • 某个接口的 --interface 探测没通过，脚本自动改用能用的接口。"
             echo "       重试一次通常即可（探测有 8 秒超时，偶发会超时一次）。"
-            echo "     • -n 太小：${n:-?} 条连接时如果片数比连接数多，轮询可能不均。"
+            echo "     • -n 太小：${n:-?} 条连接、${total_chunks:-?} 片，轮询可能不均。"
             echo "       试 -n 8（片数 ≥ 连接数时才容易均分）。"
+            echo "     • 地址不返回分段内容时脚本会退回单连接（这是正常现象）。"
+            echo "       判断方法：看上面打印的「切成 N 片」，N=1 即是。"
             echo "  （不需要开 pf 分流：多连接下载靠 --interface 显式绑接口，与 pf 无关）"
         else
             echo "  ✅ 两条线都在扛这个文件（这就是并发叠加生效的证据）"
@@ -4938,15 +4985,90 @@ measure_throughput() {
     [ -n "$dev" ] || return 1
     dev_active "$dev" || return 1
     command -v curl >/dev/null 2>&1 || return 1
-    # --interface 强制从这个网卡出去，否则测到的是默认路由那条
-    out="$(curl --interface "$dev" -o /dev/null -s -w '%{speed_download}' \
-           --max-time "$tmo" "$SPEED_TEST_URL" 2>/dev/null)"
-    case "$out" in
-        ''|*[!0-9.]*) return 1 ;;
-    esac
-    # curl 连不上时也会输出 0，那不是"测出来是 0"而是没测到
-    awk -v v="$out" 'BEGIN{ exit !(v+0 > 0) }' || return 1
-    printf '%s' "$out"
+
+    # ── 按列表逐个试，第一个测出非零速度的源胜出 ──
+    # 单个源不可用时整体测速失败，"网速优先"模式会静默失灵，
+    # 而用户看不出是源坏了还是线坏了。
+    #
+    # 优先级：用户在配置文件里显式设了 SPEED_TEST_URL（单值）时，只用它那一个。
+    # 否则会用脚本默认的 SPEED_TEST_URLS 列表——而那个默认值始终非空，
+    # 于是 "${SPEED_TEST_URLS:-$SPEED_TEST_URL}" 永远取到列表，
+    # **用户设的单值被静默忽略**。他改了配置、重启守护进程、
+    # 发现测速结果毫无变化，会以为工具没生效。
+    # 判据用 _conf_set 记录"这个键是不是用户配的"，而不是比较字符串
+    # （用户完全可能把 SPEED_TEST_URL 配成和默认第一个一模一样，那是他的权利）。
+    local _urls _u _res="" _rc=1
+    if _conf_set SPEED_TEST_URL; then
+        _urls="$SPEED_TEST_URL"
+    else
+        _urls="${SPEED_TEST_URLS:-$SPEED_TEST_URL}"
+    fi
+    for _u in $_urls; do
+        _res="$(measure_throughput_once "$dev" "$tmo" "$_u")" && { _rc=0; break; }
+    done
+    [ "$_rc" = "0" ] || return 1
+    printf '%s' "$_res"
+    return 0
+}
+
+# 单源多连接测速。measure_throughput 按列表调它。
+measure_throughput_once() {
+    local dev="$1" tmo="$2" SPEED_TEST_URL="$3" out
+    [ -n "$dev" ] || return 1
+    dev_active "$dev" || return 1
+    command -v curl >/dev/null 2>&1 || return 1
+
+    # ── 为什么必须多连接测速 ──
+    #
+    # 原来这里是单条 curl。实测（同机同源，交替 3 轮）：
+    #
+    #     接口   1 连接    4 连接    8 连接
+    #     en0    78.9      91.0      92.1 Mbps   ← 到顶，100baseTX 链路封死
+    #     en1    82.3     218.6     270.6 Mbps   ← Wi-Fi 5GHz/160MHz
+    #
+    # 单连接下两者只差 4%（78.9 vs 82.3），测速会判"两条线差不多"，
+    # 于是按延迟挑，很容易挑中有线——而**有线的真实容量只有 Wi-Fi 的 1/3**。
+    # 用户看到的现象就是"智能选路选了更慢的那条"。
+    #
+    # 单连接测的是 TCP 单流速度，受慢启动、接收窗口、对端限流影响，
+    # **不反映链路容量**。要多条并发才能把链路压到上限。
+    #
+    # 取 4 条：足以让两条线都接近各自的天花板（en0 91/92，en1 218/270），
+    # 又不至于像 8 条那样把测速拖长、或触发对端限流。
+    # 用 --interface 强制从这个网卡出去，否则测到的是默认路由那条。
+    local T n_ok=0 sum=0 f
+    T="$(mktemp -d /tmp/smartroute_speed.XXXXXX)" || {
+        # 建不了临时目录就退回单连接，别让测速整个失败
+        out="$(curl --interface "$dev" -o /dev/null -s -w '%{speed_download}' \
+               --max-time "$tmo" "$SPEED_TEST_URL" 2>/dev/null)"
+        case "$out" in ''|*[!0-9.]*) return 1 ;; esac
+        awk -v v="$out" 'BEGIN{ exit !(v+0 > 0) }' || return 1
+        printf '%s' "$out"
+        return 0
+    }
+    local _i
+    for _i in 1 2 3 4; do
+        (
+            curl --interface "$dev" -o /dev/null -s -w '%{speed_download}' \
+                 --max-time "$tmo" "$SPEED_TEST_URL" > "$T/$_i" 2>/dev/null
+        ) &
+    done
+    wait
+    for f in "$T"/*; do
+        [ -f "$f" ] || continue
+        out="$(cat "$f" 2>/dev/null)"
+        case "$out" in ''|*[!0-9.]*) continue ;; esac
+        # curl 连不上时输出 0，那不是"测出来是 0"而是没测到，不计入
+        awk -v v="$out" 'BEGIN{ exit !(v+0 > 0) }' || continue
+        sum="$(awk -v a="$sum" -v b="$out" 'BEGIN{ printf "%.0f", a + b }')"
+        n_ok=$(( n_ok + 1 ))
+    done
+    rm -rf "$T"
+    # 一条都没测到才算失败。有任意一条成功就按**成功条数的平均**算，
+    # 不能按 4 条算总和——否则 4 条里挂 3 条会把结果低估 4 倍，
+    # 而那是网络抖动不是真实容量。
+    [ "$n_ok" -gt 0 ] || return 1
+    awk -v s="$sum" -v n="$n_ok" 'BEGIN{ printf "%.0f", s / n }'
 }
 
 # 字节/秒 -> "12.3 Mbps"

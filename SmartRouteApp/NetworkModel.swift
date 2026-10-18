@@ -808,7 +808,7 @@ final class NetworkModel: ObservableObject {
             "MODE","OK_N","FAIL_N","COOLDOWN","PROBE_TARGETS","PING_TIMEOUT","NC_TIMEOUT",
             "TLS_PROBE","NOTIFY","AUTO_WIFI_POWER","BALANCE","BALANCE_MODE",
             "FASTEST_SWITCH_RATIO","FASTEST_RECHECK","WIFI_FAILOVER","WIFI_PREFERRED",
-            "WIFI_FAILOVER_COOLDOWN","SPEED_TEST_URL","SPEED_TEST_TIMEOUT",
+            "WIFI_FAILOVER_COOLDOWN","SPEED_TEST_URL","SPEED_TEST_URLS","SPEED_TEST_TIMEOUT",
             "SPEED_RECHECK","LATENCY_RECHECK","SPEED_SWITCH_RATIO","WEIGHT_RECHECK",
         ]
         let modes: Set<String> = ["auto","ethernet","wifi","speed","latency"]
@@ -852,6 +852,16 @@ final class NetworkModel: ObservableObject {
                     ok = val.count > prefix.count
                 } else {
                     ok = false
+                }
+            // 列表：每个条目都必须是 http/https。只整体判非空不够——
+            // 列表按空格拆开后逐条交给 curl，任一条是 file:// 或内网
+            // 地址都会被执行。与脚本侧的校验保持一致，
+            // 否则会出现"脚本收得进、App 报不合法"的割裂。
+            case "SPEED_TEST_URLS":
+                let parts = val.split(separator: " ").map(String.init)
+                ok = !parts.isEmpty && parts.allSatisfy {
+                    $0.hasPrefix("https://") && $0.count > "https://".count
+                        || $0.hasPrefix("http://")  && $0.count > "http://".count
                 }
             default: break
             }
