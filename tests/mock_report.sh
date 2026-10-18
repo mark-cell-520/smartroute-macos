@@ -106,8 +106,20 @@ echo "=== 12. smartroute log：行数参数的两种写法都要能用 ==="
 # 出过真 bug：cmd_log 只认 `log 40`，而 `log --lines 40` 会把 "--lines"
 # 当行数传给 tail，报 "tail: illegal offset -- --lines"。
 # 人看 --lines 更自然，很容易踩到；App 当初也因此改成自己直接 tail。
-_l() { bash smartroute.sh log "$@" 2>&1; }
-_n() { bash smartroute.sh log "$@" 2>/dev/null | wc -l | tr -d ' '; }
+# 必须自包含：原来直接读机器上的 /var/log/smartroute.log，
+# 而那台机器上只有 2 行 —— 于是"默认 50 行""log 5 取 5 行"四条断言
+# 恒失败，且**换台机器又可能通过**。依赖机器状态的测试是最坏的一种：
+# 它让人把"环境不对"当成"代码有 bug"，或者反过来把真 bug 当成环境问题放过。
+#
+# 做法：造一个有 60 行的临时日志，用一份改过 LOG_FILE 的脚本副本来跑。
+# 注意：不能用 $T——它在这个文件后面被函数改成 "$1"（本地临时目录），
+# 会被覆盖掉。用独立的 _LT 目录。
+_LT="$(mktemp -d /tmp/sr_logtest.XXXXXX)"
+_TLOG="$_LT/stub.log"
+for i in $(seq 1 60); do echo "line $i of stub log" >> "$_TLOG"; done
+sed "s|^LOG_FILE=.*|LOG_FILE=\"$_TLOG\"|" smartroute.sh > "$_LT/sr_log.sh"
+_l() { bash "$_LT/sr_log.sh" log "$@" 2>&1; }
+_n() { bash "$_LT/sr_log.sh" log "$@" 2>/dev/null | wc -l | tr -d ' '; }
 _l | grep -q "illegal offset" && bad "默认调用报 tail 错误" || ok "默认调用正常"
 [ "$(_n)" = "50" ] && ok "默认 50 行" || bad "默认得到 $(_n) 行"
 [ "$(_n 5)" = "5" ] && ok "log 5 取 5 行" || bad "log 5 得到 $(_n 5) 行"

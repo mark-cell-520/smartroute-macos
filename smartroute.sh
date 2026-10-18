@@ -723,25 +723,150 @@ probe_dev() {   # $1=设备 $2=网关
         set_probe_detail "非 root：按当前默认路由探测"
     fi
 
-    # 第一轮 ping（快）
-    for t in $targets; do
-        ping -c 1 -W "$PING_TIMEOUT" "$t" >/dev/null 2>&1 && { ping_ok=1; ok=0; break; }
-    done
-    # 第二轮 TCP 兜底（防止 ICMP 被禁）
-    if [ "$ok" -ne 0 ]; then
+    # ── 三轮探测：并行发出，但不等全部，谁先通谁算 ──
+    #
+    # 原来的写法是串行 + break，代价实测（去重后 7 个目标）：
+    #
+    #     常见（第一个 ping 就通）   0.03s     ← 这种情况串行已经最优
+    #     坏（ICMP 全禁）            5.6s(ping) + 28s(TCP) + 8s(TLS) = 42s
+    #
+    # 而守护进程 StartInterval 是 20 秒，两个接口各 42 秒 = 83 秒，
+    # 是轮询间隔的 4 倍——**于是守护进程永远在探测，没有一秒空闲**。
+    #
+    # 所以两件事都要做，缺一不可：
+    #   1) 坏情况要并行（42s → 6.8s）
+    #   2) 常见情况不能变慢
+    #
+    # 第一版我只做了并行 + wait 全部，结果常见情况从 0.03s 变成 1.95s
+    # （等 7 个 ping 里最慢的那个）——**慢 60 倍，是真实的回归**。
+    # 已实测抓到。所以正确做法是：并行发出 + 轮询等第一个成功，
+    # 常见情况仍然 ~0.03s 收手，坏情况由并行把上界压到最慢那一个。
+    local _T; _T="$(mktemp -d /tmp/smartroute_probe.XXXXXX)" || _T=""
+
+    # 在临时目录里轮询等"任一匹配前缀的文件出现"。
+    # $1=目录 $2=前缀 $3=超时（**秒**，必须是秒）-> 0 表示有任意一个成功了
+    #
+    # 单位这里栽过一次：PING_TIMEOUT=800 是**毫秒**（ping -W 用的单位），
+    # 我直接把它传给这个按秒计的函数，于是 800×20×0.05s = 800 秒——
+    # 一次探测要跑 13 分钟，实测基准测试跑出 2253 秒才发现。
+    # 现在调用方必须显式换算，并且这个函数自己校验上界：
+    # 超过 60 秒一律按 60 秒算，防止再有个毫秒值混进来把探测挂死。
+    _probe_wait_any() {
+        local _d="$1" _pre="$2" _tmo="$3" _i=0 _n _f
+        case "$_tmo" in ''|*[!0-9]*) _tmo=5 ;; esac
+        [ "$_tmo" -ge 1 ] || _tmo=1
+        [ "$_tmo" -le 60 ] || _tmo=60
+        _n=$(( _tmo * 20 ))          # 50ms 一轮
+        while [ "$_i" -lt "$_n" ]; do
+            for _f in "$_d/$_pre"*; do
+                [ -f "$_f" ] && return 0
+            done
+            sleep 0.05
+            _i=$(( _i + 1 ))
+        done
+        return 1
+    }
+
+    # 杀掉一批后台探测进程。早退成功后必须调——不杀的话裸 wait 会
+    # 等到最慢那一个，把并行省下的时间全还回去（实测 0.024s → 1.954s）。
+    # 已经跑完的 PID kill 会失败，忽略即可。
+    _probe_kill_pids() {
+        local _p
+        for _p in $1; do
+            kill "$_p" 2>/dev/null
+        done
+        return 0
+    }
+
+    # 第一轮 ping：**串行试前两个，都不通才并行剩下的**。
+    #
+    # 为什么不能一上来就并行：常见情况第一个目标 30ms 就回，
+    # 串行 + break 就是 0.03s，已经最优。并行反而更慢——
+    #   · 轮询等第一个成功，粒度是 sleep 0.05，最少也要 50ms
+    #   · 早退后还得 kill 剩余进程，又是几次系统调用
+    # 实测（5 次平均）：串行 0.030s / 并行+早退 0.109s / 并行+wait 全部 1.954s。
+    # 并行只在"前两个都不通"时才划算——那种情况串行要 7×800ms=5.6s，
+    # 并行只要 0.8s。而那种情况本来就是少数（ICMP 被禁的网络）。
+    #
+    # 所以：串行试前 2 个（覆盖绝大多数情况，且成本最低），
+    # 都不通再并行发剩余 5 个（把最坏情况从 5.6s 压到 0.8s）。
+    if [ -n "$_T" ]; then
+        _tried=""
+        _n=0
         for t in $targets; do
-            if nc -z -w "$NC_TIMEOUT" "$t" 53 >/dev/null 2>&1 || nc -z -w "$NC_TIMEOUT" "$t" 443 >/dev/null 2>&1; then
-                tcp_ok=1; ok=0; break
+            _tried="$_tried $t"
+            _n=$(( _n + 1 ))
+            if ping -c 1 -W "$PING_TIMEOUT" "$t" >/dev/null 2>&1; then
+                ping_ok=1; ok=0; : > "$_T/ping_$t"; break
             fi
+            [ "$_n" -ge 2 ] && break
+        done
+        # 前两个都没通 → 并行发剩下的。此时串行已花掉 ~1.6s，
+        # 再串行下去还要 4s；并行只要 0.8s。
+        if [ "$ping_ok" -ne 1 ] && [ -n "$_T" ]; then
+            _pids=""
+            for t in $targets; do
+                case " $_tried " in *" $t "*) continue ;; esac
+                ( ping -c 1 -W "$PING_TIMEOUT" "$t" >/dev/null 2>&1 && : > "$_T/ping_$t" ) &
+                _pids="$_pids $!"
+            done
+            # PING_TIMEOUT 是毫秒，这里换算成秒（向上取整，至少 1 秒）
+            _pt_s=$(( (PING_TIMEOUT + 999) / 1000 ))
+            [ "$_pt_s" -ge 1 ] || _pt_s=1
+            if _probe_wait_any "$_T" "ping_" "$_pt_s"; then
+                ping_ok=1; ok=0
+                _probe_kill_pids "$_pids"
+            else
+                wait 2>/dev/null
+            fi
+            for t in $targets; do [ -f "$_T/ping_$t" ] && { ping_ok=1; break; }; done
+        fi
+    fi
+
+    # 第二轮 TCP 兜底（ICMP 被禁时走）。14 个连接并行发，等第一个成功。
+    # 最坏从 28s 降到 2s。
+    if [ "$ok" -ne 0 ] && [ -n "$_T" ]; then
+        _pids=""
+        for t in $targets; do
+            for p_ in 53 443; do
+                ( nc -z -w "$NC_TIMEOUT" "$t" "$p_" >/dev/null 2>&1 && : > "$_T/tcp_${t}_${p_}" ) &
+                _pids="$_pids $!"
+            done
+        done
+        if _probe_wait_any "$_T" "tcp_" "$NC_TIMEOUT"; then
+            tcp_ok=1; ok=0
+            _probe_kill_pids "$_pids"
+        else
+            wait 2>/dev/null
+        fi
+        for t in $targets; do
+            for p_ in 53 443; do
+                [ -f "$_T/tcp_${t}_${p_}" ] && { tcp_ok=1; break 2; }
+            done
         done
     fi
-    # 第三轮 TLS 握手（确认是“真互联网”，能过证书校验）
-    if [ "$ok" -ne 0 ] && [ "$TLS_PROBE" = "1" ] && command -v curl >/dev/null 2>&1; then
+
+    # 第三轮 TLS 握手（确认是"真互联网"，能过证书校验）。2 个并行发。
+    if [ "$ok" -ne 0 ] && [ "$TLS_PROBE" = "1" ] && command -v curl >/dev/null 2>&1 && [ -n "$_T" ]; then
+        _pids=""
         for t in 1.1.1.1 8.8.8.8; do
             case " $targets " in *" $t "*) ;; *) continue ;; esac
-            if curl -s -m 4 -o /dev/null "https://$t/" 2>/dev/null; then tls_ok=1; ok=0; break; fi
+            ( curl -s -m 4 -o /dev/null "https://$t/" 2>/dev/null && : > "$_T/tls_$t" ) &
+            _pids="$_pids $!"
+        done
+        if _probe_wait_any "$_T" "tls_" 4; then
+            tls_ok=1; ok=0
+            _probe_kill_pids "$_pids"
+        else
+            wait 2>/dev/null
+        fi
+        for t in 1.1.1.1 8.8.8.8; do
+            case " $targets " in *" $t "*) ;; *) continue ;; esac
+            [ -f "$_T/tls_$t" ] && { tls_ok=1; break; }
         done
     fi
+
+    [ -n "$_T" ] && rm -rf "$_T"
 
     [ "$added" -gt 0 ] && cleanup_probe_routes
     set_probe_detail "${PROBE_DETAIL}${PROBE_DETAIL:+；}ping=$ping_ok tcp=$tcp_ok tls=$tls_ok"
