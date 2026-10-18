@@ -518,8 +518,17 @@ _spd="$(ev 'T=/tmp/sr_fetch_sp; rm -rf $T; mkdir -p $T
 # 429/503 必须可重试，不能当致命错误
 grep -qF 'if [ "$http" = "429" ] || [ "$http" = "503" ]; then' smartroute.sh \
     && ok "429/503 判定为可退避重试" || bad "429/503 被当致命错误，服务端一限流整个下载就毙"
-grep -qF 'sleep $(( try * 5 ))' smartroute.sh \
-    && ok "退避时长递增（5s/10s）" || bad "没有递增退避，立刻重试只会再吃一个 429"
+# 退避必须递增，但**不能是 5s/10s**。原来写的是 5s/10s，实测那会让
+# 5MB 文件被限流时白睡 15 秒：n=4 下 Cloudflare 返 429，fetch 总耗时
+# 14.63s、合计 2.6 Mbps，比裸 curl 单连接（14.8 Mbps）慢 5.7 倍。
+# 15 秒是为"大文件长时间下载"设计的，对小文件是灾难；而且限流的正确
+# 应对是别再往上加连接（父进程看 ratelimited 标记停止扩连），不是睡。
+# 现在 1s/2s，实测 n=4 从 2.6 提升到 6.3 Mbps。
+grep -qF 'sleep $(( try ))' smartroute.sh \
+    && ok "退避时长递增（1s/2s）" || bad "没有递增退避，立刻重试只会再吃一个 429"
+# 限流时必须停止扩连，否则加连接只会招来更多 429
+grep -qF '[ ! -f "$T/ratelimited" ]' smartroute.sh \
+    && ok "撞到 429/503 后停止扩连" || bad "限流了还在往上加连接，只会招来更多 429"
 
 # 假死检测参数
 grep -qF -- '--speed-limit 20480 --speed-time 20' smartroute.sh \

@@ -11,6 +11,10 @@ struct MainView: View {
 
     var body: some View {
         NavigationSplitView {
+            // 侧边栏顶部放实时状态头（当前走哪条线）。放在 List 外面而不是
+            // 塞进 List 的第一个 Section：List 的行高和选中态会把它压成
+            // 和普通菜单项一个样，而它需要的是"始终醒目"。
+            SidebarStatusHeader(model: model)
             List(selection: $model.page) {
                 Section("监控") {
                     ForEach([AppPage.status, .speed, .balance, .wifi, .rules]) { p in

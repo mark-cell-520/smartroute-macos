@@ -2180,7 +2180,28 @@ MSG
     # 所以：HEAD 优先（对大多数服务器最准），越界探针兜底，
     # 最后由下载时的字节数校验做最终裁决——宁可失败也不产出错文件。
     local probe_hdr probe_code size="" cr_size="" head_size=""
-    probe_hdr="$(curl -sS -L -D - -o /dev/null --range 999999999- --max-time 20 "$url" 2>/dev/null)"
+    # --max-filesize 65536 必须加，否则探针本身可能等于白下一次整个文件。
+    #
+    # 实测（Cloudflare 测速端点 speed.cloudflare.com/__down?bytes=5000000）：
+    #   探针耗时  2.73s
+    #   下载本体  2.47s
+    #   干净 curl 2.42s
+    # 也就是说 fetch 比裸 curl 慢 2.4 倍，慢出来的时间几乎全在探针上。
+    # 原因：规范要求越界 Range 返回 416 且 body 为 0，但这个端点是动态生成的，
+    # 它先把 5MB 生成完才去看 Range——探针等于完整下一次。
+    #
+    # 加了 --max-filesize 后探针降到 0.77s（3.5 倍）。curl 在 Content-Length
+    # 超过上限时根本不开始传输，直接返回 63，而**响应头已经拿到了**——
+    # 我们只需要状态行和 Content-Range，两者都在 body 之前。
+    #
+    # 对规范服务器无影响：416 的 body 本来就是 0，不会触发上限。
+    # 已用本地 stub 验证两种服务器（返回 416+Content-Range 的 / 返回 200 的）
+    # 加与不加的判定结果完全一致。
+    #
+    # 注意判的是 $probe_hdr 非空而不是 curl 退出码：触发上限时退出码是 63，
+    # 但头已经拿到，探针是成功的。
+    probe_hdr="$(curl -sS -L -D - -o /dev/null --range 999999999- \
+                 --max-filesize 65536 --max-time 20 "$url" 2>/dev/null)"
     [ -n "$probe_hdr" ] || die "取不到响应（网络不通或 URL 无效）"
     # 必须取**最后一条**状态行，不是第一条。
     # curl -L -D - 会把重定向链上每一跳的响应头都打出来，NR==1 拿到的是
@@ -2206,13 +2227,19 @@ MSG
         }
         END{print v+0}')"
 
-    local head_hdr
-    head_hdr="$(curl -sS -L -I --max-time 20 "$url" 2>/dev/null)"
-    head_size="$(printf '%s\n' "$head_hdr" | awk 'tolower($1)=="content-length:"{v=$2} END{print v+0}')"
-
     # 支持 Range 的判定：416（规范行为）或 206（把越界范围截断到文件内）
     local range_ok=0
     if [ "$probe_code" = "416" ] || [ "$probe_code" = "206" ]; then range_ok=1; fi
+
+    # HEAD 挪到这里：只有确定要切段（需要总大小）时才做。
+    # 以前无条件先做，但不支持 Range 的那条分支直接 curl -o 下载，
+    # 压根不读 $head_size 的值，那一次 HEAD（实测约 0.6s，含建连 + TLS）
+    # 是纯浪费，而且偏偏浪费在最该快的路径上。
+    local head_hdr head_size=""
+    if [ "$range_ok" = "1" ]; then
+        head_hdr="$(curl -sS -L -I --max-time 20 "$url" 2>/dev/null)"
+        head_size="$(printf '%s\n' "$head_hdr" | awk 'tolower($1)=="content-length:"{v=$2} END{print v+0}')"
+    fi
 
     if [ "$range_ok" != "1" ]; then
         # HTTP 错误（4xx/5xx）不能一律说成"不支持 Range"。URL 写错、需要登录、
@@ -2446,6 +2473,13 @@ MSG
     total_chunks=128
     [ "$total_chunks" -gt "$size" ] && total_chunks="$size"
     chunk=$(( size / total_chunks ))
+    # -n 1 时不切片：一个 worker 顺序做 N 次请求，每次都要付 TCP 握手 +
+    # TLS + 慢启动，而并行收益是 0。实测 5MB 文件：裸 curl 单请求 14.8 Mbps，
+    # fetch -n 1 切片后 6.2 Mbps——慢 2.4 倍，而且没有任何好处。
+    if [ "${n:-1}" -le 1 ]; then
+        total_chunks=1
+        chunk="$size"
+    fi
     # 每片至少 1MB：片太小则 TCP 握手和慢启动开销占比过高，吞吐反而掉
     while [ "$chunk" -lt 1048576 ] && [ "$total_chunks" -gt 1 ]; do
         total_chunks=$(( total_chunks / 2 ))
@@ -2522,6 +2556,10 @@ MSG
             # proof.ovh.net 和 hetzner 用 429 打过，多连接下载尤其容易触发。
             # 当成致命错误会让整个下载立刻毙掉，而那只是需要退避。
             if [ "$http" = "429" ] || [ "$http" = "503" ]; then
+                # 留下限流标记：父进程的扩连循环看到它就不再往上加 worker。
+                # 限流的含义是"服务端扛不住这么多连接"，此时加连接只会
+                # 招来更多 429，而原来的做法是闷头睡 15 秒（见下面退避）。
+                : > "$d/ratelimited" 2>/dev/null
                 return 3
             fi
             if [ -n "$http" ] && [ "$http" != "000" ] && [ "$http" -ge 400 ] 2>/dev/null; then
@@ -2543,7 +2581,11 @@ MSG
             case $? in
                 0) return 0 ;;
                 2) return 1 ;;
-                3) [ "$try" -lt 3 ] && sleep $(( try * 5 )) ;;   # 退避：5s/10s
+                # 退避从 5s/10s 改成 1s/2s。原来的 15 秒是为大文件设计的，
+                # 但 5MB 文件被限流时也要睡满 15 秒——实测这让 n=4 比裸 curl
+                # 单连接慢 5.7 倍（2.6 vs 14.8 Mbps）。限流时真正该做的是
+                # 停止扩连（上面已留标记），退避只需够服务端缓口气。
+                3) [ "$try" -lt 3 ] && sleep $(( try )) ;;   # 退避：1s/2s
                 *) [ "$try" -lt 3 ] && sleep 1 ;;
             esac
         done
@@ -2673,7 +2715,9 @@ MSG
         done
         [ "$_stop_seen" = "1" ] && break
         # 扩连接：达到阈值、还有剩余片、且没到用户上限时才加
-        if [ "$_spawned" -lt "$n" ]; then
+        # 服务端已经限流（有 worker 撞到 429/503 并留下标记）时不再加：
+        # 限流的含义就是连接数过头了，再加只会招来更多 429。
+        if [ "$_spawned" -lt "$n" ] && [ ! -f "$T/ratelimited" ]; then
             _comp=$(ls "$T"/p* 2>/dev/null | wc -l | tr -d ' ')
             _remain=$(( total_chunks - _comp ))
             if [ "$_comp" -ge "$_next_spawn_at" ] && [ "$_remain" -gt "$_alive" ]; then
