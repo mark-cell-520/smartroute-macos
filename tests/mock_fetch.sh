@@ -258,6 +258,28 @@ grep -q "请先确认这个 URL 用浏览器能打开" smartroute.sh \
 grep -q "这个 URL 打不开" smartroute.sh \
     && ok "探测阶段区分 HTTP 错误和不支持 Range" || bad "HTTP 错误被说成不支持 Range"
 
+# ── 第三类失败：连接失败/超时（http=000）必须和 Range 不兼容分开 ──
+# 实测栽过的坑：多连接下载撞上服务端限流时 curl 退出码 28、http=000、
+# 0 字节。以前只有"字节数不符"和"HTTP 错误"两个分支，于是它被说成
+# "服务端 Range 行为不一致，请换源"——用户照着去换源，而真正该做的
+# （降低 -n）没人告诉他。这是把用户往错方向送的假诊断。
+grep -qF 'connfail_$idx' smartroute.sh \
+    && ok "连接失败单独记账（不和 Range 不兼容混作一谈）" \
+    || bad "连接失败没有单独记账，会被误诊成 Range 不兼容"
+grep -qF 'rm -f "$d/connfail_$idx"' smartroute.sh \
+    && ok "重试成功后清掉标记（否则诊断虚报失败数）" \
+    || bad "重试成功不清标记，连接失败数会虚高"
+grep -q "分片连接失败" smartroute.sh \
+    && ok "连接失败有专属诊断文案" || bad "连接失败没有专属文案"
+grep -q "先把 -n 降到 2 试试" smartroute.sh \
+    && ok "连接失败时建议降低连接数（服务端限流的正确解法）" \
+    || bad "连接失败时没建议降 -n，用户只能瞎换源"
+# 三类诊断必须都能到达：connfail 分支要在 httperr 分支之后、且各自 die
+_cn_die=$(awk '/local _cn=0/,/^        fi$/' smartroute.sh | grep -c 'die "有分片下载失败')
+[ "$_cn_die" -ge 1 ] \
+    && ok "连接失败分支会终止（不会带着缺失分片往下合并）" \
+    || bad "连接失败分支没有 die，会拿不完整的文件当成功"
+
 echo "== 10. 权重为 0 会让一条线静默饿死 =="
 # write_pf_rules 不校验 $7/$8：传 0 时那一侧 while 一次都不跑，
 # route-to 里没有它的条目 → 一条线拿到 0 个连接，而函数返回 0、无警告。
