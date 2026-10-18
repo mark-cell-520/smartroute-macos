@@ -411,15 +411,6 @@ struct InterfaceCard: View {
 
 /// streak 的展示：脚本语义是"ok 正数 / fail 负数 / 未知 0"。
 /// 负数要显示成"连续失败 N 次"而不是 "-3 次"。
-func streakText(_ streak: String) -> String {
-    if streak == "0" || streak.isEmpty { return "未知" }
-    if streak.hasPrefix("-") {
-        let n = String(streak.dropFirst())
-        return "连续失败 \(n) 次"
-    }
-    return "连续成功 \(streak) 次"
-}
-
 struct ProbePill: View {
     let value: String
     var streak: String = ""
@@ -841,9 +832,23 @@ struct BalanceView: View {
     }
 
     private var liveCard: some View {
-        Card(title: model.balanceMode == "fastest"
-             ? "实时流量（只有一条在动 = 正在走最快线路）"
-                 : "实时流量（两个接口一起动 = 分流生效）") {
+        // 标题原来写的是"实时流量（两个接口一起动 = 分流生效）"和
+        // "实时流量（只有一条在动 = 正在走最快线路）"。
+        //
+        // 这两句是**假证据**，而且是本项目专门修过一次的那一类：
+        // Wi-Fi 只要关联着就永远有背景流量（mDNS/ARP/DHCP/iCloud 心跳），
+        // pf route-to 根本没生效时，两条曲线照样一起起伏。于是用户盯着
+        // 这个页面、看到曲线在动，就认定分流生效、结束排查——而 pf 规则
+        // 可能压根没加载。
+        //
+        // smartroute.sh 的 balance_validate 早就为此把门槛提到 64KB+10%
+        // （VALIDATE_MIN_BYTES，注释原话"低于此更可能是背景心跳，不是
+        // 分流生效"），StatusView 和 SpeedView 也都在 6ed5eae 里加了警告，
+        // 唯独漏了这里——而这是用户开启 pf 分流后**真正盯着的页面**。
+        //
+        // 曲线只回答"有没有流量"，不回答"流量是怎么被分流的"。
+        // 后者只能看权威状态（同页 statusCard）或 fetch 打印的实测分摊。
+        Card(title: "实时流量") {
             VStack(alignment: .leading, spacing: Theme.gapS) {
                 ForEach(model.monitoredDevices, id: \.self) { dev in
                     HStack {
@@ -858,6 +863,15 @@ struct BalanceView: View {
                 if model.monitoredDevices.isEmpty {
                     Text("暂无活跃接口").foregroundStyle(.secondary)
                 }
+                // 警告必须放在曲线旁边，不能只放在默认落地页：用户正在
+                // 这个页面上判断"分流到底生没生效"，把提醒放到另一个标签页
+                // 等于没说。
+                Text("曲线同时起伏不能证明流量被分摊——Wi-Fi 只要关联着就永远有背景心跳（mDNS/ARP/DHCP/iCloud）。")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                Text("要看真实分摊：看上面的「分流状态」，或用 fetch 下载后读它打印的「实测分摊」。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
     }
@@ -1396,6 +1410,14 @@ struct DaemonView: View {
         if msg.contains("守护进程没起来") || msg.contains("安装失败") {
             return "安装失败：自动选路没有生效。展开「详情」看原因，照里面的命令手动做一遍即可。"
         }
+        // 残差必须排在"卸载完成"前面。uninstall.sh 有残留时，输出里
+        // "还有 N 项残留（见上）"和标题行会同时存在；而 App 流程下
+        // --keep-app 让 /Applications/SmartRoute.app 必然计成残留
+        // （NetworkModel.swift 硬编码 --keep-app，uninstall.sh 对它只 warn 不 rm），
+        // 所以这根本不是边缘情况——顺序一反，每次卸载都会被报成"都已清干净"。
+        if msg.contains("项残留") {
+            return "卸载未完全清干净：还有残留项。展开「详情」，照里面每条的手动命令逐条删。"
+        }
         if msg.contains("卸载完成") { return "卸载完成。程序、配置、规则、路由、进程都已清干净。" }
         if msg.contains("已暂停") { return "已暂停自动选路。重启 Mac 会恢复；想重启也不恢复，用 launchctl disable。" }
         if msg.contains("已恢复自动选路") { return "已恢复自动选路，每 20 秒检测一次。" }
@@ -1409,6 +1431,9 @@ struct DaemonView: View {
     private var daemonResultOK: Bool {
         let msg = model.daemonMessage
         if msg.contains("已取消授权") { return true }
+        // 残差也要转红。原来只排除"失败"，而"还有 N 项残留"不含"失败"二字，
+        // 于是未卸干净和全部清干净一样是绿的——三态被二值成了"成功"。
+        if msg.contains("项残留") { return false }
         return !msg.contains("失败") && !msg.contains("守护进程没起来")
     }
 

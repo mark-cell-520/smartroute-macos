@@ -33,7 +33,17 @@ else
     echo "    ⚠️  图标工具编译失败，将使用默认图标（不影响功能）"
     HAVE_ICON=0
 fi
-python3 - "$PWD/.build" <<'PYEOF'
+# 组装 icns 必须放在 HAVE_ICON 判断**里面**。
+#
+# 放在外面的后果：图标工具编译失败时 HAVE_ICON=0，但这里的 python 仍然照跑，
+# 而 icon_*.png 一个都没生成 → open() 抛 FileNotFoundError → set -e 下整个
+# 脚本中止。此时第 19 行已经 rm -rf 掉旧 App 和旧 ZIP 了——用户丢掉的不仅是
+# 一次发布，还有上一版能用的产物，而屏幕上只有一段 Python traceback。
+#
+# 这正是上面那条注释想避免的情况（"图标编译失败不能一票否决整个发布"），
+# 但只挡住了 swiftc 那一步，没挡住组装这一步。
+if [ "${HAVE_ICON:-0}" = "1" ]; then
+    python3 - "$PWD/.build" <<'PYEOF'
 import struct, sys
 d = sys.argv[1]
 elems = [(b'is32', f'{d}/icon_16.png'), (b'il32', f'{d}/icon_32.png'),
@@ -46,6 +56,7 @@ for t, f in elems:
     body += t + struct.pack('>I', len(data) + 8) + data
 open(f'{d}/AppIcon.icns', 'wb').write(b'icns' + struct.pack('>I', len(body) + 8) + body)
 PYEOF
+fi
 # 图标没生成成功就别复制（复制半个文件会让 App 起不来）
 if [ "${HAVE_ICON:-0}" = "1" ] && [ -s "$PWD/.build/AppIcon.icns" ]; then
     cp "$PWD/.build/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
@@ -216,6 +227,23 @@ names = z.namelist()
 assert not any("__MACOSX" in n for n in names), "仍有 __MACOSX 条目"
 assert any(n.endswith("SmartRoute.app/Contents/MacOS/SmartRoute") for n in names), "缺少可执行文件"
 assert any(n.endswith(".txt") for n in names), "缺少安装说明"
+# 内嵌主脚本必须在，且带可执行位。
+# 为什么单查它：ScriptLocator.scriptPath 在 bundled 脚本没有 +x 时**静默**
+# return installedScript（/usr/local/bin/smartroute），而 daemonScriptOutdated
+# 又要求 bundled 可执行才做版本对比——于是"内置脚本不可用"恰好让现有的版本
+# 不一致告警失效。用户机器上 App 会一声不响地跑去用系统里那份旧脚本，
+# 而 StatusView 只显示路径、不告警（且不在默认落地页）。
+# install.sh / uninstall.sh 不查执行位：App 从不用 exec 它们，而是
+# `bash <path>`，它们的 +x 与功能无关，缺失也不静默（bash 退出非零会被
+# installDaemon 的 failed 标志接到）。
+for n in names:
+    if n.endswith("Contents/Resources/smartroute.sh"):
+        assert (z.getinfo(n).external_attr >> 16) & 0o111, "内嵌 smartroute.sh 没有可执行位"
+        break
+else:
+    assert False, "ZIP 里缺少 Contents/Resources/smartroute.sh"
+# 版本号不查：VERSION 是唯一来源（见本脚本第 13 行），同一个 $VERSION 同时喂
+# Info.plist、ZIP 根目录名和 ZIP 文件名，除非有人手改 heredoc，否则不可能漂移。
 print("    ZIP 校验通过：%d 个条目" % len(names))
 PYEOF2
 

@@ -49,11 +49,33 @@ skip() { printf '    %s-%s %s（本来就没有）\n' "$C_0" "$C_0" "$*"; }
 # 失败时不再说"（失败，可忽略）"——那句话会把用户训练成忽视失败，
 # 而卸载是他对工具信任最脆弱的时刻，满屏 ⚠ 反而更慌：到底哪个要紧？
 # 改成给出可以照抄的手动命令，让他自己能收尾。
+# 第二个参数：目标路径。给了它才能区分"删掉了"和"本来就不在"。
+# 以前只要 rm 成功就打 ✓。而 rm 对不存在的文件也返回 0——于是重复卸载时
+# （第一次删干净了，用户不放心再跑一次）会看到满屏 ✓ "已删除"，
+# 每一个都是假的。用户无法从输出判断这次到底删了什么。
+# 传 "-" 表示"这个命令没有单一目标路径"，跳过存在性判断。
+# 必须有这个逃生口：像"遍历所有用户的 LaunchAgents 再删"这类循环命令
+# 没有单一目标，硬塞一个路径只会得到错误的"已不在"。
 run() {
     local desc="$1"; shift
+    local target="${1:-}"
+    # 两种取值都要 shift：target="-" 是逃生口（无单一目标），target=路径是正常用法。
+    # 只把 target 置空却不 shift 的话，"-" 会留在 "$@" 里被当成命令执行。
+    if [ "$target" = "-" ]; then target=""; shift
+    elif [ -n "$target" ]; then shift; fi
     if [ "$DRY" = "1" ]; then printf '    %s·%s 将删除: %s\n' "$C_0" "$C_0" "$desc"; return 0; fi
+    # 存在性必须在删除**之前**判断。写成删完之后再查是错的：删成功的话目标
+    # 当然不在了，那正是成功的标志，却被当成"上次已删"——于是第一次卸载也
+    # 满屏"已不在"，比原来的假 ✓ 更糟（连真的删掉了都不承认）。
+    local existed=1
+    if [ -n "$target" ] && [ ! -e "$target" ] && [ ! -L "$target" ]; then existed=0; fi
     if "$@" >/dev/null 2>&1; then
-        ok "$desc"
+        if [ -n "$target" ] && [ "$existed" = "0" ]; then
+            # 命令成功，但目标在动手前就已不在 = 上一次已经删掉了。说清楚
+            printf '    %s·%s 已不在（上次已删除）%s\n' "$C_0" "$C_0" "$desc"
+        else
+            ok "$desc"
+        fi
     else
         printf '    %s✗%s %s —— 删除失败\n' "$C_R" "$C_0" "$desc"
         printf '      可手动执行：sudo %s\n' "$*"
@@ -165,7 +187,7 @@ if [ "$DRY" = "0" ]; then
 else
     printf '    %s·%s 将刷掉锚点 %s 的规则；若是我们开的 pf 就连 pf 一起关\n' "$C_0" "$C_0" "$ANCHOR"
 fi
-run "锚点文件 /etc/pf.anchors/com.user.smartroute" rm -f /etc/pf.anchors/com.user.smartroute
+run "锚点文件 /etc/pf.anchors/com.user.smartroute" /etc/pf.anchors/com.user.smartroute rm -f /etc/pf.anchors/com.user.smartroute
 
 # ---------- 2. 路由清理 ----------
 say "清理路由"
@@ -223,12 +245,12 @@ fi
 
 # ---------- 3. 程序与配置 ----------
 say "删除程序与配置"
-run "命令行工具 /usr/local/bin/smartroute"       rm -f /usr/local/bin/smartroute
-run "免权限扫描 helper /usr/local/bin/smartroute-wifiscan" rm -f /usr/local/bin/smartroute-wifiscan
-run "守护进程 plist"                             rm -f /Library/LaunchDaemons/com.user.smartroute.plist
-run "系统配置 /etc/smartroute.conf"              rm -f /etc/smartroute.conf
-run "用户配置 /Users/Shared/smartroute.conf"     rm -f /Users/Shared/smartroute.conf
-run "用户配置临时残留 .conf.tmp*"                bash -c 'rm -f /Users/Shared/smartroute.conf.tmp*'
+run "命令行工具 /usr/local/bin/smartroute"       /usr/local/bin/smartroute rm -f /usr/local/bin/smartroute
+run "免权限扫描 helper /usr/local/bin/smartroute-wifiscan" /usr/local/bin/smartroute-wifiscan rm -f /usr/local/bin/smartroute-wifiscan
+run "守护进程 plist"                             /Library/LaunchDaemons/com.user.smartroute.plist rm -f /Library/LaunchDaemons/com.user.smartroute.plist
+run "系统配置 /etc/smartroute.conf"              /etc/smartroute.conf rm -f /etc/smartroute.conf
+run "用户配置 /Users/Shared/smartroute.conf"     /Users/Shared/smartroute.conf rm -f /Users/Shared/smartroute.conf
+run "用户配置临时残留 .conf.tmp*"                /Users/Shared/smartroute.conf.tmp* bash -c 'rm -f /Users/Shared/smartroute.conf.tmp*'
 # .conf.bak 是 App 导入配置前自动备份的用户原始配置，导入成功的提示里
 # 明写"原配置备份为 smartroute.conf.bak"、注释原话"留个后悔药"。
 # 卸载时静默删掉它，等于把用户唯一的退路悄悄拿走——而这是我们自己承诺过的。
@@ -238,10 +260,10 @@ if [ -f /Users/Shared/smartroute.conf.bak ]; then
 else
     skip "没有导入前的配置备份"
 fi
-run "分流规则 /Users/Shared/smartroute.rules"    rm -f /Users/Shared/smartroute.rules
-run "状态目录 /var/db/smartroute"                rm -rf /var/db/smartroute
-run "锁目录 /var/run/smartroute.lock"            rm -rf /var/run/smartroute.lock
-run "/tmp 探测残留"                              bash -c 'rm -f /tmp/.smartroute.probe.*'
+run "分流规则 /Users/Shared/smartroute.rules"    /Users/Shared/smartroute.rules rm -f /Users/Shared/smartroute.rules
+run "状态目录 /var/db/smartroute"                /var/db/smartroute rm -rf /var/db/smartroute
+run "锁目录 /var/run/smartroute.lock"            /var/run/smartroute.lock rm -rf /var/run/smartroute.lock
+run "/tmp 探测残留"                              /tmp/.smartroute.probe.* bash -c 'rm -f /tmp/.smartroute.probe.*'
 # App 开机自启的 plist。注意：从 App 里点卸载时这个脚本是以 root 跑的，
 # $HOME 是 /var/root——只删 "$HOME/..." 会删错地方，真正的用户 plist 留在
 # /Users/<user>/Library/LaunchAgents/ 里，校验却查同一个错路径，照样打印"✅ 零残留"。
@@ -256,22 +278,22 @@ if [ "$DRY" = "0" ]; then
         rm -f "$_p" && printf '    %s·%s 删除 %s\n' "$C_0" "$C_0" "$_p"
     done
 fi
-run "登录自启 plist（App 开机自启）"            bash -c 'for h in "$HOME" /Users/*; do [ -d "$h/Library/LaunchAgents" ] && rm -f "$h/Library/LaunchAgents/com.user.smartroute.app.plist"; done; true' 
+run "登录自启 plist（App 开机自启）"            - bash -c 'for h in "$HOME" /Users/*; do [ -d "$h/Library/LaunchAgents" ] && rm -f "$h/Library/LaunchAgents/com.user.smartroute.app.plist"; done; true' 
 if [ "$KEEP_LOGS" = "1" ]; then
     warn "按要求保留日志：/var/log/smartroute.{log,out,err}"
 else
-    run "日志 /var/log/smartroute.log"            rm -f /var/log/smartroute.log
+    run "日志 /var/log/smartroute.log"            /var/log/smartroute.log rm -f /var/log/smartroute.log
     # 日志超 1MB 会轮转成 .log.1（smartroute.sh 里做的），以前不删这个，
     # 卸完 /var/log 里还躺着上一代日志。
-    run "日志轮转 /var/log/smartroute.log.*"      bash -c 'rm -f /var/log/smartroute.log.*' 
-    run "守护进程 stdout /var/log/smartroute.out" rm -f /var/log/smartroute.out
-    run "守护进程 stderr /var/log/smartroute.err" rm -f /var/log/smartroute.err
+    run "日志轮转 /var/log/smartroute.log.*"      /var/log/smartroute.log.* bash -c 'rm -f /var/log/smartroute.log.*' 
+    run "守护进程 stdout /var/log/smartroute.out" /var/log/smartroute.out rm -f /var/log/smartroute.out
+    run "守护进程 stderr /var/log/smartroute.err" /var/log/smartroute.err rm -f /var/log/smartroute.err
     # log() 也会把 .out/.err 轮转成 .out.1/.err.1，旧版只删本体，
     # 卸完 /var/log 里还躺着上一代——"零残留"就漏了。
-    run "守护进程 stdout 轮转 /var/log/smartroute.out.*" bash -c 'rm -f /var/log/smartroute.out.*'
-    run "守护进程 stderr 轮转 /var/log/smartroute.err.*" bash -c 'rm -f /var/log/smartroute.err.*'
+    run "守护进程 stdout 轮转 /var/log/smartroute.out.*" /var/log/smartroute.out.* bash -c 'rm -f /var/log/smartroute.out.*'
+    run "守护进程 stderr 轮转 /var/log/smartroute.err.*" /var/log/smartroute.err.* bash -c 'rm -f /var/log/smartroute.err.*'
     # 用户级配置的临时残留（state_set 的 $STATE_FILE.$$ 同类）
-    run "状态临时残留 /var/db/smartroute/*.tmp"  bash -c 'rm -f /var/db/smartroute/*.tmp' 
+    run "状态临时残留 /var/db/smartroute/*.tmp"  /var/db/smartroute/*.tmp bash -c 'rm -f /var/db/smartroute/*.tmp' 
 fi
 
 # ---------- 4. App 本体 ----------
@@ -323,9 +345,6 @@ if [ "$DRY" = "0" ]; then
              /etc/pf.anchors/com.user.smartroute /var/db/smartroute /var/run/smartroute.lock \
              "$HOME/Library/LaunchAgents/com.user.smartroute.app.plist" \
              /Users/*/Library/LaunchAgents/com.user.smartroute.app.plist \
-             /var/log/smartroute.log /var/log/smartroute.log.* \
-             /var/log/smartroute.out /var/log/smartroute.out.* \
-             /var/log/smartroute.err /var/log/smartroute.err.* \
              /Applications/SmartRoute.app "$HOME/Applications/SmartRoute.app"; do
         if [ -e "$f" ] || [ -L "$f" ]; then printf '    %s✗%s 仍在: %s\n' "$C_R" "$C_0" "$f"; left=$((left+1)); fi
     done
@@ -400,7 +419,15 @@ if [ "$DRY" = "0" ]; then
         printf '    %s  或照上面每条给出的手动命令逐条删%s\n' "$C_0" "$C_0"
     fi
     echo
-    say "卸载完成。接下来："
+    # 标题必须按 left 分叉。原来无条件说"卸载完成。接下来："，于是有残留时
+    # 输出里同时存在"还有 N 项残留（见上）"和"卸载完成"两句话——自相矛盾，
+    # 而 App 的 daemonResultSummary 只匹配"卸载完成"，会把残留报告成
+    # 绿色的"都已清干净"。脚本侧先别伪装，App 侧才好如实翻译。
+    if [ "$left" -eq 0 ]; then
+        say "卸载完成。接下来："
+    else
+        say "卸载未完全：还有 ${left} 项残留（见上）。接下来："
+    fi
     echo "    1. App 本体按你的选择保留着——拖进废纸篓即可（见上面提示）"
     echo "    2.  退出 App（菜单栏图标随之消失）"
     echo "    3.  如果上网感觉异常：开关一次 Wi-Fi，或重启 Mac，让系统重新裁决路由"

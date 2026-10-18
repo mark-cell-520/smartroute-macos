@@ -237,6 +237,13 @@ struct WifiView: View {
                         get: { model.wifiFailoverOn },
                         set: { model.setWifiFailover(on: $0) }))
                     .toggleStyle(.switch)
+                if !model.wifiPrefMessage.isEmpty {
+                    Text(model.wifiPrefMessage)
+                        .font(.callout)
+                        .foregroundStyle(model.wifiPrefMessageFailed ? Theme.bad : Theme.ok)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text("优先尝试（逗号分隔，靠前优先）")
@@ -250,6 +257,18 @@ struct WifiView: View {
                             .buttonStyle(.borderedProminent)
                             .controlSize(.small)
                             .disabled(model.wifiLoading)
+                    }
+                    // 保存结果必须显示在这张卡片里。以前共用 model.wifiMessage，
+                    // 而它只渲染在上面「已保存的网络」卡片——用户在这张卡片点了
+                    // "保存"，盯着自己刚点的这张卡片，什么反馈都没有；
+                    // 上面那张卡片讲的是另一回事（已保存网络的清单），在那里看到
+                    // "优先列表已保存"只会让人困惑，甚至会以为存到了别处。
+                    if !model.wifiPrefMessage.isEmpty {
+                        Text(model.wifiPrefMessage)
+                            .font(.callout)
+                            .foregroundStyle(model.wifiPrefMessageFailed ? Theme.bad : Theme.ok)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
 

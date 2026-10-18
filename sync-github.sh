@@ -74,8 +74,26 @@ if [ "${1:-}" = "release" ]; then
         else
             gh release create "v${VERSION}" "$ZIP" --title "SmartRoute v${VERSION}" --notes-file "$NOTES"
         fi
+        _rc=$?
         rm -f "$NOTES"
-        say "✅ 已发布: $(gh release view "v${VERSION}" --json url -q .url 2>/dev/null)"
+        # 退出码必须接。set -u 不含 -e，这个裸命令失败时脚本会继续往下走，
+        # 照样打印"✅ 已发布"。
+        #
+        # 最坏的一条路径：Release 已存在（create 本来就不能重跑，见本脚本
+        # 末尾的提示）。此时 create 返回非 0，而 gh release view 对**已存在的
+        # 旧 Release 会成功**——于是打出一个真实、格式正确、却指向上一次发布
+        # 旧产物的 URL。用户看到合法链接，会比看到空 URL 更确信发布成功。
+        if [ "$_rc" -ne 0 ]; then
+            die "gh release create 失败，退出码 $_rc ——Release 未创建/未上传。\
+                请检查 gh auth status、仓库写权限；若 v${VERSION} 已存在，先 gh release delete v${VERSION} 再重跑。"
+        fi
+        _url="$(gh release view "v${VERSION}" --json url -q .url 2>/dev/null)"
+        if [ -n "$_url" ]; then
+            say "✅ 已发布: $_url"
+        else
+            die "Release 似乎已创建，但取不到 URL。请手动确认：\
+                https://github.com/\$(git remote get-url origin | sed -n 's#.*github.com[:/]\([^/]*/[^/.]*\).*#\1#p')/releases/tag/v${VERSION}"
+        fi
     else
         echo "没有 gh CLI 登录，无法直接建 Release。请先认证："
         echo "  export PATH=\"\$HOME/Pictures/smartroute/.tools/gh_*/bin:\$PATH\""

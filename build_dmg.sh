@@ -31,8 +31,36 @@ cleanup() {
 trap cleanup EXIT
 
 # ---------- 0. 前置检查 ----------
+# 只查 "$APP 目录存在"不够：目录在、可执行文件不在/不可执行/单架构/签名坏了，
+# DMG 照样打得出来，用户下载后打不开——而报错发生在千里之外的用户机器上，
+# 这里看到的只是一个"打包成功"。
+# build_release.sh 早就为同样的风险加了架构断言和 codesign 校验（见它的第 2 段），
+# 这里却只有目录存在性检查。补上同一套。
 [ -d "$APP" ] || die "找不到 ${APP}，请先运行: bash build_app.sh"
+BIN="$APP/Contents/MacOS/SmartRoute"
+[ -f "$BIN" ] || die "${APP} 里没有可执行文件（Contents/MacOS/SmartRoute）——这是个坏 App，请重新构建"
+[ -x "$BIN" ] || die "${APP} 的可执行文件没有执行位，打进去也起不来"
 command -v hdiutil >/dev/null || die "系统缺少 hdiutil"
+# 架构：必须是通用二进制。单架构产物在另一台机器上直接起不来，
+# 而 wifi_scan_bin() 只查 -x 不查架构，会静默降级成 system_profiler。
+if command -v lipo >/dev/null 2>&1; then
+    _archs="$(lipo -archs "$BIN" 2>/dev/null)"
+    case "$_archs" in
+        *x86_64*arm64*|*arm64*x86_64*) say "  ✓ 通用二进制 ($_archs)" ;;
+        "") echo "  ⚠️ 读不到架构信息（lipo 失败），跳过这项检查" ;;
+        *)  die "App 不是通用二进制，只有 $_archs 架构。用户机器上可能起不来；请用 build_release.sh 构建" ;;
+    esac
+fi
+# 签名： codesign -v 失败说明签名坏了，用户在 Mac 上会看到"已损坏"。
+# 不设 die——开发用的 ad-hoc 签名在全新构建后可能尚未重新签署，
+# 但至少要告诉打包的人。
+if command -v codesign >/dev/null 2>&1; then
+    if codesign -v "$APP" 2>/dev/null; then
+        say "  ✓ 签名校验通过"
+    else
+        echo "  ⚠️ 签名校验未通过——用户可能看到「App 已损坏」。若要发布，先跑 build_release.sh"
+    fi
+fi
 say "准备打包 ${APP}（版本 ${VERSION}）"
 
 # ---------- 1. 生成背景图 ----------

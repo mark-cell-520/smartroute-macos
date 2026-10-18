@@ -514,9 +514,28 @@ route_add_host() {   # $1=目标IP $2=设备 $3=网关
 }
 
 route_add_default() {  # $1=设备 $2=网关
+    # 第三条兜底不能不带 -interface。`route add default $gw` 只指定网关，
+    # 内核按自己的路由表选出口，很可能落到另一个接口上——而函数返回 0，
+    # 调用方（do_switch）据此打出"切换默认路由: X -> Y"、"✅ 已切换"。
+    # 用户看到成功，实际默认路由没动。这是假成功。
+    #
+    # 现在：先验证默认路由的出口确实是目标设备，不是就承认失败。
+    # 失败会让 do_switch 走原有的失败路径（记 flap、不清 flap_count），
+    # 而不是谎报成功。
     route add default -interface "$1" "$2" 2>/dev/null && return 0
     route add default "$2" -interface "$1" 2>/dev/null && return 0
-    route add default "$2" 2>/dev/null && return 0
+    # 兜底仍然尝试一次（某些 macOS 版本对参数顺序挑剔），但必须验证出口
+    if route add default "$2" 2>/dev/null; then
+        local _out
+        _out="$(route -n get default 2>/dev/null | awk '/^ *interface:/{print $2; exit}')"
+        if [ "$_out" = "$1" ]; then
+            return 0
+        fi
+        # 出口不对：把这条错的撤掉，别留一条指向错误接口的默认路由
+        route delete default "$2" >/dev/null 2>&1
+        log "route_add_default: 兜底成功但出口是 ${_out:-未知}（期望 $1），已撤销"
+        return 1
+    fi
     return 1
 }
 
@@ -1865,7 +1884,7 @@ route_has() {   # $1=CIDR $2=设备 -> 0 已存在
 
 apply_rules() {   # 由守护进程调用：把规则文件落地为静态路由
     [ "$(id -u)" -eq 0 ] || return 0
-    local want="" applied line cidr dev gw entry ifs
+    local want="" keep="" applied line cidr dev gw entry ifs
     applied="$(state_get applied_routes)"
 
     if [ -f "$RULES_FILE" ]; then
@@ -1893,7 +1912,17 @@ apply_rules() {   # 由守护进程调用：把规则文件落地为静态路由
         case "$want" in
             *"$entry;"*) ;;
             *) cidr="${entry%@*}"; dev="${entry#*@}"
-               route_del_net "$cidr" "$dev" && log "分流规则: 删除路由 $cidr via $dev" ;;
+               # 删除失败不能静默。以前只在本轮成功时打日志，失败什么都不会说，
+               # 而这条 entry 随后被从 applied_routes 里去掉——于是孤儿路由
+               # （指向已删除接口或已停用的规则）留在系统路由表里，
+               # 之后 balance off / 改规则时再也不会有人尝试删它。
+               # 至少要留下证据，并把它保留在 applied_routes 里下次再试。
+               if route_del_net "$cidr" "$dev"; then
+                   log "分流规则: 删除路由 $cidr via $dev"
+               else
+                   log "分流规则: 删除路由 $cidr via $dev 失败（该路由可能已不在，保留记录下次重试）"
+                   keep="${keep}${entry};"
+               fi ;;
         esac
     done
     # 添加规则里有但还没生效的
@@ -1910,7 +1939,10 @@ apply_rules() {   # 由守护进程调用：把规则文件落地为静态路由
     done
     IFS="$ifs"
 
-    state_set applied_routes "$want"
+    # 删除失败的 entry 要留在记录里（见上面删除循环），否则下一轮不会再有人
+    # 尝试删它，孤儿路由就永久留在系统路由表里。keep 里的项都不在 want 中
+    # （只在"规则里没有"时才可能进 keep），所以拼起来不会重复。
+    state_set applied_routes "$want$keep"
     return 0
 }
 
@@ -4037,9 +4069,23 @@ cmd_report() {
 #   · networksetup -setairportnetwork 失败时**也返回退出码 0**，所以成败必须解析输出文本。
 
 # 已保存的 Wi-Fi 列表（按系统偏好顺序，最优先在前）
+#
+# 两个必须的守卫，少一个就会把失败伪装成数据：
+# 1) 设备为空时 networksetup 把错误文本写到 **stdout** 并返回 10，
+#    sed -n '2,$p' 恰好留下第二行 "** Error: Error obtaining wireless
+#    information." —— 于是一条幽灵 SSID 出现在 wifi list、report 和
+#    App 的 Wi-Fi 页里，而且** 在 `for ssid in $saved` 里会被 glob
+#    展开成目录清单。
+# 2) 即使设备非空，接口被禁用/无 IPv4 时 find_active 也不会给它
+#    ACTIVE_WIFI_DEV（它只收有 IPv4 的设备），所以第 1 条是常态而非边角。
+#
+# 最后一级仍用 sed 而不是 grep -v：这样即使全部被滤掉、输出为空，
+# 管道退出码仍是 0，不改变现有 6 个调用点的成败语义。
 wifi_saved_list() {
+    [ -n "${ACTIVE_WIFI_DEV:-}" ] || return 1
     networksetup -listpreferredwirelessnetworks "$ACTIVE_WIFI_DEV" 2>/dev/null \
-        | sed -n '2,$p' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$'
+        | sed -n '2,$p' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+        | grep -v '^$' | sed '/^\*\*/d; / is not a /d'
 }
 
 # 候选列表 = WIFI_PREFERRED 里指定的（靠前优先）+ 其余已保存的（去重）
@@ -4549,9 +4595,14 @@ cmd_wifi() {
             # SSID 本身完全可以叫 "1. CZ-305"，那样按 "数字. " 去剥前缀就会剥错。
             # 所以人看的格式和机器读的格式分开，别让 App 去猜。
             if [ "${1:-}" = "--raw" ] || [ "${1:-}" = "-r" ]; then
+                # 空设备时安静返回：App 侧 Shell.run 会把 stderr 并进 stdout，
+                # 在这里 die 等于把错误文本又当成一条 SSID 显示——换了一种说谎方式。
+                [ -n "$ACTIVE_WIFI_DEV" ] || return 0
                 wifi_saved_list
                 return 0
             fi
+            # 人读格式：没有 Wi-Fi 接口要明说，和 scan/join/tryall 的措辞一致
+            [ -n "$ACTIVE_WIFI_DEV" ] || { echo "没有检测到 Wi-Fi 接口"; return 1; }
             echo "已保存的 Wi-Fi（靠前优先）："
             local n=0 ssid
             while IFS= read -r ssid; do

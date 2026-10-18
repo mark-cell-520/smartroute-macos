@@ -533,6 +533,24 @@ let r2 = Shell.run(restored, timeout: 10)
 eq(r2.out, nasty, "两层叠加后 bash 仍拿到原始值")
 
 print("")
+print("== 18b. streakText：读不到不能渲染成空标签 ==")
+// 脚本的 state_get 取不到键时返回 "-"。以前 dropFirst() 拿到空串，
+// 渲染成"连续失败  次"——中间空两格，出现在默认落地页的接口卡片上。
+// 实测复现：streakText("-") => "连续失败  次"
+let streakCases = [
+    ("-", "未知"),
+    ("-3", "连续失败 3 次"),
+    ("0", "未知"),
+    ("", "未知"),
+    ("5", "连续成功 5 次"),
+    ("12", "连续成功 12 次"),
+]
+for (inp, want) in streakCases { eq(streakText(inp), want, "streakText(\"\(inp)\")") }
+// 兜底：任何输出都不该出现连续两个空格（那就是空值漏进了字符串）
+for (inp, _) in streakCases {
+    isTrue(!streakText(inp).contains("  "), "streakText(\"\(inp)\") 不含连续空格")
+}
+
 print("== 18. beginOp 必须配 defer 形式的 endOp ==")
 // inFlight 守卫防的是"并发跑多份 shell 把机器拖垮"。但它有个静默失效模式：
 // 如果 endOp 是在 DispatchQueue.main.async 里手动调的，那么将来任何人在那个

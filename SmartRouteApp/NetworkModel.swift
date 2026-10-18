@@ -323,6 +323,15 @@ final class NetworkModel: ObservableObject {
     @Published var wifiScanAt: Date? = nil            // 上次扫描时间
     @Published var wifiLoading = false
     @Published var wifiMessage = ""
+    /// 「自动切换」卡片自己的一套消息。和 wifiMessage 分开是因为两者服务不同卡片：
+    //   · wifiMessage 归「已保存的网络」卡片（试连、刷新列表）
+    //   · wifiPrefMessage 归「自动切换」卡片（开关、保存优先列表）
+    // 共用一套的话，在自动切换卡片里点"保存"，结果会显示在上面那张
+    // 「已保存的网络」卡片里——用户盯着自己刚点的那张卡片，什么反馈都没有，
+    // 而上面那张卡片讲的是另一回事（已保存网络的清单），在那里看到
+    // "优先列表已保存"只会让人困惑。
+    @Published var wifiPrefMessage = ""
+    @Published var wifiPrefMessageFailed = false
     /// wifiMessage 是成功还是失败。以前靠字符串匹配 "失败"/"❌" 上色，
     /// 于是"网络名里含空格，无法加入优先列表"这种**警告**被染成成功绿——
     /// 用户以为存进去了，其实没有。severity 由设置消息的人显式给出。
@@ -989,19 +998,32 @@ final class NetworkModel: ObservableObject {
         let log = "/tmp/smartroute-pause.log"
         DispatchQueue.global().async {
             var result = ""
+            // ok 单独跟踪"到底成没成"。以前退出码只被拼进 result 文本，
+            // 而 daemonPaused 无条件置成请求值——bootout/bootstrap 失败时
+            // 界面照样显示"已暂停"+绿色"操作完成"，用户以为生效了。
+            // 这是假成功，比沉默更糟。
+            var ok = false
             do {
                 let (out, code) = try Privileged.runWithLog(cmd, logFile: log)
+                ok = (code == 0)
                 result = out.isEmpty ? (paused ? "已暂停自动选路" : "已恢复自动选路") : out
-                if code != 0 { result += "\n(退出码 \(code))" }
+                if code != 0 {
+                    result = "失败：暂停/恢复未生效。\(out)(退出码 \(code))"
+                }
             } catch PrivilegedError.cancelled {
+                // 用户取消授权 = 什么都没变，和"已取消授权，什么都没有改动。"自洽
+                ok = false
                 result = "已取消授权，什么都没有改动。"
             } catch {
+                ok = false
                 result = "失败: \(error.localizedDescription)"
             }
             DispatchQueue.main.async {
                 self.daemonMessage = result
                 self.daemonInstalling = false
-                self.daemonPaused = paused
+                // 只有真的成功了才翻转状态。取消/失败/非零退出码都保持原值，
+                // 与 installDaemon 的 failed 标志同一套处理。
+                self.daemonPaused = ok ? paused : self.daemonPaused
                 self.refresh()
             }
         }
@@ -1388,7 +1410,7 @@ final class NetworkModel: ObservableObject {
     /// 开关自动故障转移
     func setWifiFailover(on: Bool) {
         wifiLoading = true
-        wifiMessage = ""
+        wifiPrefMessage = ""
         let script = ScriptLocator.scriptPath
         DispatchQueue.global().async {
             do {
@@ -1396,14 +1418,14 @@ final class NetworkModel: ObservableObject {
                 DispatchQueue.main.async {
                     self.wifiLoading = false
                     self.loadWifiFailover()
-                    self.wifiMessage = on ? "已开启自动切换" : "已关闭自动切换"
-                    self.wifiMessageFailed = false
+                    self.wifiPrefMessage = on ? "已开启自动切换" : "已关闭自动切换"
+                    self.wifiPrefMessageFailed = false
                 }
             } catch {
                 DispatchQueue.main.async {
                     self.wifiLoading = false
-                    self.wifiMessage = "设置失败: \(error.localizedDescription)"
-                    self.wifiMessageFailed = true
+                    self.wifiPrefMessage = "设置失败: \(error.localizedDescription)"
+                    self.wifiPrefMessageFailed = true
                 }
             }
         }
@@ -1455,17 +1477,40 @@ final class NetworkModel: ObservableObject {
     /// 立即重新测量（用户等不及 SPEED_RECHECK 时点这个）
     func remeasureNow() {
         remeasuring = true
+        measurementsNote = ""
         let script = ScriptLocator.scriptPath
         DispatchQueue.global().async {
+            // 用 runWithLog 而不是 run：run 只返回字符串，拿不到退出码，
+            // 于是 `smartroute measure now` 自身失败（脚本报错、磁盘满、
+            // 另一个实例占着锁）时这里也视为成功——按钮转完圈回到原样，
+            // 用户只会再点一次。同一个静默失效，两个来源，一起堵。
             do {
-                _ = try Privileged.run("'\(script)' measure now")
+                let (_, code) = try Privileged.runWithLog("'\(script)' measure now",
+                                                          logFile: "/tmp/smartroute-remeasure.log")
                 DispatchQueue.main.async {
                     self.remeasuring = false
-                    self.loadMeasurements()
+                    if code == 0 {
+                        self.loadMeasurements()
+                    } else {
+                        // 不能只清 note：那会让上一次的成功/失败提示凭空消失，
+                        // 用户以为按钮坏了。给出可操作的原因。
+                        self.measurementsNote = "重新测量失败（退出码 \(code)）。常见原因：脚本正被另一个实例占用，或磁盘满。详情见 /tmp/smartroute-remeasure.log"
+                    }
                 }
             } catch {
+                // 失败不能静默。以前这里只把 remeasuring 置回 false——
+                // 按钮转完圈回到原样，没有任何原因说明，用户只会再点一次，
+                // 而真正的问题（要管理员密码时取消了、脚本不可执行、
+                // 磁盘满、提权被拒）一个都没告诉他。
+                // measurementsNote 已经被界面渲染成橙色提示行，正好复用。
                 DispatchQueue.main.async {
                     self.remeasuring = false
+                    switch error {
+                    case PrivilegedError.cancelled:
+                        self.measurementsNote = "已取消授权，没有重新测量。"
+                    default:
+                        self.measurementsNote = "重新测量失败：\(error.localizedDescription)"
+                    }
                 }
             }
         }
@@ -1481,18 +1526,18 @@ final class NetworkModel: ObservableObject {
         // 现在：含空格就明确拒绝，让用户知道这个网络名进不了优先列表。
         let normalized = wifiPreferred.replacingOccurrences(of: "，", with: ",")
         if normalized.contains(" ") {
-            wifiMessage = "网络名里含空格，无法加入优先列表（脚本用空格分隔多项）。可改用系统菜单栏 Wi-Fi 调整顺序。"
-            wifiMessageFailed = true
+            wifiPrefMessage = "网络名里含空格，无法加入优先列表（脚本用空格分隔多项）。可改用系统菜单栏 Wi-Fi 调整顺序。"
+            wifiPrefMessageFailed = true
             return
         }
         wifiPreferred = normalized
-        wifiMessage = ""
+        wifiPrefMessage = ""
         // 传原始值，不在这里 Shell.quote：quote 已收敛到 setConfigBatch 内部，
         // 在这里再包一层会变成空串加原引号，反而存不进东西。
         setConfigBatch([("WIFI_PREFERRED", normalized)]) { ok, msg in
             DispatchQueue.main.async {
-                self.wifiMessage = ok ? (normalized.isEmpty ? "已恢复默认顺序" : "优先列表已保存") : "保存失败: \(msg)"
-                self.wifiMessageFailed = !ok
+                self.wifiPrefMessage = ok ? (normalized.isEmpty ? "已恢复默认顺序" : "优先列表已保存") : "保存失败: \(msg)"
+                self.wifiPrefMessageFailed = !ok
                 self.loadWifiFailover()
             }
         }

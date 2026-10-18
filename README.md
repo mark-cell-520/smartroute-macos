@@ -328,7 +328,11 @@ gh release create v2.2 dist/SmartRoute-2.2-macOS.zip \
 6. **双网并发**（可选，`balance on`）：通过 pf 锚点把**新连接**按 round-robin 分发到两个网关——
    - 只对"新连接"生效，单线程传输不会翻倍；多连接/多应用会自然分摊；
    - 自动排除两个局域网网段、链路本地/组播、以及 VPN/拨号接口上的网段；
-   - 两个接口同网段时不需要 NAT；不同网段会按出口接口做 NAT 修正源地址；
+   - **同网段也必须 NAT**（这一点反直觉，但少了它下行会被钉死在慢的那条线上）：
+     两个接口同网段时，内核给去网关的路由只指向一个接口，源地址就固定成那个接口的 IP；
+     pf 的 `route-to` 只改出口、不改源地址，于是回程全涌向同一个接口——
+     用户看到的现象就是"开了并发下载还是 100M"。加了 `nat on` 之后源地址随出口改写，
+     回程才真的走对接口。代价只是一次地址改写。
    - 开启前做 10 个真实连接 + 流量分布验证，失败自动还原；任一口掉线，守护进程 20 秒内自动关闭并还原。
 7. **分流规则**（可选）：`smartroute.rules` 里每行 `CIDR 接口`，守护进程（root）落地为静态路由，
    优先级高于默认选路，适合"公司内网段固定走有线"这类需求。
@@ -337,7 +341,7 @@ gh release create v2.2 dist/SmartRoute-2.2-macOS.zip \
 
 | 项 | 默认 | 说明 |
 |---|---|---|
-| `MODE` | `auto` | `auto`=谁有外网走谁 / `ethernet`=强制有线 / `wifi`=强制无线 |
+| `MODE` | `auto` | `auto`=谁有外网走谁 / `ethernet`=强制有线 / `wifi`=强制无线 / `speed`=按实测吞吐选快的 / `latency`=按实测延迟选快的 |
 | `OK_N` / `FAIL_N` | 2 / 3 | 连续成功/失败多少次才改变判定 |
 | `COOLDOWN` | 45 | 两次切换最小间隔（秒） |
 | `PROBE_TARGETS` | 5 个公共 IP | 探测目标，可换成公司内网 IP |
@@ -346,9 +350,18 @@ gh release create v2.2 dist/SmartRoute-2.2-macOS.zip \
 | `NOTIFY` | 0 | 置 1 后，每次切换弹系统通知 |
 | `AUTO_WIFI_POWER` | 0 | 置 1 后，以太网无外网且 Wi-Fi 被关闭时自动打开 Wi-Fi |
 | `BALANCE` | 0 | 双网并发分流开关（由 `balance on/off` 维护，勿手改） |
-| `BALANCE_MODE` | `round-robin` | 并发策略：`round-robin` 轮询两条 / `fastest` 只走最快 |
+| `BALANCE_MODE` | `round-robin` | 并发策略：`round-robin` 轮询两条 / `fastest` 只走最快的 / `weighted` 按实测吞吐配比分流 |
 | `FASTEST_SWITCH_RATIO` | 20 | 判定"明显更快"的延迟差百分比，低于此值继续轮询不切换 |
 | `FASTEST_RECHECK` | 12 | fastest 模式下守护进程重测延迟的轮询次数（每轮约 20 秒） |
+| `WIFI_FAILOVER` | 0 | 置 1 后，Wi-Fi 上不了网时自动试连其它已保存的 Wi-Fi |
+| `WIFI_PREFERRED` | 空 | 优先试连的 Wi-Fi 名（逗号分隔，靠前优先）。留空=按系统保存顺序 |
+| `WIFI_FAILOVER_COOLDOWN` | 120 | Wi-Fi 故障转移的最小间隔（秒），防止在网络间来回跳 |
+| `SPEED_TEST_URL` | `https://speed.cloudflare.com/__down?bytes=5000000` | 网速优先模式的测速地址 |
+| `SPEED_TEST_TIMEOUT` | 8 | 单次测速超时（秒） |
+| `SPEED_RECHECK` | 300 | 多久重新测一次网速（秒）。测速要真下载，太频繁费流量 |
+| `SPEED_SWITCH_RATIO` | 30 | 判定"明显更快"的吞吐差阈值（百分比），低于它就继续用当前线路 |
+| `LATENCY_RECHECK` | 60 | 多久重新测一次延迟（秒） |
+| `WEIGHT_RECHECK` | 30 | weighted 模式下重测吞吐、更新配比的轮询次数（每轮约 20 秒） |
 
 配置文件位置：`/etc/smartroute.conf`（系统级）+ `/Users/Shared/smartroute.conf`（用户级，优先级更高，
 App 和 `smartroute set` 默认写这里，**不需要 sudo**）。分流规则在 `/Users/Shared/smartroute.rules`。
