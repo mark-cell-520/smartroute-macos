@@ -102,7 +102,30 @@ else
     # 644：属主可写、其他人只读。1777 目录里新建文件默认可能是 644，
     # 但显式 chmod 不依赖 umask，也不会被用户的 shell 配置改掉。
     sudo chmod 644 /Users/Shared/smartroute.conf
-    ok "已创建用户级配置 /Users/Shared/smartroute.conf（644）"
+    # ⚠️ 必须 chown 给控制台用户，不能留着 root 属主。
+    #
+    # 用户级配置的设计前提是"App/普通用户可写"（它就是为此存在的：
+    # 优先级高于 /etc，且改它不需要 sudo）。而 `sudo tee` 建出来的文件
+    # 属主是 root，/Users/Shared 又带 sticky 位 → conf_set 两条路都堵：
+    #   · 路径一同目录 tmp + mv：sticky 目录里 rename 不掉他人（root）的文件
+    #   · 路径二 cat >：打不开 644 的 root 文件
+    # 实测验证过 sticky 语义（/private/tmp 1777，mv 一个自己的文件去覆盖
+    # root 拥有的文件 → Permission denied；对照 mv 自己拥有的文件 OK）。
+    #
+    # 后果链：conf_set 返回 1 → cmd_set die「该文件属于 root…请 sudo chown」；
+    # cmd_wifi auto on / cmd_boost 的 conf_set_kv 同样失败（这两个调用方
+    # 都有明确报错，不是静默）。cmd_fixconf 和 conf_set:1782-1788 的存在
+    # 都说明这个状态是**已知坏状态**——而 install.sh 自己又在制造它。
+    # 全新安装后普通用户 set / App 保存必失败。
+    #
+    # 本机 /Users/Shared/smartroute.conf 现在是 mm 属主，说明确实有人已经
+    # 手工修过一次。
+    _console_uid="$(stat -f '%u' /dev/console 2>/dev/null || echo 0)"
+    _console_user="$(stat -f '%Su' /dev/console 2>/dev/null || echo root)"
+    if [ "$_console_uid" != "0" ]; then
+        sudo chown "$_console_uid" /Users/Shared/smartroute.conf 2>/dev/null
+    fi
+    ok "已创建用户级配置 /Users/Shared/smartroute.conf（644，属主 ${_console_user}）"
 fi
 
 # ---------- 4. 守护进程 ----------

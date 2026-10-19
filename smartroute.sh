@@ -4681,6 +4681,26 @@ acquire_lock_wait() {   # $1=最多等待秒数（默认 8）
     if [ ! -d "$LOCK_DIR" ] && [ "$(id -u)" -ne 0 ]; then
         return 0
     fi
+    # 非 root 且锁目录**已存在**（被 root 守护进程持有）：同样直接放行。
+    #
+    # 上面那条旁路只覆盖"目录不存在"这一种情况。而 /var/run 属 root，
+    # 非 root 用户 `mkdir "$LOCK_DIR"` 必然失败——目录存在时也一样拿不到，
+    # 等一辈子也白等，却要等满超时再 die"另一个操作正在进行"。
+    #
+    # 实测（父目录置 555 模拟 /var/run 属 root，pid 文件放活进程）：
+    #     拿不到锁（白等了 3 秒后失败）
+    #     拿不到锁（白等了 8 秒后失败）
+    # 调用方 cmd_test/cmd_quality/cmd_measure 传的是 10 秒。而 App 的
+    # loadQuality() 是不带 sudo 调的（timeout 30 秒），守护进程每 20 秒
+    # 占锁几秒 →「网速与延迟」页约 10-25% 的概率卡 10 秒然后空白。
+    #
+    # 旁路的论证对"目录已存在"同样成立：互斥只是为了保护主机路由的增删，
+    # 而那件事本身就需要 root。非 root 下 probe_dev / measure_latency /
+    # cmd_quality 都走"按当前默认路由"的分支，根本不碰路由表，
+    # 没有东西需要互斥。所以放行是安全的，不是"放弃保护"。
+    if [ "$(id -u)" -ne 0 ] && [ -d "$LOCK_DIR" ] && [ ! -w "$(dirname "$LOCK_DIR")" ]; then
+        return 0
+    fi
     local deadline=$(( $(date +%s) + ${1:-8} ))
     while :; do
         _lock_try && return 0

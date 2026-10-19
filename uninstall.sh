@@ -158,9 +158,25 @@ elif [ -n "$(route -n get default 2>/dev/null | awk '/^ *interface:/{print $2; e
         done
         if [ "$_back" = "1" ]; then
             ok "系统已自动重建默认路由（interface=$(route -n get default 2>/dev/null | awk '/^ *interface:/{print $2; exit}')）"
-        elif [ -n "$_d_gw" ] && route_add_default "$_d_if" "$_d_gw"; then
+        elif [ -n "$_d_gw" ]; then
             # configd 没动静：原样加回去，绝不把用户留在没有默认路由的状态
-            warn "系统未自动重建，已按原参数加回（interface=${_d_if} gateway=${_d_gw}）"
+            #
+            # ⚠️ 这里原来调 `route_add_default "$_d_if" "$_d_gw"`——而那个
+            # 函数定义在 smartroute.sh 里，uninstall.sh 既没定义也没 source，
+            # 全文只有这一处引用。实测（mock 一个 configd 2 秒内不重建的
+            # route）：命令找不到，直接落到 else 分支告警，而默认路由
+            # 始终不存在——**用户被留在断网状态**，注释承诺的兜底
+            # 100% 走不到。卸载脚本卸载到一半把网弄丢，是最坏的一种失败。
+            #
+            # 改成内联实现，不依赖另一个脚本的作用域。
+            # 两种写法都试：带 -interface 的写法在网关不在该接口网段时
+            # 会失败，退回让内核自己选出口。
+            if route add default -interface "$_d_if" "$_d_gw" 2>/dev/null \
+               || route add default "$_d_gw" -interface "$_d_if" 2>/dev/null; then
+                warn "系统未自动重建，已按原参数加回（interface=${_d_if} gateway=${_d_gw}）"
+            else
+                warn "默认路由未能自动重建——请手动开关一次 Wi-Fi 或重启 Mac"
+            fi
         else
             warn "默认路由未能自动重建——请手动开关一次 Wi-Fi 或重启 Mac"
         fi

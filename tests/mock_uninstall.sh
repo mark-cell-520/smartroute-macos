@@ -190,7 +190,45 @@ PYEOF2
 [ "$n" = "0" ] && ok "源码无 $VAR+中文 陷阱" || bad "源码还有 $n 处 $VAR+中文 陷阱"
 
 echo
+# ---------- 9. uninstall.sh 不许调用自己作用域里不存在的函数 ----------
+# 踩过的坑（真实发生过，而且是我自己修完却漏掉的）：
+#   uninstall.sh:161 调了 route_add_default，而那个函数定义在
+#   smartroute.sh 里，uninstall.sh 既没定义也没 source，全文只有这一处
+#   引用。注释承诺"configd 没动静就原样加回去，绝不把用户留在没有默认
+#   路由的状态"，实际这条路径 100% 走不到——命令找不到，直接落到 else
+#   分支告警，而默认路由始终不存在，**用户被留在断网状态**。
+#
+# 为什么测试没抓到：mock_uninstall 全程只 mock route/networksetup，
+# 而"函数未定义"是 bash 运行时错误，不触发任何 mock 的失败分支。
+# 更糟的是我在提交信息里写了"已修"，实际那次编辑因为文件并发修改
+# 报错后没有重试——**声称修了和真修了是两件事**。
+#
+# 所以这里做静态守卫：把 uninstall.sh 里所有"像函数调用"的标识符取出来，
+# 逐个确认它在本文件里有定义。新增的跨脚本调用会在这里立刻红，
+# 而不是等用户在卸载时断网。
+UNI="$(cd "$(dirname "$0")/.." && pwd)/uninstall.sh"
+if [ -f "$UNI" ]; then
+    _defs="$(grep -oE '^[a-z_][a-z0-9_]*\(\)' "$UNI" | tr -d '()')"
+    _calls="$(grep -v '^[[:space:]]*#' "$UNI" \
+        | grep -oE '(^|[;&| ])[a-z_][a-z0-9_]{2,}[[:space:]]' \
+        | tr -d ' ;&|' | sort -u)"
+    _cross=0
+    for _c in $_calls; do
+        printf '%s\n' $_defs | grep -qx "$_c" && continue
+        # 只报告"smartroute.sh 里有定义、而 uninstall.sh 里没有"的
+        if grep -q "^${_c}()" "$SRC" 2>/dev/null; then
+            bad "uninstall.sh 调用了 smartroute.sh 才有的函数：$_c（本文件未定义也未 source）"
+            _cross=$(( _cross + 1 ))
+        fi
+    done
+    [ "$_cross" -eq 0 ] && ok "uninstall.sh 没有跨脚本调用未定义函数（不会把用户留在断网状态）"
+else
+    bad "找不到 uninstall.sh（$UNI）"
+fi
+
+
 echo "结果: $PASS 通过, $FAIL 失败"
+
 [ "$FAIL" -eq 0 ]
 
 echo "=== 12. 服务顺序：备份要发生在改之前，卸载要还原 ==="
