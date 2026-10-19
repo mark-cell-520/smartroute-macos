@@ -1362,11 +1362,44 @@ cmd_watch() {
                 want="$ACTIVE_WIFI_DEV"
             fi
             ;;
-        *)        if [ "$eth_ok" -eq 1 ] && [ -n "$ACTIVE_ETH_DEV" ]; then
-                      want="$ACTIVE_ETH_DEV"
-                  elif [ "$wifi_ok" -eq 1 ] && [ -n "$ACTIVE_WIFI_DEV" ]; then
-                      want="$ACTIVE_WIFI_DEV"
-                  fi ;;
+        *)
+            # auto（默认模式）原来只看"哪个能上网"，有线永远赢。
+            #
+            # 这在两条线差不多快时没问题，但差很多时就是灾难：
+            # 本机实测 en0 封顶 92 Mbps（100baseTX），en1 能跑 270 Mbps（Wi-Fi 6
+            # 160MHz）。用户开着默认配置，于是**永远被钉在慢 3 倍的那条线上**，
+            # 而 status 显示一切正常——这正是"网络还是不好"的来源。
+            #
+            # 单连接测速时代两个数只差 4%（78.9 vs 82.3），加了也是噪声；
+            # 多连接测速修好后差值稳定在 2.6-3.3 倍，这时候再不加就说不过去了。
+            #
+            # 做法：两边都可用时，用实测吞吐当 tiebreaker；测不出来就退回原行为
+            # （有线优先）。不改变 auto 的可用性语义——某条线不通时照样转移。
+            if [ "$eth_ok" -eq 1 ] && [ "$wifi_ok" -eq 1 ] \
+               && [ -n "$ACTIVE_ETH_DEV" ] && [ -n "$ACTIVE_WIFI_DEV" ]; then
+                # 复用缓存（SPEED_RECHECK 秒内不真下载），不拖慢轮询。
+                # force 传空：auto 不该为了选路而强制下载，那会把 20 秒的
+                # 轮询周期拉长好几秒。
+                ensure_throughput "$ACTIVE_ETH_DEV" "$ACTIVE_WIFI_DEV"
+                local _ae _aw _apick
+                _ae="$(_metric_val "speed_$ACTIVE_ETH_DEV")"
+                _aw="$(_metric_val "speed_$ACTIVE_WIFI_DEV")"
+                _apick="$(pick_by_speed "$ACTIVE_ETH_DEV" "$_ae" "$ACTIVE_WIFI_DEV" "$_aw")"
+                case "$_apick" in
+                    "")   want="" ;;      # 都没测出来，保持现状更安全
+                    tie)  want="$cur" ;;  # 差距不够大，别折腾
+                    *)    want="$_apick" ;;
+                esac
+                # 只在真的选了更快的那条时才说话。tie/测不出来时安静，
+                # 否则每轮都刷一条日志，用户看不过来。
+                if [ -n "$_apick" ] && [ "$_apick" != "tie" ]; then
+                    log "自动选路: eth=$(fmt_bps "${_ae:-0}") wifi=$(fmt_bps "${_aw:-0}") -> ${_apick}"
+                fi
+            elif [ "$eth_ok" -eq 1 ] && [ -n "$ACTIVE_ETH_DEV" ]; then
+                want="$ACTIVE_ETH_DEV"
+            elif [ "$wifi_ok" -eq 1 ] && [ -n "$ACTIVE_WIFI_DEV" ]; then
+                want="$ACTIVE_WIFI_DEV"
+            fi ;;
     esac
 
     echo "$(ts) eth=${ACTIVE_ETH_DEV:-无}($eth_res) wifi=${ACTIVE_WIFI_DEV:-无}($wifi_res) default=${cur:-无} want=${want:-保持} mode=$MODE"

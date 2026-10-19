@@ -66,6 +66,10 @@ common='
 # 跑一次 watch。环境变量（MOCK_ETH_RES / MOCK_WIFI_RES / MOCK_DEFAULT_DEV /
 # MOCK_ETH_STREAK / MOCK_WIFI_STREAK）由调用方在**父 shell** export，
 # 因为 run_watch 是在父 shell 里读 streak 来 seed state 的。
+metric_code() {   # $1=eth键 $2=eth值 $3=wifi键 $4=wifi值 -> 一段可执行的 shell 代码
+    printf 'echo "%s=%s 1700000000" >> "$STATE_FILE"; echo "%s=%s 1700000000" >> "$STATE_FILE"' \
+        "$1" "$2" "$3" "$4"
+}
 run_watch() {
     : > "$T/calls"; : > "$T/sr.log"; : > "$T/state/st"
     # seed 滞回 streak：cmd_watch 的可用性判定要连续 OK_N(=2) 次成功才判"可用"，
@@ -102,11 +106,33 @@ MOCK_ETH_RES=fail MOCK_ETH_STREAK=-3 run_watch wifi
 grep -q "SWITCH en1" "$T/calls" && ok "以太网失败也不影响 wifi 模式" || bad "以太网失败时行为不对"
 MOCK_ETH_STREAK=2; unset MOCK_ETH_RES
 
-echo "== 3. MODE=auto（默认）：以太网优先 =="
-export MOCK_DEFAULT_DEV=en1
-run_watch auto
-grep -q "SWITCH en0" "$T/calls" && ok "两个都可用时优先以太网" || bad "没优先以太网: $(cat "$T/calls")"
-MOCK_ETH_RES=fail MOCK_ETH_STREAK=-3 MOCK_DEFAULT_DEV=en0 run_watch auto
+echo "== 3. MODE=auto（默认）：可用性优先，速度当 tiebreaker =="
+# 语义改过一次。原来 auto 只看"哪个能上网"，有线永远赢。
+# 但本机实测 en0 封顶 92M（100baseTX）、en1 能跑 270M（Wi-Fi 6 160MHz），
+# 单连接测速时代两者只差 4% 所以加了也是噪声；多连接测速修好后差值稳定在
+# 2.6-3.3 倍。这时候"永远钉在有线"就是让用户白丢 2/3 带宽——
+# 而 status 显示一切正常，正是"网络还是不好"的来源。
+# 所以 auto 改成：两边都可用时按实测吞吐挑快的，测不出来才退回有线优先。
+#
+# 三条断言分别锁住新语义的三个面，且都播种指标缓存、不碰真实网络
+# （不播种子的话 ensure_throughput 会真去下载，测试随机器变还慢）。
+# 注意 MOCK_DEFAULT_DEV 是"当前默认路由"，不是"期望选谁"。
+# 从 en0 出发、期望选 en1，才算一次切换；反之时 en1 出发才算。
+# （第一版写反了，期望 SWITCH en1 却让当前就在 en1，于是永远不触发——
+#  空 calls 看起来像选路坏了，其实是测试自己没造出切换条件。）
+export MOCK_DEFAULT_DEV=en0
+run_watch auto "$(metric_code speed_en0 23000000 speed_en1 75800000)"
+grep -q "SWITCH en1" "$T/calls" && ok "Wi-Fi 明显更快时选 Wi-Fi" || bad "没选更快的: $(cat "$T/calls")"
+# 反过来：有线更快时必须选有线，不能因为"auto 偏爱 Wi-Fi"而固守一边。
+# 这条要从 en1 出发才构成切换（want=en0 而 cur=en1）；
+# 上一版错在让当前就在 en0 还期望 SWITCH en0，等于期望一次不存在的切换。
+MOCK_DEFAULT_DEV=en1 run_watch auto "$(metric_code speed_en0 75800000 speed_en1 23000000)"
+grep -q "SWITCH en0" "$T/calls" && ok "以太网更快时选以太网" || bad "没选更快的: $(cat "$T/calls")"
+# 差距不够大（SPEED_SWITCH_RATIO=30%）时必须 tie、保持现状，不能来回横跳
+MOCK_DEFAULT_DEV=en1 run_watch auto "$(metric_code speed_en0 80000000 speed_en1 82000000)"
+[ -s "$T/calls" ] && bad "差距不大却切换了（会横跳）" || ok "差距不大时保持现状（tie）"
+# 一条线不通时照样按可用性转移，速度数据不影响这个语义
+MOCK_ETH_RES=fail MOCK_ETH_STREAK=-3 MOCK_DEFAULT_DEV=en0 run_watch auto "$(metric_code speed_en0 23000000 speed_en1 75800000)"
 grep -q "SWITCH en1" "$T/calls" && ok "以太网失败时退到 Wi-Fi" || bad "没退到 Wi-Fi: $(cat "$T/calls")"
 MOCK_ETH_STREAK=2; unset MOCK_ETH_RES
 
@@ -122,10 +148,6 @@ grep -q "SWITCH" "$T/calls" && bad "没测出吞吐就切换了" || ok "没测�
 #     在外面先写会被抹掉。（最早就是在外面写的，两条用例其实在真测延迟。）
 #  2) 用 echo 而不是 printf "...\n"：这段代码文本要再经一层 bash -c，
 #     里面的反斜杠不稳。echo 一条一行，没有任何转义。
-metric_code() {   # $1=eth键 $2=eth值 $3=wifi键 $4=wifi值 -> 一段可执行的 shell 代码
-    printf 'echo "%s=%s 1700000000" >> "$STATE_FILE"; echo "%s=%s 1700000000" >> "$STATE_FILE"' \
-        "$1" "$2" "$3" "$4"
-}
 run_watch speed "$(metric_code speed_en0 12000000 speed_en1 4000000)"
 grep -q "SWITCH en0" "$T/calls" && ok "以太网更快时选 en0" || bad "没选更快的: $(cat "$T/calls")"
 MOCK_DEFAULT_DEV=en0 run_watch speed "$(metric_code speed_en0 4000000 speed_en1 12000000)"
