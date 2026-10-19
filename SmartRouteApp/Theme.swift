@@ -267,7 +267,7 @@ struct WelcomeView: View {
                     .frame(width: 96, height: 96)
                 Text("SmartRoute 智能选路")
                     .font(.largeTitle.weight(.semibold))
-                Text("网线没外网时自动切 Wi-Fi，恢复后自动切回")
+                Text("网线没外网时自动切 Wi-Fi；两边都能用时按实测吞吐挑更快的那条")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }

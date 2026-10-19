@@ -2,7 +2,7 @@
 # mock 测试：apply_rules / write_pf_rules / cmd_rule
 # 用假的 route/netstat/pfctl/ifconfig/networksetup 验证逻辑，不动真实系统
 set -u
-SRC="/Users/mm/Pictures/smartroute/smartroute.sh"
+SRC="$(cd "$(dirname "$0")/.." && pwd)/smartroute.sh"
 T=/tmp/sr_mock2
 rm -rf "$T"; mkdir -p "$T/bin" "$T/state" "$T/etc" "$T/log"
 PASS=0; FAIL=0
@@ -526,10 +526,28 @@ if [ -n "$_trap_line" ] && [ -n "$_pf_line" ] && [ "$_trap_line" -lt "$_pf_line"
 else
     bad "trap 挂在加载 pf 之后或没挂（$_trap_line / $_pf_line），中断会漏还原"
 fi
-# 成功路径必须摘掉 trap，否则它会渗到后续命令里
-grep -q "state_set balance_winner \"\$only\"
-trap - INT TERM" "$SRC" \
-    && ok "成功路径摘掉 trap（不渗到后续命令）" || bad "成功路径没摘 trap"
+# 成功路径必须摘掉 trap，否则它会渗到后续命令里。
+#
+# ⚠️ 原来用跨行 grep 模式（模式里含换行）。而 grep 的多行 pattern 在 bash 里
+# 被拆成多个 pattern，语义是 **OR** 不是 AND——于是
+# `state_set balance_winner "$only"` 和 `trap - INT TERM` 各自存在即命中，
+# **完全不验证二者相邻**。而已知 trap - INT TERM 在源码里有 8 处，
+# 所以这条断言基本恒绿。实测：在两者之间插 3 行无关代码（bash -n 通过），
+# 断言仍然绿。
+#
+# 而"相邻"正是它想守的属性：不相邻就意味着 trap 会渗到后续命令里。
+# 改成取 winner 行的**下一行**再比对，行号差必须是 1。
+_winner_line=$(grep -n 'state_set balance_winner "\$only"' "$SRC" | head -1 | cut -d: -f1)
+if [ -n "$_winner_line" ]; then
+    _next_line=$(awk -v n="$_winner_line" 'NR==n+1' "$SRC")
+    if [ "$_next_line" = "    trap - INT TERM" ]; then
+        ok "成功路径摘掉 trap（紧跟在 winner 之后，不渗到后续命令）"
+    else
+        bad "成功路径没紧跟着摘 trap（下一行是: $_next_line）"
+    fi
+else
+    bad "找不到 state_set balance_winner \"\$only\""
+fi
 # 每条 die/回滚分支都要先摘 trap 再走，否则 trap 会在进程退出前多余地跑一次
 _n_clear=$(grep -c "trap - INT TERM; balance_off quiet" "$SRC")
 [ "$_n_clear" -ge 3 ] \

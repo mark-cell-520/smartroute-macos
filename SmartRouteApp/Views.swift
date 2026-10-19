@@ -262,7 +262,7 @@ struct StatusView: View {
         HStack(spacing: Theme.gapXS) {
             Image(systemName: "cable.connector")
                 .font(.caption)
-            Text("插上网线自动走网线，网线没外网自动切 Wi-Fi，恢复后自动切回。")
+            Text("两条线挑实测更快的那条走；某条断了自动切另一条，恢复后按实测速度重新判断，不保证切回原来那条。")
                 .font(.caption)
         }
         .foregroundStyle(.secondary)
@@ -272,7 +272,7 @@ struct StatusView: View {
     private var daemonBanner: some View {
         Banner(icon: "exclamationmark.triangle.fill", color: Theme.warn,
                title: "守护进程尚未安装",
-               message: "安装后每 20 秒自动检测：以太网没有外网时自动切到 Wi-Fi，恢复后自动切回（开机自启）",
+               message: "安装后每 20 秒自动检测：某条线没外网就切到另一条；两边都能用时按实测吞吐挑更快的那条，不保证切回原来那条（开机自启）",
                buttonTitle: model.daemonInstalling ? nil : "安装守护进程") {
             model.installDaemon()
         }
@@ -338,8 +338,19 @@ struct StatusView: View {
                 Spacer()
                 VStack(spacing: Theme.gapS) {
                     Button { model.refresh() } label: { Label("刷新", systemImage: "arrow.clockwise") }
-                    Button { runWatch() } label: { Label("立即检测", systemImage: "play.fill") }
+                    // 这个按钮跑的是 `smartroute watch`：探测 + 滞回判定 +
+                    // **当场切换默认路由**，且走 Privileged（弹管理员密码）。
+                    //
+                    // ⚠️ 原来叫「立即检测」，和旁边只读的「刷新」并排放，
+                    // 用户以为它也是个只读检查——结果是意外弹出密码框、
+                    // 默认路由可能被改。**同一个动作在 DaemonView 里被如实
+                    // 标成「立即检测并切换（会改默认路由，需要管理员密码）」**，
+                    // 落地页这个版本把两个关键信息都弱化了。同一项目内
+                    // 两种说法，前者不诚实。
+                    Button { runWatch() } label: { Label("立即检测并切换", systemImage: "play.fill") }
                         .disabled(model.watchRunning)
+                    Text("会改默认路由，需要管理员密码；只想看状态请点「刷新」。")
+                        .font(.caption2).foregroundStyle(.tertiary)
                 }
                 .controlSize(.small)
             }
@@ -1101,8 +1112,8 @@ struct RoutingView: View {
         // 描述和实际行为不一致时，用户会以为工具坏了——而他读的字面意思
         // 正是我们亲手写上去的。
         "auto": "自动：两个接口谁有外网就走谁；两边都能上网时，挑实测吞吐更快的那条。\n差距不足 30% 会维持当前线路，避免来回切换。某条线断了会自动转移。",
-        "ethernet": "强制有线：只要以太网有外网就走以太网（没有则保持现状）。",
-        "wifi": "强制无线：只要 Wi-Fi 有外网就走 Wi-Fi，适合网线口是局域网/坏口的情况。",
+        "ethernet": "强制有线：只要以太网有外网就走以太网；以太网没外网时回退到 Wi-Fi（可用性优先于偏好），两条都没有才保持现状。",
+        "wifi": "强制无线：只要 Wi-Fi 有外网就走 Wi-Fi，没外网时回退到以太网。适合网线口是局域网/坏口的情况。",
         // 名字造成的误解必须在这里拆掉。"网速优先"听起来像"让网变快"，
         // 实际语义只是"哪个接口快就走哪个"——两条线都慢的时候它毫无办法，
         // 用户却以为买了加速器。说明白，预期才对得上。
@@ -1143,10 +1154,10 @@ struct RoutingView: View {
                     KeyValueRow(key: "实测吞吐", value: "eth \(model.ethSpeed)   Wi-Fi \(model.wifiSpeed)")
                     KeyValueRow(key: "实测延迟", value: "eth \(model.ethLatency)   Wi-Fi \(model.wifiLatency)")
                     if model.ethSpeed == "未测" && model.wifiSpeed == "未测" {
-                        Text("固定/自动模式下不会自动测量（省流量和省电），点下面的按钮测一次，\n就能看到当前选的接口是不是真的更快。")
+                        Text("固定模式（以太网/Wi-Fi）下不自动测量，点下面的按钮测一次，\n就能看到当前选的接口是不是真的更快；自动模式下守护进程会按实测吞吐定期测。")
                             .font(.caption2).foregroundStyle(.secondary)
                     } else {
-                        Text("固定/自动模式下不会自动测量，这里是上次的结果。")
+                        Text("固定模式下不自动测量，这些是上次的结果；自动模式下守护进程会按实测吞吐定期测（约每 300 秒），这里显示的就是它的结果。")
                             .font(.caption2).foregroundStyle(.secondary)
                     }
                 }
@@ -1409,7 +1420,7 @@ struct DaemonView: View {
                 }
             }
             Section {
-                Text("守护进程以 root 每 20 秒检测一次：以太网没有外网时自动把默认路由切到 Wi-Fi，恢复后自动切回；"
+                Text("守护进程以 root 每 20 秒检测一次：某条线没外网就自动把默认路由切到另一条；两边都能用时按实测吞吐挑更快的那条，不保证切回原来那条；"
                      + "同时应用分流规则，并在双网并发开启时监控接口健康（掉线自动还原）。安装后本 App 主要用作仪表盘和手动干预。")
                     .font(.caption).foregroundStyle(.secondary)
             }
@@ -1606,7 +1617,7 @@ struct AboutView: View {
             }
             Section("工作方式") {
                 Text("• 每 20 秒探测以太网和 Wi-Fi 的外网连通性（ping → TCP → TLS 三层）")
-                Text("• 没有外网的接口不会提供默认路由；恢复后自动切回（带滞回与冷却）")
+                Text("• 没有外网的接口不会提供默认路由；两边都能用时按实测吞吐挑更快的那条（带滞回与冷却）")
                 Text("• 双网并发通过 pf 轮询把不同连接分发到两个网关（需两个接口都有外网）")
                 Text("• 分流规则把指定网段固定从指定接口出去（静态路由）")
             }

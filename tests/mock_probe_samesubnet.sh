@@ -1,7 +1,7 @@
 #!/bin/bash
 # 复现并验证：同网段双宿主 + 与守护进程并发时，探测不再误判
 set -u
-SRC="/Users/mm/Pictures/smartroute/smartroute.sh"
+SRC="$(cd "$(dirname "$0")/.." && pwd)/smartroute.sh"
 T=/tmp/sr_mock4
 rm -rf "$T"; mkdir -p "$T/bin" "$T/state" "$T/etc" "$T/log" "$T/run"
 PASS=0; FAIL=0

@@ -1,7 +1,7 @@
 #!/bin/bash
 # mock 测试：watch 的安全阀与规则应用集成（不影响原有选路逻辑）
 set -u
-SRC="/Users/mm/Pictures/smartroute/smartroute.sh"
+SRC="$(cd "$(dirname "$0")/.." && pwd)/smartroute.sh"
 T=/tmp/sr_mock3
 rm -rf "$T"; mkdir -p "$T/bin" "$T/state" "$T/etc" "$T/log" "$T/run"
 PASS=0; FAIL=0

@@ -143,7 +143,18 @@ conf_value_ok() {
         #   · weighted 会话之后裸跑 balance on，静默变成 round-robin
         BALANCE_MODE)  case "$val" in round-robin|fastest|weighted) ;; *) return 1 ;; esac ;;
         OK_N|FAIL_N|COOLDOWN|PING_TIMEOUT|NC_TIMEOUT|FASTEST_SWITCH_RATIO|FASTEST_RECHECK|WIFI_FAILOVER_COOLDOWN|SPEED_TEST_TIMEOUT|SPEED_RECHECK|LATENCY_RECHECK|SPEED_SWITCH_RATIO)
-                       case "$val" in ''|*[!0-9]*) return 1 ;; esac ;;
+                       case "$val" in ''|*[!0-9]*) return 1 ;; esac
+                       # 上界也要查。查过的实例：
+                       #   OK_N=999999999999999999999 → 通过校验，
+                       #     然后每个 watch 周期往 stderr 写 2 行
+                       #     "integer expression expected"（进 /var/log/smartroute.err，
+                       #     还会被轮转），而用户完全看不到。
+                       #   PING_TIMEOUT=99999999999999999999 → ping -W 直接
+                       #     rc=64 用法错误，**ping 探测层全程失效**
+                       #     （还有 TCP/TLS 兜底，不至误判断网，但少了一层）。
+                       # 86400（一天）对这些键都是荒谬的上限：没有任何一个是
+                       # "等一天"才有意义的配置。真实值远在它下面。
+                       [ "$val" -le 86400 ] || return 1 ;;
         TLS_PROBE|NOTIFY|AUTO_WIFI_POWER|BALANCE|WIFI_FAILOVER)
                        case "$val" in 0|1) ;; *) return 1 ;; esac ;;
         PROBE_TARGETS) case "$val" in *[!0-9.\ ]*) return 1 ;; esac ;;
@@ -1271,8 +1282,20 @@ cmd_watch() {
             fi
         elif [ "$(state_get balance_mode)" = "weighted" ]; then
             # 权重模式：周期性重测吞吐并更新配比。只在权重真的变了时才重写规则。
-            local bwcyc
-            bwcyc=$(( $(state_get balance_wcycle) + 1 ))
+            #
+            # ⚠️ 计数必须先校验再进算术。state 文件被写坏成 "1x" 时，
+            # `$(( 1x + 1 ))` 直接报 "value too great for base"，
+            # **分支在这里中断**——后面的 state_set 和
+            # balance_weight_reevaluate 都不会执行，配比永远不再更新，
+            # 只有 stderr 一行（进 /var/log/smartroute.err，还会被轮转）。
+            # 实测确认过这个中断：写坏后不写 state、不触发重测。
+            #
+            # cmd_watch 主决策链（update_streak/do_switch/flap/bump_switch_count）
+            # 都有这层卫衣，这两处是漏的。
+            local bwcyc _bwraw
+            _bwraw="$(state_get balance_wcycle)"
+            [[ "$_bwraw" =~ ^[0-9]+$ ]] || _bwraw=0
+            bwcyc=$(( _bwraw + 1 ))
             state_set balance_wcycle "$bwcyc"
             if [ "$bwcyc" -ge "$WEIGHT_RECHECK" ]; then
                 state_set balance_wcycle 0
@@ -1280,8 +1303,10 @@ cmd_watch() {
             fi
         elif [ "$(state_get balance_mode)" = "fastest" ]; then
             # 最快线路模式：周期性重测延迟，线路变慢自动改道
-            local bcyc
-            bcyc=$(( $(state_get balance_cycle) + 1 ))
+            local bcyc _bcraw
+            _bcraw="$(state_get balance_cycle)"
+            [[ "$_bcraw" =~ ^[0-9]+$ ]] || _bcraw=0
+            bcyc=$(( _bcraw + 1 ))
             state_set balance_cycle "$bcyc"
             if [ "$bcyc" -ge "$FASTEST_RECHECK" ]; then
                 state_set balance_cycle 0
@@ -3692,15 +3717,40 @@ cmd_boost() {
     conf_set_kv WIFI_FAILOVER 1 && echo "  ✅ Wi-Fi 自动寻找 → 开（当前 Wi-Fi 上不了网时试连其它已保存网络）" \
                                   || echo "  ❌ 写 WIFI_FAILOVER 失败"
     # 3) 双网并发。配置打开，但 pf 规则要 root 加载，分开说清楚。
-    conf_set_kv BALANCE 1       && echo "  ✅ 双网并发 → 配置已开" \
-                                  || echo "  ❌ 写 BALANCE 失败"
-    conf_set_kv BALANCE_MODE weighted && echo "  ✅ 并发策略 → weighted（按实测吞吐自动配比）" \
-                                  || echo "  ❌ 写 BALANCE_MODE 失败"
+    #
+    # ⚠️ 这里必须先做同网关预检，不能无条件写 BALANCE=1 再打 ✅。
+    #
+    # 实测踩过的坑：同网关机器（本机就是 en0/en1 同 192.168.1.0/24 同网关）
+    # 上跑 boost，四项全是 ✅，其中"✅ 双网并发 → 配置已开"。但同网关时
+    # `balance on` 一律拒绝（见 4459 行），pf 规则永远不可能存在；而守护
+    # 进程下一轮看到 BALANCE=1、锚点无规则、anchor 文件不存在，会走
+    # balance_off quiet 把 BALANCE 置回 0——**用户看到的 ✅ 在 ≤20 秒后
+    # 变成假的，而且没有任何界面/通知告知**。
+    #
+    # 同网关时双网并发没有带宽收益（一个 WAN、带宽不叠加），只有风险，
+    # 所以正确做法是明说"本机不满足条件"，而不是打一个会自己消失的 ✅。
+    _same_gw=0
+    eth_wifi_same_gateway && _same_gw=1
+    if [ "$_same_gw" = "1" ]; then
+        echo "  ⚠️  双网并发 → 本机两个接口同网关，已禁用"
+        echo "      同网关意味着只有一个 WAN，两条线的带宽不会叠加，"
+        echo "      强行分流只有卡死风险。这一步不是故障，是拓扑不支持。"
+        echo "      （配置没有写 BALANCE=1，所以守护进程也不会去反复尝试）"
+    else
+        conf_set_kv BALANCE 1       && echo "  ✅ 双网并发 → 配置已开" \
+                                      || echo "  ❌ 写 BALANCE 失败"
+        conf_set_kv BALANCE_MODE weighted && echo "  ✅ 并发策略 → weighted（按实测吞吐自动配比）" \
+                                      || echo "  ❌ 写 BALANCE_MODE 失败"
+    fi
 
     echo ""
     if [ "$(id -u)" -eq 0 ]; then
         # root 直接加载，不用用户再敲一条
-        if balance_on weighted; then
+        # 同网关时 balance_on 一定拒绝，别去调它然后打一个 ❌——
+        # 那不是失败，是拓扑不支持（上面已经解释过了）。
+        if [ "$_same_gw" = "1" ]; then
+            :
+        elif balance_on weighted; then
             echo "  ✅ pf 分流规则已加载"
         else
             echo "  ❌ pf 规则加载失败，请手动跑: sudo smartroute balance on weighted"

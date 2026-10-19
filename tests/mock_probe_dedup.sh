@@ -7,7 +7,7 @@ bad() { printf '  ✗ %s\n' "$1"; FAIL=$((FAIL+1)); }
 set -u
 T=/tmp/sr_dedup
 rm -rf "$T"; mkdir -p "$T/bin" "$T/state"
-SRC="/Users/mm/Pictures/smartroute/smartroute.sh"
+SRC="$(cd "$(dirname "$0")/.." && pwd)/smartroute.sh"
 
 sed -e "\|^PATH=/usr/local/sbin:|d" "$SRC" \
   | awk '/^# ---------------- 入口 ----------------/{exit} {print}' > "$T/sr.sh"

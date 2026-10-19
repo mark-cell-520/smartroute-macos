@@ -1,7 +1,7 @@
 #!/bin/bash
 # 用真实 pfctl -n 校验生成的 pf 规则语法（不需要 root）
 set -u
-SRC="/Users/mm/Pictures/smartroute/smartroute.sh"
+SRC="$(cd "$(dirname "$0")/.." && pwd)/smartroute.sh"
 T=/tmp/sr_pfreal
 rm -rf "$T"; mkdir -p "$T/etc"
 PASS=0; FAIL=0

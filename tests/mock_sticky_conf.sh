@@ -1,7 +1,7 @@
 #!/bin/bash
 # 专项：修复"App 保存失败"——/Users/Shared 带 sticky 位、用户配置被 root 占有的问题
 set -u
-SRC="/Users/mm/Pictures/smartroute/smartroute.sh"
+SRC="$(cd "$(dirname "$0")/.." && pwd)/smartroute.sh"
 T=/tmp/sr_sticky
 rm -rf "$T"; mkdir -p "$T/etc" "$T/shared"
 PASS=0; FAIL=0

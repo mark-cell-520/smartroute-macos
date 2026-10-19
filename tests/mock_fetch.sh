@@ -121,7 +121,14 @@ echo "== 4. Range 探测：三种办法都在真实 CDN 上失败过 =="
 #     且 body 为 0；但它和 HEAD 对同一 URL 会给出不同大小
 #     （CDN 按请求返回不同压缩变体），信它就会切出错文件。
 # 所以 HEAD 优先、越界探针兜底，最后由下载时字节数校验裁决。
-grep -q "range 999999999-" smartroute.sh \
+# ⚠️ 必须先剥注释行再 grep。原来直接 grep 源码，而 smartroute.sh:2526 的
+# 注释和 :2553 的真实 curl 调用**都含这个串**——把 2553 那行代码删掉、
+# 只留注释，断言仍然绿（已实测复现）。而"用越界范围探测"是一个
+# documented-important 的设计决策（HEAD 会对同一 URL 给出不同大小，
+# 信它就会切出错文件），它实际零有效覆盖。
+# 行为测试兜不了这个：httpstub 对 --range 0-0 和 --range 999999999- 都回
+# 206/416+Content-Range，mock_fetch_http 区分不了二者。
+grep -v '^[[:space:]]*#' smartroute.sh | grep -q "range 999999999-" \
     && ok "用越界范围探测（规范强制带 Content-Range）" || bad "没有越界探测"
 grep -q 'probe_code" = "416"' smartroute.sh \
     && ok "按 416 判定支持 Range" || bad "没有按 416 判定"
@@ -283,8 +290,15 @@ _cn_die=$(awk '/local _cn=0/,/^        fi$/' smartroute.sh | grep -c 'die "有�
 echo "== 10. 权重为 0 会让一条线静默饿死 =="
 # write_pf_rules 不校验 $7/$8：传 0 时那一侧 while 一次都不跑，
 # route-to 里没有它的条目 → 一条线拿到 0 个连接，而函数返回 0、无警告。
-grep -q "权重必须落在 \[1,8\]" smartroute.sh \
-    && ok "有权重校验" || bad "没有权重校验"
+# 这里原来有一条静态 grep：
+#     grep -q "权重必须落在 \[1,8\]" smartroute.sh && ok "有权重校验"
+# 实测：那个串**只出现在注释里**，真实的 clamp（for/case 夹到 [1,8]）不含它，
+# 于是把 clamp 整块删掉、只留注释，断言仍然绿。
+#
+# 但有行为兜底：下面的 gen_w 真调 write_pf_rules，删掉 clamp 会让 route-to
+# 从 "1 4" 变 "0 4" → gen_w 变红（已实测）。所以这条静态断言是
+# **冗余且没牙**，留着只会虚高"有覆盖"的观感——真正的保障是 gen_w。
+# 删掉它，覆盖来自行为测试。
 gen_w() {   # $1=wA $2=wB
     bash -c ". '$T/sr.sh'; trap - EXIT INT TERM HUP
         export PATH='/usr/bin:/bin:/usr/sbin:/sbin'

@@ -1,7 +1,7 @@
 #!/bin/bash
 # 端到端：route 往 stdout 喷垃圾（旧版 bug 场景）时，判定链仍能正确得出 wifi_ok=1
 set -u
-SRC="/Users/mm/Pictures/smartroute/smartroute.sh"
+SRC="$(cd "$(dirname "$0")/.." && pwd)/smartroute.sh"
 T=/tmp/sr_e2e
 rm -rf "$T"; mkdir -p "$T/bin" "$T/state" "$T/etc" "$T/log" "$T/run"
 PASS=0; FAIL=0

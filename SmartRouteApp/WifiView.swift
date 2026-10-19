@@ -54,6 +54,25 @@ struct WifiView: View {
                     EmptyState(icon: "wifi.slash",
                                title: "附近没有已保存的网络",
                                message: "只列出已保存过的网络（密码在系统钥匙串里）。新网络请先在系统菜单栏的 Wi-Fi 里连一次。")
+                    // ⚠️ 原来 wifiScanNote 只在下面那个 else（列表非空）分支里
+                    // 渲染。于是扫描失败（Shell.run 超时、或脚本 die，如
+                    // "没有检测到 Wi-Fi 接口"）时 WifiParsing.nearbyNetworks
+                    // 返回空数组 → 走这个分支 → note 被完全丢弃。
+                    //
+                    // 用户看到的是一个**确定性的结论**，而实际只是没扫到。
+                    // NetworkModel.swift 的注释早就写着要避免这件事
+                    // （"超时时 out 只有『命令超时 15 秒』，解析出空列表，
+                    // 界面会显示『附近没有已保存的网络在范围』——一个确定性的
+                    // 结论，而实际只是没扫到"），但只修了 wifiScanAt 不写
+                    // 时间戳那一半，显示那一半没修。
+                    //
+                    // 成功但 unknown>0 且列表为空时，"有 N 个网络未能确认"
+                    // 也同样被丢弃。现在把它挪到链尾，两个分支都能看到。
+                    if !model.wifiScanNote.isEmpty {
+                        Text(model.wifiScanNote)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 } else {
                     ForEach(model.wifiNearby) { n in
                         HStack(spacing: Theme.gapS) {
