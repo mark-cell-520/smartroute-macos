@@ -152,8 +152,20 @@ out="$(run 'pick_by_speed en0 1000000 en1 1100000')"
 [ "$out" = "tie" ] && ok "差 10% < 30% 阈值 → tie（不折腾）" || bad "得到: $out"
 out="$(run 'pick_by_speed en0 1000000 en1 1400000')"
 [ "$out" = "en1" ] && ok "差 40% > 30% → en1" || bad "得到: $out"
+# ⚠️ 这条断言改过语义，原因是实测踩坑：
+# 老逻辑是 if (a+0 <= 0) { print d2 }，即"一边是 0 就选另一边"。
+# 但一边是 0 的真实含义是**这一边没测到**（探测超时、测速源不可用、
+# 刚装上前两轮缓存为空），不是"另一边更快"。
+# 后果：status 打出「实测较快的是 en1」，用户以为有线就是慢，
+# 去换网线换口，白忙一场；cmd_watch 的 auto 分支也会据此切走一条
+# 可能完全正常的线。
+#
+# 改成弃权（返回空），由调用方按可用性兜底。这和 probe_dev 的可用性
+# 探测是互补的：线真坏了时可用性会判 fail 并切走，不会卡住。
 out="$(run 'pick_by_speed en0 0 en1 1100000')"
-[ "$out" = "en1" ] && ok "只有一边测到 → 直接用那边" || bad "得到: $out"
+[ -z "$out" ] && ok "一边没测到 → 弃权（不假设另一边更快）" || bad "得到: $out（会把没测到当成另一边更快）"
+out="$(run 'pick_by_speed en0 1100000 en1 0')"
+[ -z "$out" ] && ok "另一边没测到 → 同样弃权" || bad "得到: $out"
 out="$(run 'pick_by_speed en0 0 en1 0')"
 [ -z "$out" ] && ok "两边都没测到 → 空（保持现状）" || bad "应输出空，得到: $out"
 
@@ -261,8 +273,11 @@ _ps() {   # pick_by_speed 的判定
 [ -z "$(_pf 'en0 0 en1 0')" ] && ok "pick_fastest: 两边都是 0 时判"没测到"" || bad "两边 0 却有结论"
 [ "$(_pf 'en0 -5 en1 12')" = "en1" ] && ok "pick_fastest: 负延迟被拒" || bad "负延迟被当合法"
 [ "$(_pf 'en0 12.5 en1 10')" = "en1" ] && ok "pick_fastest: 小数正常比较" || bad "小数比较错"
-# 和 pick_by_speed 对齐：同为 <=0 都当没测到
-[ "$(_ps 'en0 0 en1 1100000')" = "en1" ] && ok "pick_by_speed: 0 不当合法吞吐" || bad "pick_by_speed 0 被当合法"
+# 和 pick_by_speed 对齐：同为 <=0 都当没测到，且都弃权。
+# （以前这里期望 "en1"，即"一边是 0 就选另一边"——那个语义已修，
+#  理由见第 4 节的长注释：一边是 0 表示没测到，不表示另一边更快。）
+[ -z "$(_ps 'en0 0 en1 1100000')" ] && ok "pick_by_speed: 0 不当合法吞吐（弃权）" || bad "pick_by_speed 0 被当合法"
+[ -z "$(_ps 'en0 1100000 en1 0')" ] && ok "pick_by_speed: 反过来也弃权" || bad "只挡了一边"
 # tie 阈值两边要一致（以前 speed 用 <、latency 用 <=，同一差距一个换一个不换）
 [ "$(_pf 'en0 10 en1 12')" = "en0" ] && ok "正好 20% 差距时判赢家（与 speed 一致）" || bad "阈值不一致: $(_pf 'en0 10 en1 12')"
 [ "$(_pf 'en0 10 en1 11')" = "tie" ] && ok "不到 20% 判平手" || bad "平手判断错: $(_pf 'en0 10 en1 11')"
@@ -285,6 +300,62 @@ _mv() { bash "$T/mv.sh" "$T" "$1" 2>/dev/null; }
 [ -z "$(_mv -5)" ]    && ok "_metric_val: 负数当没测到" || bad "负数被透传了"
 [ -z "$(_mv abc)" ]   && ok "_metric_val: 非数字当没测到" || bad "非数字被透传了"
 [ "$(_mv 0.001)" = "0.001" ] && ok "_metric_val: 小正数仍透传" || bad "小正数被误滤"
+
+echo
+echo "=== 9. status 必须打出选路依据，不只是数字 ==="
+# 背景：auto 模式改成"两边都可用时按实测吞吐挑快的"之后，
+# 用户看到"当前走有线"时真正想知道的是**为什么**。
+# 只打两个数字（eth=184M wifi=606M）是不够的——他仍然要来问
+# "为什么不走快的那条"，而这个答案工具早就知道了。
+#
+# 三种情况都必须说人话，且措辞不同：
+#   tie        → "差不多，不折腾"（否则以为工具没在做决定）
+#   一边没数据  → 安静，不打 0 也不打"失败"（那会让用户以为线坏了）
+#   全没数据    → 完全不打印这两行
+ST="$(mktemp -d /tmp/sr_stwhy.XXXXXX)"
+mkdir -p "$ST/state" "$ST/bin"
+cat > "$ST/bin/date" <<'DEOF'
+#!/bin/bash
+[ "${1:-}" = "+%s" ] && { echo "${MOCK_NOW:-1700000000}"; exit 0; }
+exec /bin/date "$@"
+DEOF
+chmod +x "$ST/bin/date"
+sed "s|^STATE_FILE=.*|STATE_FILE=\"$ST/state/st\"|" smartroute.sh \
+    | awk '/^# ---------------- 入口 ----------------/{exit} {print}' > "$ST/sr.sh"
+_why() {   # $1=eth 值 $2=wifi 值 $3=当前默认路由
+    printf 'speed_en0=%s 1700000000\nspeed_en1=%s 1700000000\n' "$1" "$2" > "$ST/state/st"
+    bash -c ". \"$ST/sr.sh\" >/dev/null 2>&1
+        export PATH=\"$ST/bin:/usr/bin:/bin:/usr/sbin:/sbin\"
+        ACTIVE_ETH_DEV=en0; ACTIVE_WIFI_DEV=en1
+        default_dev() { echo $3; }
+        cmd_status 2>/dev/null"
+}
+out="$(_why 23000000 75800000 en1)"
+printf '%s' "$out" | grep -q "实测吞吐" && ok "status 打出实测吞吐" || bad "没打实测吞吐"
+printf '%s' "$out" | grep -q "当前 en1 就是实测较快的那条" \
+    && ok "已经在快的那条时说明白" || bad "没说明当前就是快的: $(printf '%s' "$out" | grep 选路依据)"
+out="$(_why 23000000 75800000 en0)"
+printf '%s' "$out" | grep -q "实测较快的是 en1，当前走 en0" \
+    && ok "在慢的那条时指出该走哪条" || bad "没指出该走哪条"
+out="$(_why 80000000 82000000 en0)"
+printf '%s' "$out" | grep -q "不来回切换" \
+    && ok "差距不大时明说不折腾" || bad "tie 时没解释"
+out="$(_why 0 75800000 en0)"
+# 正确行为不是"安静"，而是**明确说没测到、按可用性选路**。
+# 第一版断言写成" grep 选路依据 就失败"，那是在要求工具闭嘴——
+# 而闭嘴比解释更糟：用户看到"当前走 en0"时没有任何依据可查。
+# 但要命的是不能下"另一边更快"的结论，那正是老逻辑的坑。
+printf '%s' "$out" | grep -q "还没测出可用的吞吐数据" \
+    && ok "一边没数据时明说没测到（不下结论）" || bad "没解释为什么没依据: $out"
+printf '%s' "$out" | grep -q "较快的是" \
+    && bad "一边没数据还断言另一边更快（老逻辑的坑）" || ok "没有把没测到当成另一边更快"
+# 顺带确认它也没把 0 说成"eth=0"——那会让用户以为有线坏了
+printf '%s' "$out" | grep -q "eth=0" \
+    && bad "把没测到显示成 0（用户会以为线坏了）" || ok "没把没测到显示成 0"
+out="$(_why 0 0 en0)"
+[ -z "$(printf '%s' "$out" | grep -E '实测吞吐|选路依据')" ] \
+    && ok "全没数据时完全不打印" || bad "全没数据还打印了"
+rm -rf "$ST"
 
 echo
 echo "结果: $PASS 通过, $FAIL 失败"

@@ -1589,6 +1589,25 @@ cmd_status() {
     _ws="$(_metric_val "speed_$ACTIVE_WIFI_DEV")"
     if [ -n "$_es" ] || [ -n "$_ws" ]; then
         echo "实测吞吐     : eth=$(fmt_bps "$_es")  wifi=$(fmt_bps "$_ws")"
+        # 只打数字不够——用户看到"当前走有线"时真正想知道的是**为什么**。
+        # auto 和 speed 两个模式都按 pick_by_speed 选路，把它判定的结论
+        # 原样打出来，用户就不必反复问"为什么不走快的那条"。
+        #
+        # 三种情况都要说人话：
+        #   tie  → "差不多，不折腾"（否则以为工具没在做决定）
+        #   空   → "还没测出数据"（刚装上前两轮为空是正常的，不是故障）
+        #   具体 → 当前是不是就是快的那条；不是的话说明受冷却期约束
+        local _why
+        _why="$(pick_by_speed "${ACTIVE_ETH_DEV:-}" "${_es:-0}" "${ACTIVE_WIFI_DEV:-}" "${_ws:-0}")"
+        case "$_why" in
+            "")  echo "选路依据     : 还没测出可用的吞吐数据，按可用性选路" ;;
+            tie) echo "选路依据     : 两条线速度差不多（差距不足 ${SPEED_SWITCH_RATIO}%），不来回切换" ;;
+            *)   if [ -n "$cur" ] && [ "$cur" = "$_why" ]; then
+                     echo "选路依据     : 当前 ${_why} 就是实测较快的那条"
+                 else
+                     echo "选路依据     : 实测较快的是 ${_why}，当前走 ${cur:-未知}（切换受冷却期约束）"
+                 fi ;;
+        esac
     fi
     _el="$(_metric_val "lat_$ACTIVE_ETH_DEV")"
     _wl="$(_metric_val "lat_$ACTIVE_WIFI_DEV")"
@@ -5378,10 +5397,19 @@ _metric_val() {   # $1=state 键 -> stdout: 正数（无记录/非数字/非正�
 
 # 按吞吐挑赢家：大的赢，差距不到 SPEED_SWITCH_RATIO 判 tie（保持现状）
 pick_by_speed() {   # $1=设备A $2=BpsA $3=设备B $4=BpsB -> stdout: 设备名 | tie | 空
+    # ⚠️ "一边是 0/空" **不是**"另一边更快"，而是"这一边没测到"。
+    #
+    # 实测踩过的坑：speed_en0=0（探测失败、源不可用、刚装上前两轮）
+    # 时，老逻辑走 if (a+0 <= 0) { print d2 }，直接断言"en1 更快"。
+    # 于是 status 打出「实测较快的是 en1」，而真相只是 en0 没测到——
+    # 用户会以为有线就是慢，去换网线/换口，白忙一场。
+    # cmd_watch 的 auto 分支同理：会把线路切到"没测到的那边之外"的另一边，
+    # 而依据根本不存在。
+    #
+    # 所以：任一边缺数据就整体弃权（返回空），由调用方按可用性兜底。
+    # 只有两边都有正数时才真的比大小。
     awk -v d1="$1" -v a="$2" -v d2="$3" -v b="$4" -v r="$SPEED_SWITCH_RATIO" 'BEGIN{
-        if (a+0 <= 0 && b+0 <= 0) { exit }              # 都没测出来
-        if (a+0 <= 0) { print d2; exit }                # 只有 B 有数
-        if (b+0 <= 0) { print d1; exit }
+        if (a+0 <= 0 || b+0 <= 0) { exit }              # 任一边没测到 → 弃权
         lo = (a < b ? a : b); hi = (a < b ? b : a)
         if (hi < lo * (100 + r) / 100) { print "tie"; exit }
         print (a > b ? d1 : d2)
