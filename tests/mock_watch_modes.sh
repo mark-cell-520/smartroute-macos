@@ -134,6 +134,20 @@ MOCK_DEFAULT_DEV=en1 run_watch auto "$(metric_code speed_en0 80000000 speed_en1 
 # 一条线不通时照样按可用性转移，速度数据不影响这个语义
 MOCK_ETH_RES=fail MOCK_ETH_STREAK=-3 MOCK_DEFAULT_DEV=en0 run_watch auto "$(metric_code speed_en0 23000000 speed_en1 75800000)"
 grep -q "SWITCH en1" "$T/calls" && ok "以太网失败时退到 Wi-Fi" || bad "没退到 Wi-Fi: $(cat "$T/calls")"
+# ── 任一边没测到 → 必须弃权，不能假设另一边更快 ──
+# 这是上一轮留下的遗漏：pick_by_speed 改成"一方缺数据就弃权"后，
+# cmd_watch 的 auto 分支会跟着变，但当时只测了 status 的输出，
+# 没测这里。老语义是"一边是 0 就选另一边"，那会把用户从一条
+# 可能完全正常的线上赶走（一方是 0 只表示没测到，不表示另一方更快）。
+# 现在从 en0 出发、只有 en1 有数：应当不切换。
+MOCK_DEFAULT_DEV=en0 run_watch auto "$(metric_code speed_en0 0 speed_en1 75800000)"
+[ -s "$T/calls" ] && bad "一边没测到就切换了（把没测到当成另一边更快）: $(cat "$T/calls")" || ok "一边没测到时弃权、不切换"
+# 反过来：只有 en0 有数，当前在 en1，同样不该切
+MOCK_DEFAULT_DEV=en1 run_watch auto "$(metric_code speed_en0 75800000 speed_en1 0)"
+[ -s "$T/calls" ] && bad "另一边没测到却切换了: $(cat "$T/calls")" || ok "反过来也弃权"
+# 但可用性仍然优先：en0 探测失败时，哪怕它有速度数据也要切到 en1
+MOCK_ETH_RES=fail MOCK_ETH_STREAK=-3 MOCK_DEFAULT_DEV=en0 run_watch auto "$(metric_code speed_en0 75800000 speed_en1 0)"
+grep -q "SWITCH en1" "$T/calls" && ok "可用性失败时照样转移（不被弃权卡住）" || bad "弃权把可用性转移也挡住了: $(cat "$T/calls")"
 MOCK_ETH_STREAK=2; unset MOCK_ETH_RES
 
 echo "== 4. MODE=speed：网速优先 =="
