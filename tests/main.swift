@@ -755,6 +755,69 @@ isTrue(shSrc2.contains("for _u in $_urls"), "按列表逐个尝试")
 isTrue(!shSrc2.contains("SPEED_TEST_URL=\"https://speed.cloudflare.com/__down?bytes=5000000\"   #"),
       "默认测速源不再只有 Cloudflare（实测它忽略 Range 且时段性劣化）")
 
+// ── 18g. 分片必须按容量加权，而且份额必须交错 ──
+// 实测教训：均分会把一半字节赶到慢线上。本机 en0 封顶 89 Mbps、
+// en1 能跑 180 Mbps，38MB 文件均分时出现 12.65s 的长尾（慢线钉死总时长），
+// 加权后稳定在 2.95s。
+//
+// 但真正摔过的坑是**排列方式**：第二版把每个设备按权重重复 N 次后首尾相接
+// （en0×11 紧跟 en1×22），权重算对了、排列全错——前 11 片统统走 en0，
+// 9 片文件 100% 压在慢线上，实测分摊 99%/0%，比不改还糟。
+// 所以这里同时锁"按权重"和"交错"两件事，缺一不可。
+// 取一段源码：从 start 到第一次出现的 endMarker 为止。
+// 照 18f 的写法来——那里也是手写 range，不搞通用 helper
+// （helper 一旦写错边界，所有断言会同时变绿或同时变红，反而看不出问题）。
+func shSeg(_ src: String, _ start: String, _ endMarker: String) -> String {
+    guard let a = src.range(of: start) else { return "" }
+    let seg = String(src[a.lowerBound...])
+    if let b = seg.range(of: endMarker) { return String(seg[..<b.lowerBound]) }
+    return seg
+}
+
+print("== 18g. 分片按容量加权，且份额必须交错（不是块状拼接）==")
+do {
+    // 起点必须是序列构造处，不是 _spread_pick——SWRR 的代码在函数定义
+    // **之前**，从 _spread_pick() { 起取会整段漏掉，断言全部变红。
+    let body = shSeg(shSrc2, "local _spread_seq=", "local _spread_len=0")
+    if body.isEmpty {
+        isTrue(false, "取不到分片分配的代码段")
+    } else {
+        // 加权依据：必须读实测吞吐
+        isTrue(body.contains("_metric_val \"speed_$"), "按实测吞吐加权，不按片数均分")
+        // 交错：必须是 SWRR（挑最亏欠的那条），不能是重复拼接
+        isTrue(body.contains("_bestscore") && body.contains("_bestdev"),
+              "用平滑加权轮转逐条挑选，而不是把份额首尾相接")
+        isTrue(!body.contains("_n_rep=$(( (_wval * 32 + _stot - 1) / _stot ))"),
+              "不再用按权重重复 N 次后拼接（那是块状，会整段压在一条线上）")
+        // 数据不全时不猜：部分接口没实测值就退回均分
+        isTrue(body.contains("_ndata\" -eq \"$_ndev\""),
+              "只有全部接口都有实测数据才加权；否则退回均分（不猜）")
+        // 均分回退必须存在
+        isTrue(body.contains("[ -n \"$_spread_seq\" ] || _spread_seq=\"$_spread_devs\""),
+              "没有实测数据时退回均分（诚实的默认）")
+    }
+}
+// 探针必须并行 + 短超时：串行 8 秒超时最坏 8+1+8=17 秒，
+// 而下载本身只要 1 秒。实测 fetch 出现过 18s 离群值正是这个原因。
+do {
+    // 结束标记不能用 "    fi"——块内有 8 空格缩进的 fi，"    fi" 是它的
+    // 子串，会把段截断在并行探测代码之前，断言全部变红。
+    // 用块之后独有的那一行当边界。
+    let r = shSeg(shSrc2, "if [ \"$_spread_n\" -gt 1 ]; then", "if [ -n \"$_spread_devs\" ]; then")
+    if r.isEmpty {
+        isTrue(false, "取不到接口探测的代码段")
+    } else {
+        isTrue(r.contains("_pT/ok_") && r.contains("&"),
+              "两个接口的探测并行跑（串行时最坏 17 秒，下载才 1 秒）")
+        isTrue(r.contains("--max-time 4"), "探测超时从 8 秒降到 4 秒（只取 1 字节）")
+        // 两个都探测失败 → 不绑接口走默认路由。第一版写成了绑回原列表，
+        // 导致回环/内网地址下每个分片都失败，还打出"连续失败"告警——
+        // 而测试正是靠 grep「失败」判断下载是否真坏，于是误报。
+        isTrue(!r.contains("_spread_devs=\"$_orig_spread_devs\""),
+              "两个接口都探测失败时不绑回原列表（否则分片全失败还误报）")
+    }
+}
+
 print("== 18. beginOp 必须配 defer 形式的 endOp ==")
 // inFlight 守卫防的是"并发跑多份 shell 把机器拖垮"。但它有个静默失效模式：
 // 如果 endOp 是在 DispatchQueue.main.async 里手动调的，那么将来任何人在那个

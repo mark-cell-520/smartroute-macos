@@ -2640,39 +2640,83 @@ MSG
     # 先验证 --interface 真的能用，不能用就退回不绑（走默认路由）。
     # 硬绑会让每个分片都失败，那比不绑糟得多。探测只取 1 字节，很便宜。
     if [ "$_spread_n" -gt 1 ]; then
-        # 每个接口试 2 次。实测单次探测偶发失败过一次（8 秒超时），
-        # 而原来的写法是"一次失败就整体放弃"——于是多接口分摊被一次
-        # 网络抖动静默关掉，用户看到的是"分片走默认路由"，
-        # 而他什么都没做错。这种静默降级比明说更难排查。
-        # 2 次都失败才认为这个接口真不能用，成本最多多一次 1 字节请求。
-        for _d in $_spread_devs; do
-            _spread_try=0
-            while [ "$_spread_try" -lt 2 ]; do
-                if curl -s --interface "$_d" --max-time 8 -o /dev/null -r 0-0 \
-                        "$url" 2>/dev/null; then
-                    break
-                fi
-                _spread_try=$(( _spread_try + 1 ))
-                [ "$_spread_try" -lt 2 ] && sleep 1
+        # 每个接口试 2 次。实测单次探测偶发失败过一次，而原来的写法是
+        # "一次失败就整体放弃"——于是多接口分摊被一次网络抖动静默关掉，
+        # 用户看到"分片走默认路由"，而他什么都没做错。
+        # 这种静默降级比明说更难排查，所以保留 2 次重试。
+        #
+        # 但**两个接口必须并行探**，而且超时必须短。理由是一次实测事故：
+        #   · 串行 + 8 秒超时：一个接口探测失败就要 8+1+8 = 17 秒，
+        #     两个接口最坏 34 秒——而下载本身只要 1 秒。
+        #   · 实测那次 fetch：裸 curl 稳定 0.52-0.63s，fetch 却出现 18s 的
+        #     离群值，正好等于"一个接口探测两次超时（8+1+8=17s）+下载"。
+        #     也就是说方差不是网络抖，是探测在最坏情况下把启动时间拉爆了。
+        #   · 探测只取 1 字节，8 秒超时本来就过于宽松；4 秒足够，
+        #     而且两个接口并行后最坏也只是 4+0.3+4 ≈ 8.3 秒，不再是 17 秒。
+        local _pT; _pT="$(mktemp -d /tmp/smartroute_fprobe.XXXXXX)" || _pT=""
+        if [ -n "$_pT" ]; then
+            for _d in $_spread_devs; do
+                (
+                    _t=0
+                    while [ "$_t" -lt 2 ]; do
+                        if curl -s --interface "$_d" --max-time 4 -o /dev/null -r 0-0 \
+                                "$url" 2>/dev/null; then
+                            : > "$_pT/ok_$_d"; break
+                        fi
+                        _t=$(( _t + 1 ))
+                        [ "$_t" -lt 2 ] && sleep 0.3
+                    done
+                ) &
             done
-            [ "$_spread_try" -lt 2 ] || _spread_ok=0
-        done
-        if [ "$_spread_ok" = "1" ]; then
-            :
-        else
-            # 不全清空：只要还有一个接口能用，就绑那个能用的。
-            # 原来是一处失败就把 _spread_devs 整个清空、退回默认路由，
-            # 而"退回默认路由"在两条线都通的情况下是没必要的降级。
+            wait
             _spread_devs=""
             for _d in $ACTIVE_ETH_DEV $ACTIVE_WIFI_DEV; do
                 [ -n "$_d" ] || continue
-                if curl -s --interface "$_d" --max-time 8 -o /dev/null -r 0-0 \
-                        "$url" 2>/dev/null; then
-                    case " $_spread_devs " in *" $_d "*) ;; *) _spread_devs="$_spread_devs $_d" ;; esac
-                fi
+                # 只保留探测通过的接口；两个都通过就都保留（正常路径）
+                [ -f "$_pT/ok_$_d" ] || continue
+                case " $_spread_devs " in *" $_d "*) ;; *) _spread_devs="$_spread_devs $_d" ;; esac
             done
             _spread_devs="${_spread_devs# }"
+             # ⚠️ 这里第一版写错了：注释写"退回不绑（走默认路由）"，代码却把
+             # 探测前的原始列表又绑了回去（为此还多引入了一个 _orig_spread_devs
+             # 变量）。后果是在"两个接口都探不通"的场景下强行 --interface，
+             # 每个分片都失败，最后打出"连续失败"的告警——而 mock_fetch_ramp
+             # 正是靠 grep「失败」判断下载是否真的坏，于是误报（文件其实完整、
+             # rc=0）。**注释和代码相反时，代码赢，但读代码的人会按注释去改。**
+             # 那个变量已删掉——留着就是给下一个误读埋线索。
+             #
+             # 注意：上面这段说明故意不写成可执行代码的样子。tests/main.swift
+             # 有一条断言就是 grep 这段区域里有没有"把原列表绑回去"的写法，
+             # 注释里只要含同样的字面量就会误判（"用户可见的文案也是测试数据"，
+             # 这条在本项目已经绊倒过三次）。
             [ -n "$_spread_devs" ] || _spread_devs=""
+            rm -rf "$_pT"
+        else
+            # mktemp 失败：退回原来的串行写法，功能不少，只是慢一点
+            for _d in $_spread_devs; do
+                _spread_try=0
+                while [ "$_spread_try" -lt 2 ]; do
+                    if curl -s --interface "$_d" --max-time 4 -o /dev/null -r 0-0 \
+                            "$url" 2>/dev/null; then
+                        break
+                    fi
+                    _spread_try=$(( _spread_try + 1 ))
+                    [ "$_spread_try" -lt 2 ] && sleep 0.3
+                done
+                [ "$_spread_try" -lt 2 ] || _spread_ok=0
+            done
+            if [ "$_spread_ok" != "1" ]; then
+                _spread_devs=""
+                for _d in $ACTIVE_ETH_DEV $ACTIVE_WIFI_DEV; do
+                    [ -n "$_d" ] || continue
+                    if curl -s --interface "$_d" --max-time 4 -o /dev/null -r 0-0 \
+                            "$url" 2>/dev/null; then
+                        case " $_spread_devs " in *" $_d "*) ;; *) _spread_devs="$_spread_devs $_d" ;; esac
+                    fi
+                done
+                _spread_devs="${_spread_devs# }"
+                [ -n "$_spread_devs" ] || _spread_devs=""
+            fi
         fi
     fi
     if [ -n "$_spread_devs" ]; then
@@ -2705,12 +2749,75 @@ MSG
         [ "$n" -lt "$FETCH_DEV_FAIL_MAX" ]
     }
 
-    # 片号 -> 设备名。空表示不绑。
+    # 实现：**平滑加权轮转（SWRR）**生成一条交错序列，之后按 idx % 长度取。
+    # 放在这里而不是每次调用时算——_spread_pick 每个分片都要调一次，
+    # 不能在里面做除法。
+    #
+    # ⚠️ 第二版在这里栽过一次，值得记下来：我当时把每个设备按权重重复
+    # N 次后**首尾相接**（en0×11 紧跟 en1×22）。权重算对了，排列全错——
+    # 前 11 片统统走 en0，9 片的文件 100% 压在慢的那条线上，
+    # 实测分摊比例 99% / 0%，比不改还糟。
+    # **"按比例给份额"和"把份额交错开"是两件事**，只做前者等于没做。
+    # SWRR 每一步都挑"目前最亏欠"的那条线，天然交错，也不会漂移。
+    #
+    # 数据不全时不猜：只有部分接口有实测值 → 退回均分。
+    # 理由和 pick_by_speed 的弃权一致——没有证据说另一条慢，
+    # 就不能因此少分它片。均分是诚实的默认。
+    local _spread_seq="" _si _sw _stot=0 _wpairs="" _wpair _wdev _wval
+    local _ndev=0 _ndata=0 _p=0 _best=0 _bestscore="" _j=0 _score _c _newcur _bestdev
+    local _cur=""
+    for _si in $_spread_devs; do _ndev=$(( _ndev + 1 )); done
+    for _si in $_spread_devs; do
+        _sw="$(_metric_val "speed_$_si")"
+        case "$_sw" in ''|*[!0-9]*) _sw=0 ;; esac
+        [ "$_sw" -gt 0 ] || _sw=0
+        [ "$_sw" -gt 0 ] && _ndata=$(( _ndata + 1 ))
+        _wpairs="$_wpairs $_si:$_sw"
+        _stot=$(( _stot + _sw ))
+    done
+    _wpairs="${_wpairs# }"
+    # 全部接口都有实测数据时才加权；否则均分。均分时序列就是设备列表，
+    # idx % ndev 本身就是交错的，不需要额外处理。
+    if [ "$_stot" -gt 0 ] && [ "$_ndata" -eq "$_ndev" ] && [ "$_ndev" -gt 1 ]; then
+        for _wpair in $_wpairs; do _cur="$_cur 0"; done
+        _cur="${_cur# }"
+        while [ "$_p" -lt 32 ]; do
+            _bestscore=""
+            _j=0
+            for _wpair in $_wpairs; do
+                _wdev="${_wpair%%:*}"
+                _wval="${_wpair##*:}"
+                _score=$(( $(echo "$_cur" | cut -d' ' -f $((_j+1))) + _wval ))
+                if [ -z "$_bestscore" ] || [ "$_score" -gt "$_bestscore" ]; then
+                    _bestscore=$_score; _best=$_j; _bestdev=$_wdev
+                fi
+                _j=$(( _j + 1 ))
+            done
+            # 被选中那条线的欠账减去总量，下一步就轮到别的线
+            _newcur=""
+            _j=0
+            for _wpair in $_wpairs; do
+                _c=$(echo "$_cur" | cut -d' ' -f $((_j+1)))
+                if [ "$_j" -eq "$_best" ]; then _c=$(( _bestscore - _stot )); fi
+                _newcur="$_newcur $_c"
+                _j=$(( _j + 1 ))
+            done
+            _cur="${_newcur# }"
+            _spread_seq="$_spread_seq $_bestdev"
+            _p=$(( _p + 1 ))
+        done
+        _spread_seq="${_spread_seq# }"
+    fi
+    # 加权不适用（无数据/数据不全）时退回均分：序列就是设备列表本身
+    [ -n "$_spread_seq" ] || _spread_seq="$_spread_devs"
+    local _spread_len=0
+    for _si in $_spread_seq; do _spread_len=$(( _spread_len + 1 )); done
+
     _spread_pick() {   # $1=片号 -> stdout: 设备名
         [ -z "$_spread_devs" ] && { echo ""; return 0; }
         local i="$1" k=0 d want
-        want=$(( i % _spread_n ))
-        for d in $_spread_devs; do
+        want=$(( i % _spread_len ))
+        for d in $_spread_seq; do
             if [ "$k" -eq "$want" ]; then
                 # 这条线降级了就换另一条，而不是退回不绑：
                 # 不绑走的是默认路由，而默认路由往往正是出问题那条。
@@ -2971,9 +3078,25 @@ MSG
             break
         done
         [ "$_stop_seen" = "1" ] && break
-        # 扩连接：达到阈值、还有剩余片、且没到用户上限时才加
+        # 扩连接：完成数达到阈值、还有剩余片、且没到用户上限时才加。
         # 服务端已经限流（有 worker 撞到 429/503 并留下标记）时不再加：
         # 限流的含义就是连接数过头了，再加只会招来更多 429。
+        #
+        # ⚠️ 这个阈值试过两种改法，都错了，原因记在这里免得再改：
+        #
+        # 改法一（纯时间驱动，每 0.25s 加一人）：慢服务端也被加到 8 条。
+        # 完成数少的含义正是"服务端跟不上"，这时候加连接只会招来 429——
+        # 把原有的自适应保护拆了。mock_fetch_ramp 的"慢服务端收敛"断言
+        # 当场抓到。
+        #
+        # 改法二（每新完成一片加一人）：慢服务端加到 5 条，仍然超过测试
+        # 要求的 4。慢服务端 700ms/片、2 worker 时约 350ms 完成一片，
+        # 这个速率下"每完成一片加一人"照样能爬到 5。
+        #
+        # 结论：**这个阈值不该动**。小文件（12.7MB / 9 片）扩不上去的真正
+        # 原因不是阈值，是整个下载只要 1 秒、ramp 根本来不及——
+        # 那种情况下该做的是把已有的少数 worker 分对活（按容量加权，
+        # 见 _spread_pick），不是硬加连接数。
         if [ "$_spawned" -lt "$n" ] && [ ! -f "$T/ratelimited" ]; then
             _comp=$(ls "$T"/p* 2>/dev/null | wc -l | tr -d ' ')
             _remain=$(( total_chunks - _comp ))
