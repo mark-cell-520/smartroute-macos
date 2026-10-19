@@ -133,6 +133,23 @@ for pair in "0:未知" "1338605:10.7 Mbps" "1993576:15.9 Mbps" "12500000:100 Mbp
     [ "$got" = "$want" ] && ok "$in B/s → $got" || bad "$in 期望 ${want}，得到 $got"
 done
 
+echo "=== 2b. _metric_val：荒谬值必须当没测到（不能显示成事实）==="
+# 实测查到的 bug：state 里被写进 speed_en0=99999999999999999999999 时，
+# status 原样打出 eth=799999999999999872 Mbps——物理上不可能的吞吐，
+# 界面却像真测出来的一样显示。更糟的是它会流进 pick_by_speed 做比较，
+# 让守护进程认真地去切到一条"更快"的线上。
+# 荒谬的数字比没有数字危险：没有数字时界面说"未知"，用户知道要去测。
+for pair in "99999999999999999999999:" "1000000000000000:" "1e12:"; do
+    in="${pair%%:*}"
+    out="$(run "_metric_set speed_x $in 1700000000; _metric_val speed_x")"
+    [ -z "$out" ] && ok "$in 被判为无数据（不显示成事实）" || bad "$in 应当被拒，得到: $out"
+done
+# 正常值不能被打成孤儿：上限必须高于真实测量的天花板，而不是紧贴
+for v in 75800000 1993576 12500000; do
+    out="$(run "_metric_set speed_x $v 1700000000; _metric_val speed_x")"
+    [ "$out" = "$v" ] && ok "$v 仍可通过（上限没有误伤真实测量）" || bad "$v 应可通过，得到: $out"
+done
+
 echo "=== 3. measure_throughput 按接口分别测 ==="
 export MOCK_SPEED_en0=1993576 MOCK_SPEED_en1=1338605
 out="$(run 'measure_throughput en0 5')"
