@@ -778,17 +778,32 @@ probe_dev() {   # $1=设备 $2=网关
     # 现在调用方必须显式换算，并且这个函数自己校验上界：
     # 超过 60 秒一律按 60 秒算，防止再有个毫秒值混进来把探测挂死。
     _probe_wait_any() {
-        local _d="$1" _pre="$2" _tmo="$3" _i=0 _n _f
+        local _d="$1" _pre="$2" _tmo="$3" _t0 _f
         case "$_tmo" in ''|*[!0-9]*) _tmo=5 ;; esac
         [ "$_tmo" -ge 1 ] || _tmo=1
         [ "$_tmo" -le 60 ] || _tmo=60
-        _n=$(( _tmo * 20 ))          # 50ms 一轮
-        while [ "$_i" -lt "$_n" ]; do
+        # ⚠️ 必须按**墙上时间**封顶，不能按迭代次数。
+        #
+        # 原来是 `_n=$(( _tmo * 20 ))` 配 `sleep 0.05`，即假设每轮 50ms。
+        # 但 macOS 上 /bin/sleep 是外部命令，每次 fork+exec 实测 100–210ms
+        # （本机 load 2.4，plist 里 Nice=10 更慢），于是实际时长是标称的
+        # 2–4 倍，且随负载浮动、没有真正的上界：
+        #     tmo=1s -> 3306 ms    单接口三层全不通探测 = 21391 ms（目标 7s）
+        #     tmo=2s -> 6379 ms    完整 watch（两口全死）= 48 秒
+        #     tmo=4s -> 12243 ms
+        # StartInterval=20，而一个周期 48s，下一个守护实例被 acquire_lock
+        # （_lock_try || exit 0）**静默跳过** → 有效轮询间隔从 20s 变成 48s。
+        # RECONFIRM_BUDGET=9 也形同虚设（单次当场确认探测就要 21s）。
+        #
+        # 用 bash 内建 SECONDS，零 fork。实测修复后
+        # tmo=1/2/4 → 1082 / 1947 / 3996 ms。
+        _t0=$SECONDS
+        while :; do
             for _f in "$_d/$_pre"*; do
                 [ -f "$_f" ] && return 0
             done
+            [ $(( SECONDS - _t0 )) -ge "$_tmo" ] && return 1
             sleep 0.05
-            _i=$(( _i + 1 ))
         done
         return 1
     }
@@ -1346,7 +1361,29 @@ cmd_watch() {
                     # 而 pick_fastest 本来就用 awk，统一做法更不容易错。
                     if [ -n "$_lc" ] && [ -n "$_lo" ] \
                        && awk -v a="$_lc" -v b="$_lo" -v r="$LATENCY_DEGRADE_RATIO" \
-                              'BEGIN{ exit !(a+0 > b+0 * r) }'; then
+                              # ⚠️ 必须写成 (b+0)*r，不能写 b+0*r：
+                              # awk 里 * 的优先级高于 +，于是 b+0*r 等于
+                              # b+0 等于 b，**LATENCY_DEGRADE_RATIO 完全
+                              # 没有参与运算**，"变慢预警"退化成"另一条快任意
+                              # 一点点就重下全量"。
+                              #
+                              # 实测数值表（LATENCY_DEGRADE_RATIO=2）：
+                              #   lat_cur=13.1 lat_oth=13.0 比值 1.01x
+                              #     → 代码判定 FORCE，设计意图 keep
+                              #   lat_cur=25.9 lat_oth=13.0 比值 1.99x
+                              #     → 代码判定 FORCE，设计意图 keep
+                              # 端到端：mock lat_en0=13.4 / lat_en1=12.8，
+                              # 每周期都打"变慢预警…超过…的 2 倍"并做两次
+                              # 全量 4 连接下载，而 13.4 < 2×12.8=25.6——
+                              # **日志这句话本身是假的，软件在自己的日志里
+                              # 说谎**。lat 缓存 60s 内不刷新，同一对值被反复
+                              # 比较 → 每分钟约 3 次全量测速，设计意图是 5 分钟 1 次。
+                              #
+                              # 顺带：1350 行附近的日志文案也只在条件真满足时
+                              # 才与数值自洽。
+                              # 全脚本只有这一处漏括号（pick_by_speed 和
+                              # pick_fastest 都正确写了 lo * (100 + r) / 100）。
+                              'BEGIN{ exit !(a+0 > (b+0)*r) }'; then
                         log "变慢预警: ${cur} 延迟 ${_lc}ms 超过 ${_oth_dev} 的 ${_lo}ms 的 ${LATENCY_DEGRADE_RATIO} 倍，提前重测吞吐"
                         _force=1
                     fi
@@ -1472,9 +1509,29 @@ cmd_watch() {
         [[ "$_fn" =~ ^[0-9]+$ ]] || _fn=0
         _quiet="$(state_get flap_quiet_until)"
         [[ "$_quiet" =~ ^[0-9]+$ ]] || _quiet=0
+        # ⚠️ 这里原来是 `&& [ "$now" -lt "$_quiet" ]`，而 flap_quiet_until
+        # **只在下面这个分支内部被写入**（1481 行）。冷启动时该键不存在 →
+        # _quiet=0 → `now < 0` 永假 → 分支不可达 → flap_quiet_until 永远是 0
+        # → **退避永不启动**。先有鸡还是先有蛋。
+        #
+        # 实测确认（用真实 do_switch + mock networksetup/route，模拟"macOS
+        # 每次都把默认路由判回 en0"）：13 轮里 flap_count 冲到 13（门槛 10），
+        # 「选路退避」日志 0 条，flap_backoff/flap_quiet_until 始终为空。
+        # 正向对照：手工把 flap_quiet_until 预置成 now+300 后，同一分支立即
+        # 生效——证明分支体没问题，唯一的堵点就是入口条件。
+        #
+        # 测试为什么抓不到：mock_mode_select.sh 第 8 节**每一例都预置了
+        # flap_quiet_until**，只覆盖了分支体、从未验证过入口。
+        #
+        # 改成：flap_backoff 还不是 1（没在退避中，冷启动也属于这种）
+        # 或者还没到期，都算"应当处于退避"。
+        # ⚠️ 这里是 `!=` 不是 `=`：写成 `= "1"` 的话，一旦旗标置上就永远
+        # 满足条件，退避到期后也走不出去——mock_mode_select 的
+        # 「退避永不结束」「退避标记没清」「计数没清零」三条会同时红。
+        # 第一版就是这么写错的。
         if [ "$_fn" -ge "$FLAP_BACKOFF_AT" ] \
            && [ "$eth_res" = "ok" ] && [ "$wifi_res" = "ok" ] \
-           && [ "$now" -lt "$_quiet" ]; then
+           && { [ "$(state_get flap_backoff)" != "1" ] || [ "$now" -lt "$_quiet" ]; }; then
             # 只在进入退避时说一次，不要每轮刷屏
             if [ "$(state_get flap_backoff)" != "1" ]; then
                 state_set flap_backoff 1
