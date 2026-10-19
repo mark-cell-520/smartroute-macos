@@ -619,8 +619,14 @@ print("== 18d. fetch 一键入口：不许有骗人的按钮和假成功 ==")
 // 2) 长任务必须用 runWithLog。fetch 是大文件下载，stdout 会被
 //    do shell script 的系统超时（约 2 分钟）截断甚至杀掉，
 //    而且杀的时候不抛错——表现为按钮转完圈什么都没发生。
-// 3) 必须显示脚本打印的「实测分摊」。曲线同时起伏不能证明流量被
-//    分摊到两个接口（Wi-Fi 关联着就永远有背景心跳），那一行是唯一证据。
+// 3) 必须显示脚本打印的分摊证据。曲线同时起伏不能证明流量被分摊到两个
+//    接口（Wi-Fi 关联着就永远有背景心跳），那几行是唯一证据。
+//    ⚠️ 这里原来断言的是 "实测分摊"——而 App 的 fetchMulti 强制 n>=2，
+//    永远走多连接路径，脚本在多连接路径打印的是「流量分摊」。
+//    "实测分摊" 只存在于 -n 1 分支，App 走不到。于是断言在守一个
+//    永不出现的字符串，而功能实际是哑的（note 恒等于"下载完成。"）。
+//    测试全绿，用户看不到任何分摊证据——**守错对象的断言比没有断言更糟**，
+//    因为它给人"这里验证过了"的错觉。
 let nmSrc2 = readSrc("SmartRouteApp/NetworkModel.swift")
 isTrue(nmSrc2.contains("func fetchCancel()"), "NetworkModel 提供 fetchCancel")
 // fetchCancel 必须真的杀进程 + 清半成品，不能是空函数
@@ -631,14 +637,49 @@ if let fs = nmSrc2.range(of: "func fetchCancel()") {
         // 必须匹配**可执行代码里的** pkill，不能只搜字符串——注释里
         // 也写着 pkill（解释为什么用 pkill 而不是 kill）。早先只搜
         // "pkill" 时，把整段换成 true 后这条断言仍然是绿的（注释还在），
-        // 只有 rm -f 那条红了。现在限定在 Privileged.run( 之后搜。
-        isTrue(body.contains("Privileged.run(\n") && body.contains("pkill -f"),
+        // 只有 rm -f 那条红了。
+        //
+        // 原来限定成 body.contains("Privileged.run(\n")，即字面换行。
+        // 后来把命令先赋值给变量再传进去（为了 do/catch 复用），
+        // 那个字面模式就匹配不到了——断言红，但 pkill 明明还在。
+        // **这是假阴性**：测试在惩罚一个正确的重构。
+        // 现在改成先剥掉注释行再查，比原来的字面位置限定更稳：
+        // 注释怎么挪都满足不了它，代码怎么组织都躲不过它。
+        let code = body
+            .components(separatedBy: "\n")
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }
+            .joined(separator: "\n")
+        isTrue(code.contains("pkill -f"),
               "fetchCancel 真的杀进程（不留后台下载）")
-        isTrue(body.contains("rm -f /tmp/smartroute-fetch.out"),
+        isTrue(code.contains("rm -f /tmp/smartroute-fetch.out"),
               "fetchCancel 删掉半成品文件（不留假文件）")
+        // 取消授权时不许翻 fetchRunning，也不许报"已停止"——那是假成功。
+        // 实例：凭证缓存过期时系统弹密码框，用户按取消（极自然的反应：
+        // "停个下载为什么要我密码？"），旧代码用 try? 吞掉 throw 后
+        // 无条件报告已停止，而 curl 还在跑、文件还在涨。
+        isTrue(code.contains("PrivilegedError.cancelled"),
+              "取消授权被单独处理（不冒充已停止）")
+        isTrue(!code.contains("try? Privileged.run"),
+              "不提权错误用 try? 吞掉（那会让取消授权看起来像成功）")
     } else {
         isTrue(false, "取不到函数体结尾")
     }
+}
+// fetchMulti 必须显示分摊证据，不能只给"下载完成。"
+// App 只走多连接路径，脚本在多连接路径打印的标签是「流量分摊」。
+if let fm = nmSrc2.range(of: "func fetchMulti()") {
+    let seg = String(nmSrc2[fm.lowerBound...])
+    if let end = seg.range(of: "\n    func ") {
+        let body = String(seg[..<end.lowerBound])
+        isTrue(body.contains("流量分摊"),
+              "fetchMulti 抓多连接路径的分摊标签（不是单连接的「实测分摊」）")
+        isTrue(body.contains("都在扛") || body.contains("只有一条线"),
+              "fetchMulti 显示两条线是否都在扛（脚本已算出这个结论）")
+    } else {
+        isTrue(false, "取不到 fetchMulti 函数体结尾")
+    }
+} else {
+    isTrue(false, "取不到 fetchMulti")
 }
 // fetchMulti 必须用 runWithLog，不能把大文件下载往 stdout 里灌
 if let fs = nmSrc2.range(of: "func fetchMulti()") {

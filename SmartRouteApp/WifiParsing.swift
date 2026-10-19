@@ -95,8 +95,25 @@ enum WifiParsing {
     }
 
     /// 从 scan 输出里取「有 N 个未能确认」的 N（没有则 nil）
+    ///
+    /// ⚠️ 原来的正则是 `有\s+(\d+)\s+个没能确认`，要求"个"紧跟"没能确认"。
+    /// 但脚本实际打印的是
+    ///     （有 8 个已保存网络没能确认在不在范围——系统扫描有冷却，不是故障…）
+    /// 中间多了"已保存网络"四个字，于是**永不匹配**——快速扫描下 8/10 个
+    /// 网络没确认是常态，用户却看不到这句提示，会以为全查过了。
+    /// 这就是"脚本输出格式变了但解析没跟上"那一类，而且方向是往少了说。
+    ///
+    /// 现在两种格式都认：脚本侧的提示（带"已保存网络"）和 wifi_nearby 的
+    /// `@unknown N` 契约行。后者更稳——不依赖中文文案的措辞。
     static func scanUnknownCount(_ text: String) -> Int? {
-        capture(text, pattern: "有[[:space:]]+([0-9]+)[[:space:]]+个没能确认").flatMap(Int.init)
+        if let n = capture(text, pattern: "有[[:space:]]+([0-9]+)[[:space:]]+个(?:已保存网络)?没能确认") {
+            return Int(n)
+        }
+        // @unknown N 是 wifi_nearby 的机器可读契约，优先于中文文案
+        if let n = capture(text, pattern: "@unknown[[:space:]]+([0-9]+)") {
+            return Int(n)
+        }
+        return nil
     }
 
     /// 取第一个捕获组。注意：`String.range(of:options:.regularExpression)`

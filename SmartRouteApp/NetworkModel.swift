@@ -590,10 +590,11 @@ final class NetworkModel: ObservableObject {
         for path in [ScriptLocator.systemConf, ScriptLocator.userConf] {
             guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { continue }
             for line in content.components(separatedBy: "\n") {
-                let t = line.trimmingCharacters(in: .whitespaces)
+                let t = line.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !t.isEmpty, !t.hasPrefix("#"), let eq = t.firstIndex(of: "=") else { continue }
-                let key = String(t[t.startIndex..<eq])
+                let key = String(t[t.startIndex..<eq]).trimmingCharacters(in: .whitespacesAndNewlines)
                 let value = String(t[t.index(after: eq)...])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
                 if !key.isEmpty { result[key] = value }
             }
         }
@@ -819,11 +820,11 @@ final class NetworkModel: ObservableObject {
         var out = ""
         var rejected = 0
         for line in raw.components(separatedBy: "\n") {
-            let t = line.trimmingCharacters(in: .whitespaces)
+            let t = line.trimmingCharacters(in: .whitespacesAndNewlines)
             if t.isEmpty || t.hasPrefix("#") { continue }
             guard let eq = t.firstIndex(of: "=") else { rejected += 1; continue }
-            let key = String(t[t.startIndex..<eq]).trimmingCharacters(in: .whitespaces)
-            let val = String(t[t.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
+            let key = String(t[t.startIndex..<eq]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let val = String(t[t.index(after: eq)...]).trimmingCharacters(in: .whitespacesAndNewlines)
             guard validKeys.contains(key) else { rejected += 1; continue }
             var ok = true
             switch key {
@@ -1583,18 +1584,44 @@ final class NetworkModel: ObservableObject {
                 DispatchQueue.main.async {
                     self.fetchRunning = false
                     if code == 0 {
-                        // 从日志里抓「实测分摊」行——那是唯一能证明流量真的
+                        // 从日志里抓**分摊证据**——那是唯一能证明流量真的
                         // 分摊到两个接口的证据。曲线同时起伏不能证明（Wi-Fi
                         // 关联着就永远有背景心跳）。
+                        //
+                        // ⚠️ 以前只 grep「实测分摊」，而 App 的 fetchMulti 强制
+                        // n=max(2,…)，永远走多连接路径——脚本在多连接路径打印的是
+                        // 「流量分摊（本次下载期间）」，「实测分摊」只存在于 -n 1
+                        // 单连接分支。于是这个 if 恒不命中，note 恒等于"下载完成。"
+                        //
+                        // 后果不是少显示几行：脚本明明算出并打印了
+                        //     en0: 6.8 MB (49%) / en1: 6.9 MB (50%)
+                        //     ✅ 两条线都在扛这个文件
+                        // 或
+                        //     ⚠️ 这次只有一条线在扛这个文件
+                        // App 全丢掉。**该给证据时沉默**——尤其脚本已判定"只有一条线
+                        // 在扛"（那是个警告）时，App 呈现一个干净的成功。
+                        //
+                        // 而 Views.swift 的提示卡还叫用户"读它打印的「实测分摊」"——
+                        // 这个标签在 App 提示里永远不出现，在脚本多连接输出里叫
+                        // "流量分摊"。用户被引去找一个不存在的字符串。
+                        //
+                        // 现在按语义抓：分摊块、每条线的字节与百分比、结论行
+                        // （都在扛 / 只有一条线）、本次吞吐。四条里抓到什么都拼进去。
                         var note = "下载完成。"
                         if let data = FileManager.default.contents(atPath: log),
                            let text = String(data: data, encoding: .utf8) {
+                            var picked: [String] = []
                             for line in text.components(separatedBy: "\n") {
-                                if line.contains("实测分摊") {
-                                    note += "\n" + line.trimmingCharacters(in: .whitespaces)
-                                    break
+                                let t = line.trimmingCharacters(in: .whitespaces)
+                                if t.isEmpty { continue }
+                                // 单连接分支的「实测分摊」也仍然要认（-n 1 时）
+                                if t.contains("实测分摊") || t.contains("流量分摊")
+                                    || t.contains("都在扛") || t.contains("只有一条线")
+                                    || t.contains("本次吞吐") {
+                                    picked.append(t)
                                 }
                             }
+                            if !picked.isEmpty { note += "\n" + picked.joined(separator: "\n") }
                         }
                         self.fetchNote = note
                         self.fetchNoteFailed = false
@@ -1675,20 +1702,48 @@ final class NetworkModel: ObservableObject {
     ///     在 /tmp 翻到一个不完整的文件，会以为下载成功过。
     func fetchCancel() {
         guard fetchRunning else { return }
+        // 用内置脚本路径去匹配进程，而不是写死 "smartroute.sh fetch"。
+        // 以前是写死的，恰好是内置路径的子串所以功能没坏——那是巧合，
+        // 不是设计。换个部署位置就会静默杀不干净。
         let script = ScriptLocator.scriptPath
         DispatchQueue.global().async {
             // pkill -f 匹配完整命令行：fetch 的每个 worker 是独立 curl，
             // 且带 --interface，所以只杀外层 bash 是杀不干净的。
             // -o 的输出文件名是特征串，用它来锁定这一次下载的进程，
             // 避免误杀用户自己起的 curl。
-            _ = try? Privileged.run(
-                "pkill -f 'curl.*smartroute-fetch.out' 2>/dev/null; "
-                    + "pkill -f 'smartroute.sh fetch' 2>/dev/null; "
-                    + "rm -f /tmp/smartroute-fetch.out /tmp/smartroute-fetch.out.* 2>/dev/null; true")
-            DispatchQueue.main.async {
-                self.fetchRunning = false
-                self.fetchNote = "已停止，下载到一半的文件已删除。"
-                self.fetchNoteFailed = false
+            //
+            // ⚠️ 这里以前是 `_ = try? Privileged.run(...)`，随后无条件
+            // 置 fetchRunning=false 并报告"已停止，文件已删除"。
+            // try? 把 PrivilegedError.cancelled（用户在系统密码框上按了取消）
+            // 和 .failed 一起吞掉——而取消是极自然的反应："停个下载为什么要我密码？"
+            // 结果是 curl 还在跑、文件还在涨，界面却说已停止。
+            // 注释里承诺过"界面上放了「停止」按钮，就不能让它点了没反应"，
+            // 假成功比没反应更糟：用户以为停了，回去发现磁盘还在涨。
+            //
+            // pkill 匹配不到进程时命令以 ; true 结尾退出 0，所以**唯一**能区分
+            // "授权被拒"和"真停掉了"的信号就是这个 throw，绝不能吞。
+            let cmd = "pkill -f 'curl.*smartroute-fetch.out' 2>/dev/null; "
+                + "pkill -f '\(script) fetch' 2>/dev/null; "
+                + "rm -f /tmp/smartroute-fetch.out /tmp/smartroute-fetch.out.* 2>/dev/null; true"
+            do {
+                _ = try Privileged.run(cmd)
+                DispatchQueue.main.async {
+                    self.fetchRunning = false
+                    self.fetchNote = "已停止，下载到一半的文件已删除。"
+                    self.fetchNoteFailed = false
+                }
+            } catch PrivilegedError.cancelled {
+                // 授权被拒：下载仍在继续。**不要翻 fetchRunning**，
+                // 否则连重试入口都没了，用户只能杀进程。
+                DispatchQueue.main.async {
+                    self.fetchNote = "已取消授权，下载仍在继续。要停止请再次授权。"
+                    self.fetchNoteFailed = true
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.fetchNote = "停止失败：\(error.localizedDescription)。下载可能仍在继续。"
+                    self.fetchNoteFailed = true
+                }
             }
         }
     }
@@ -1925,7 +1980,16 @@ private func allGateways() -> [String: String] {
 
 private func router(of service: String) -> String {
     guard !service.isEmpty, service != "-" else { return "" }
-    let out = Shell.run("networksetup -getinfo '\(service)'", timeout: 5).out
+    // 服务名必须过 Shell.quote。以前是裸单引号 '\(service)'，而服务名来自
+    // networksetup -listnetworkserviceorder 的输出——iPhone USB 共享热点
+    // 生成的服务名就是 "Bob's iPhone"，含单引号。那时 bash 报语法错误、
+    // 函数返回空串，该接口网关显示 "-"，同网关判定也被跳过。
+    //
+    // 更要紧的是注入：服务名写成 x'; touch /tmp/PWNED; 'y 时命令真的会执行。
+    // removeRule 已经为"点一下删除按钮就以 App 用户身份注入"堵过一路，
+    // 同一个输入源在这里又开了一路。项目里所有其它用户输入（SSID、URL、
+    // CIDR、配置值）都走了 Shell.quote，这里是唯一漏的。
+    let out = Shell.run("networksetup -getinfo \(Shell.quote(service))", timeout: 5).out
     for line in out.components(separatedBy: "\n") {
         let t = line.trimmingCharacters(in: .whitespaces)
         if t.hasPrefix("Router:") {
@@ -1952,9 +2016,17 @@ private func readMode() -> String {
     for path in [ScriptLocator.userConf, ScriptLocator.systemConf] {
         guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { continue }
         for line in content.components(separatedBy: "\n") {
-            let t = line.trimmingCharacters(in: .whitespaces)
+            // whitespacesAndNewlines 而不是 whitespaces：配置文件被 Windows
+            // 编辑器或某些 App 存成 CRLF 时，.whitespaces 不剥离 \r，
+            // MODE 的值会变成 "wifi\r"。refreshMenuState 的
+            // modeNames[cur] 查不到 → 回落成给「自动模式」打勾，
+            // 而 SmartRouteApp.swift 的注释明说设计意图是
+            // "读不到就全不打勾——不打勾比打错勾好"。
+            // 实现和注释相反，就是这条要修的。
+            let t = line.trimmingCharacters(in: .whitespacesAndNewlines)
             if t.hasPrefix("MODE=") {
                 return String(t.dropFirst("MODE=".count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
             }
         }
     }

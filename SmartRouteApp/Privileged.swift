@@ -77,14 +77,27 @@ enum Privileged {
         let stdout = try run(wrapped)
         // 最后一行是 SR_EXIT=<码>，前面是 wrapped 命令本身的 echo（没有）
         var code: Int32 = -1
-        let lines = stdout.components(separatedBy: "\n")
-        for line in lines.reversed() {
-            let t = line.trimmingCharacters(in: .whitespaces)
+        var lines = stdout.components(separatedBy: "\n")
+        // 找到 SR_EXIT= 行就**删掉**它，不只是 break。
+        //
+        // 以前只 break 不删，而下面"日志为空时 out 退回 stdout"正好把这个
+        // 内部标记当成命令输出返回给调用方。实例：launchctl bootout 成功且
+        // 静默时日志为空 → out = "SR_EXIT=0\n" → setDaemonPaused 把它当
+        // daemonMessage 显示，用户看到绿色"操作完成。"加一行 SR_EXIT=0，
+        // 而本该出现的"已暂停自动选路。重启 Mac 会恢复…"整段消失——
+        // 暂停是临时这件事用户无从得知。
+        //
+        // runCapturing 一直是删掉的，两边不对称就是漏点所在。
+        // 内部协议不该泄漏到用户可见文本里。
+        for i in lines.indices.reversed() {
+            let t = lines[i].trimmingCharacters(in: .whitespaces)
             if t.hasPrefix("SR_EXIT=") {
                 code = Int32(t.dropFirst("SR_EXIT=".count)) ?? -1
+                lines.remove(at: i)
                 break
             }
         }
+        let stdoutClean = lines.joined(separator: "\n")
         // 读回日志。文件由 root 经 do shell script 创建，umask 022 → 0644，
         // 普通用户读得到。读不到也不致命，退回 stdout。
         var out = ""
@@ -93,7 +106,7 @@ enum Privileged {
             out = text
         }
         if out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            out = stdout
+            out = stdoutClean
         }
         return (out, code)
     }

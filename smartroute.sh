@@ -200,14 +200,34 @@ conf_parse_file() {   # $1=文件路径
     # 这里做纵深防御：群/他人可写的配置直接不解析。
     # 合法场景不受影响——install.sh 现在会以 644 创建它（见 install.sh），
     # App 和 smartroute set 写的也是同一属主。
+    #
+    # ⚠️ 这里原来用 `ls -ld | cut -c1-10` 加 glob 判权限位，**整段是死代码**：
+    # 外层 case 的 `?rw?w?*` 查第 5 位（group-read），内层
+    # `??????w?*` 查第 7 位、`?????????w` 查第 10 位——而第 7/10 位是
+    # 执行位（x/s/t/-），**永远不可能是 'w'**，所以拒绝分支不可达。
+    # 实测穷举 owner-rw 的全部 128 种模式：生效 128、拒绝 0；
+    # chmod 666 的配置里 MODE=wifi 照样生效。
+    #
+    # 后果不是"少一道防御"：/Users/Shared 是 1777，用户级配置不存在时
+    # （安装顺序竞态、被删、被其他本地用户抢先创建）任何本地用户都能建一个
+    # 666 的配置，root 守护进程每 20 秒照单全收：MODE/WIFI_PREFERRED
+    # （root 去连攻击者的 AP）、SPEED_TEST_URLS（root curl 任意 http/https）、
+    # BALANCE（装 pf 规则）全部可控。install.sh 现在先建成 root 属主，
+    # 恰好掩住了这个洞——**掩住不等于修好**，注释却一直在声称已防护。
+    #
+    # 改成直接算权限位，不再猜字符位置。
+    #
+    # ⚠️ 算术里必须写 8# 强制八进制：stat -f '%Lp' 给的是八进制串（如 "600"），
+    # 而 `$(( 600 & 0022 ))` 会把 "600" 当**十进制**解析——600 十进制 = 0o1130，
+    # 与 0o22 相与非 0，于是 600/755 这类完全合法的权限被误拒。
+    # 实测踩过：第一版就是这么写的，chmod 600 和 755 都不解析了。
     local _perm
-    _perm="$(ls -ld "$f" 2>/dev/null | cut -c1-10)"
-    case "$_perm" in
-        ?rw?w?*|????????w*|??????????)
-            # 只精确判 group-write / other-write 两位，避免误伤
-            case "$_perm" in
-                ??????w?*|?????????w) log "跳过配置 ${f}：群/他人可写（${_perm}），拒绝解析" ; return 0 ;;
-            esac ;;
+    _perm="$(stat -f '%Lp' "$f" 2>/dev/null)"
+    case "$_perm" in ''|*[!0-7]*) ;; *)
+        if [ $(( 8#$_perm & 8#22 )) -ne 0 ]; then
+            log "跳过配置 ${f}：群/他人可写（${_perm}），拒绝解析"
+            return 0
+        fi ;;
     esac
     while IFS= read -r line || [ -n "$line" ]; do
         # 去掉行尾 CR（配置文件被 Windows 编辑器改过的情况）
@@ -963,7 +983,9 @@ reorder_first() {   # $1=服务名
     # 还把网络抖得厉害。用户体感是"这工具在卡我的网"。
     # 调用方靠 REORDER_NOOP 区分"真调整了"和"本来就是对的"，
     # 从而跳过那 2 秒等待（见 do_switch）。
-    while IFS= read -r svc; do
+    # || [ -n "$svc" ]：最后一行没有换行符时 read 返回非 0 但变量已赋值，
+    # 不加这句整个循环体一次都不跑——服务会被静默漏掉。
+    while IFS= read -r svc || [ -n "$svc" ]; do
         [ -z "$svc" ] && continue
         [ "$svc" = "$primary" ] && continue
         rest+=("$svc")
@@ -2117,7 +2139,12 @@ apply_rules() {   # 由守护进程调用：把规则文件落地为静态路由
 
     if [ -f "$RULES_FILE" ]; then
         local bad=0
-        while read -r cidr dev extra; do
+        # || [ -n "$cidr" ]：规则文件是用户手工编辑的，最后一行很可能没有
+        # 换行符。不加这句，那条规则会被静默丢掉——而 rule list 也会跟着
+        # 说"（无规则）"，于是"列表说没有"和"文件里有一条"同时成立。
+        # 实测确认：printf '10.0.0.0/8 en0\n192.168.0.0/16 en1'（末行无 \n）
+        # 时，apply_rules 和 rule list 都只看到第一条。
+        while read -r cidr dev extra || [ -n "$cidr" ]; do
             case "$cidr" in ""|\#*) continue ;; esac
             [ -n "$dev" ] || continue
             # 和 cmd_rule add 用同一套校验。smartroute.rules 在 /Users/Shared
@@ -2248,7 +2275,7 @@ cmd_rule() {
             local applied entry cidr dev mark any=0
             applied="$(state_get applied_routes)"
             if [ -f "$RULES_FILE" ]; then
-                while read -r cidr dev extra; do
+                while read -r cidr dev extra || [ -n "$cidr" ]; do
                     case "$cidr" in ""|\#*) continue ;; esac
                     [ -n "$dev" ] || continue
                     any=1
@@ -2393,6 +2420,19 @@ USAGE
       --interface 显式绑到各条线上，见下面"分片将分摊到"那一行。
       同网关拓扑下 pf 分流没有带宽收益，还有网络卡死风险，一般不用开。
 MSG
+    fi
+
+    # 输出目录现在就建，不要等到合并阶段。
+    #
+    # 为什么放探测之前：原来直到 `cat ... > "$out"` 才发现目录不存在，
+    # 那时所有分片都下完了（可能几十 MB、几分钟带宽），bash 先漏一行
+    # 原生错误再 die"合并失败"。实测：-o nd/sub/x.bin 时 2 片都下完才失败。
+    # 自动化下载里 -o 写错路径很常见，白跑一轮的代价全在用户带宽上。
+    _outdir="$(dirname "$out")"
+    if [ ! -d "$_outdir" ]; then
+        mkdir -p "$_outdir" 2>/dev/null || die "输出目录不存在或不可写: ${_outdir}"
+    elif [ ! -w "$_outdir" ]; then
+        die "输出目录不可写: ${_outdir}"
     fi
 
     echo "探测 $url …"
@@ -2874,8 +2914,8 @@ MSG
     # 以前没加 --fail：HTTP 404 时 curl 返回 0、把错误页写进分片文件，
     # 于是走到"字节数不符"分支，重试 3 次后报"服务端 Range 行为不一致"——
     # 诊断完全错误，用户会跑去换源，而真正的原因只是 URL 写错了。
-    _fetch_seg() {   # $1=分片号 $2=start $3=end $4=URL $5=目录 $6=设备(空=不绑)
-        local idx="$1" st="$2" en="$3" u="$4" d="$5" dev="${6:-}" try got http rc
+    _fetch_seg() {   # $1=分片号 $2=start $3=end $4=URL $5=目录 $6=设备(空=不绑) $7=总大小
+        local idx="$1" st="$2" en="$3" u="$4" d="$5" dev="${6:-}" sz="${7:-}" try got http rc
         # 不用数组拼 --interface：bash 3.2 下空数组展开有坑，而设备名
         # （en0/en1）不可能含空格，未加引号的 $ifpre 展开是安全的。
         local ifpre=""
@@ -2897,6 +2937,7 @@ MSG
             http="$(curl -sS -L --fail --connect-timeout 10 --speed-limit 20480 \
                     --speed-time 20 --max-time 300 --range "${st}-${en}" \
                     $ifpre \
+                    -D "$d/h$idx" \
                     -o "$d/p$idx" -w '%{http_code}' "$u" 2>/dev/null)"
             rc=$?
             if [ "$rc" -eq 0 ]; then
@@ -2909,9 +2950,56 @@ MSG
                 got=0
                 [ -f "$d/p$idx" ] && got="$(wc -c < "$d/p$idx" | tr -d ' ')"
                 if [ "$got" = $(( en - st + 1 )) ]; then
+                    # 长度对了还要验**偏移**。
+                    #
+                    # 为什么必须验：这里原来只比字节数，而响应头里的
+                    # Content-Range 从头到尾没被用来和请求的 st 比对过。
+                    # 于是服务端只要返回「长度正确、偏移错误」的分片，
+                    # 每一片都单独通过、总和也通过，合并出的文件是错的，
+                    # 而退出码 0、输出"完成"。
+                    #
+                    # 实测确认（本地桩：对每个 Range 请求都回 206 + 正确的
+                    # Content-Range 头，但 body 永远是文件开头那段）：
+                    #     完成: o.bin（12.0 MB，8 片 / 2 连接）
+                    #     文件字节: 12582912  期望: 12582912
+                    #     字节数校验: PASS
+                    #     错误字节数 11010048 占 87.5 %
+                    # 3 次复现全部 rc=0。用户拿到一个字节数正确、md5 却
+                    # 对不上的文件，工具还明确说"完成"——**这是最坏的一类
+                    # 说谎**：文件是坏的，界面说是好的。
+                    #
+                    # 触发条件不是臆想：剥掉/改写 Range 头的反向代理、
+                    # CDN 缓存变体串位、对象存储 range 实现缺陷都会这样。
+                    # 对照组：长度不对的分片能被现有校验抓住（"分片大小与
+                    # 请求不符"），说明漏的 precisely 是偏移这一个维度。
+                    #
+                    # 用 -D 把头落盘再 awk 取，不用 -w '%header{...}'——
+                    # 本机 curl 8.7.1 实测不认那个变量。
+                    #
+                    # ⚠️ 必须剥掉行尾 \r：HTTP 头是 \r\n 结尾的，而 awk 的默认
+                    # 分隔符不把 \r 当空白，$3 会变成 "0-1023/1048576\r"，
+                    # 于是和 "bytes 0-1023/1048576" 永远不相等——**所有下载
+                    # 都会失败**。第一版就是这么写的，实测 3 个分片全红。
+                    if [ -n "$sz" ] && [ -f "$d/h$idx" ]; then
+                        _cr="$(awk 'tolower($1)=="content-range:"{sub(/\r$/,"",$3); print $2, $3; exit}' \
+                                "$d/h$idx" 2>/dev/null)"
+                        if [ "$_cr" != "bytes ${st}-${en}/${sz}" ]; then
+                            # 不符 → 按可重试处理。重试和跨接口兜底都不成，
+                            # 会走到已有的 fail_$idx 路径，诊断文案不用改。
+                            return 1
+                        fi
+                    fi
                     # 成功了要清掉前几次失败留下的 connfail 标记，否则重试成功
                     # 的分片会被父进程算进"连接失败"里，诊断就虚报了。
                     rm -f "$d/connfail_$idx" 2>/dev/null
+                    # 限流标记也要清：429/503 只说明"那一刻服务端扛不住"，
+                    # 但这个标记原来只写不删，于是一次瞬时 429 就把整次下载
+                    # 的连接数永久钉死在 2 条——实测 A/B（同一 24MB、-n 8、
+                    # 桩每请求固定 400ms）：起始撞一次 429 → 起到 2 条；
+                    # 全程无 429 → 起到 5 条。文件都正确，所以这是纯吞吐损失，
+                    # 而用户看到"-n 8 却只起了 2 条"且没有任何说明。
+                    # connfail 早就是"有成功即清"的设计，这里对齐它。
+                    rm -f "$d/ratelimited" 2>/dev/null
                     return 0
                 fi
                 return 1
@@ -2994,7 +3082,7 @@ MSG
             # 一旦某条线慢，它上面那两个 worker 就拖着整个下载；
             # 按片号轮询则快的 worker 认领更多片，天然自平衡。
             dev="$(_spread_pick "$idx")"
-            if ! _fetch_seg "$idx" "$st" "$en" "$u" "$d" "$dev"; then
+            if ! _fetch_seg "$idx" "$st" "$en" "$u" "$d" "$dev" "$sz"; then
                 # 注意：不能写 wc -c < "$d/p$idx" 2>/dev/null。
                 # bash 按从左到右处理重定向，< 先执行——文件打不开时
                 # shell 自己报的错发生在 2>/dev/null 生效**之前**，
@@ -3235,6 +3323,91 @@ MSG
         _i=$(( _i + 1 ))
     done
     eval "cat $_catlist" > "$out" || die "合并失败"
+    # 【内容回读校验】合并完之后、宣布"完成"之前，抽查几段和单连接重下的
+    # 结果逐字节比对。
+    #
+    # 为什么必须有这一步：上面所有校验（每片字节数、Content-Range 头、
+    # 总和）都只证明"长度对、头对"，**没有一处证明字节内容对**。
+    # 于是一个返回「长度正确、Content-Range 正确、但 body 是错的」的服务端
+    # 能让每一片都通过、总和也通过，最后产出损坏文件并报 rc=0"完成"。
+    #
+    # 实测确认过这个洞（本地桩：头全对，body 永远给文件开头那段）：
+    #     完成: o.bin（12.0 MB，8 片 / 2 连接）
+    #     文件字节: 12582912  期望: 12582912
+    #     字节数校验: PASS
+    #     错误字节数 11010048 占 87.5 %
+    # 3 次复现全部 rc=0。用户拿到一个字节数正确、md5 却对不上的文件，
+    # 工具还明确说"完成"——**最坏的一类说谎：文件是坏的，界面说是好的**。
+    #
+    # 触发条件不是臆想：剥掉/改写 Range 头的反向代理、CDN 缓存变体串位、
+    # 对象存储 range 实现缺陷都会这样。
+    #
+    # 做法：挑几个确定性偏移，各取 64KB 用**单连接**重下一遍，和已合并的
+    # 文件在同一位移比对。成本是几倍于 64KB 的小请求，对 12MB 以上的文件
+    # 完全可忽略；小文件直接跳过（分片本来就少，风险面也小）。
+    #
+    # 单连接而不是多连接：这一路是当"参照物"用的，走默认路由、不绑接口，
+    # 避免和被校验的那条路共享故障模式。
+    # ⚠️ 变量名是 chunk 不是 cs——第一版写成 cs，而那个名字在这个作用域
+    # 里根本不存在，于是 `${cs:-0}` 恒为 0、整个校验块被静默跳过，
+    # 而下载照样报"完成"。**一个名字写错的校验比没有校验更危险**：
+    # 它让人以为内容被验过了。
+    if [ "$size" -ge 262144 ] && [ -n "${chunk:-}" ] && [ "${chunk:-0}" -gt 131072 ]; then
+        # ⚠️ 不能写成 `_vok=1 _voff _vgot _vwant _vtmp _vidx` 这种连写：
+        # bash 把它解析成"用 _vok=1 作为环境变量去执行**命令** _voff"，
+        # 于是 _voff/_vgot/... 被当成命令名和参数，报 command not found，
+        # 而 _vok **根本没有在当前 shell 里被赋值**（它只进了那个
+        # 从未成功执行的子进程环境）。表现是：校验明明全过，
+        # 末尾 `[ "$_vok" != "1" ]` 却恒真 → 每次下载都报内容校验失败。
+        # 隔离实测：`bash -c '_vok=1 _voff; echo [$_vok]'` 打出 `[]`。
+        # 这些变量都不需要预声明（没有 local），只赋 _vok 就够了。
+        _vok=1
+        _vtmp="$(mktemp "${TMPDIR:-/tmp}/sr_verify.XXXXXX")" || _vtmp=""
+        if [ -n "$_vtmp" ]; then
+            # 偏移取**每片的正中间**，不是片边界。
+            #
+            # 为什么这点是关键：第一版取的是 0 / size/4 / size/2 / 3size/4，
+            # 而 size/4 恰好是片起点。对一个"忽略 Range、永远返回文件开头
+            # 那段"的服务端，片起点的内容本来就是 BODY[0:…]，重下回来和
+            # 合并文件在该位移的内容**一模一样**，于是校验静默通过——
+            # 实测就是这么漏的。取片内偏移后，合并文件在该位移放的是
+            # BODY[cs/2:…]，而重下回来仍是 BODY[0:…]，立刻对不上。
+            #
+            # 反过来，对**正确**的服务端，重下回来的就是该位移的真实字节，
+            # 和合并文件必然一致——所以这个校验不会误报，包括全零文件、
+            # 稀疏镜像这类内容重复的场景（那时两边都相同，照样通过）。
+            for _vidx in 0 1 2 3; do
+                [ "$_vidx" -ge "${total_chunks:-1}" ] && break
+                _voff=$(( _vidx * chunk + chunk / 2 ))
+                [ "$_voff" -ge "$size" ] && continue
+                _vwant=$(( size - _voff ))
+                [ "$_vwant" -gt 65536 ] && _vwant=65536
+                if curl -sS --fail --connect-timeout 10 --max-time 60 \
+                        --range "${_voff}-$(( _voff + _vwant - 1 ))" \
+                        -o "$_vtmp" "$url" 2>/dev/null && [ -f "$_vtmp" ]; then
+                    _vgot="$(wc -c < "$_vtmp" | tr -d ' ')"
+                    if [ "$_vgot" != "$_vwant" ]; then
+                        _vok=0; break
+                    fi
+                    # 不用 status=none：那是 GNU coreutils 的专有参数，
+                    # macOS 的 dd 不认，会直接失败——于是**正确**的服务端
+                    # 也被判成内容不符，下载全灭。第一版就是这么写的，
+                    # A/B 两侧同时报"内容校验失败"。用 2>/dev/null 静音即可。
+                    if ! dd if="$out" of="$_vtmp.mine" bs=1 skip="$_voff" \
+                            count="$_vwant" 2>/dev/null \
+                       || ! cmp -s "$_vtmp" "$_vtmp.mine"; then
+                        _vok=0; break
+                    fi
+                fi
+                rm -f "$_vtmp" "$_vtmp.mine" 2>/dev/null
+            done
+            rm -f "$_vtmp" "$_vtmp.mine" 2>/dev/null
+            if [ "$_vok" != "1" ]; then
+                rm -f "$out" 2>/dev/null
+                die "多连接下载的内容校验失败：单连接重下的字节和多连接拼出的不一致。这个源的 Range 实现有问题（可能被代理/CDN 改写），已删掉不完整的文件。请换一个源，或用 -n 1 单连接下载。"
+            fi
+        fi
+    fi
     # 下载耗时的终点必须是**合并完成这一刻**，不能放到报告之后取。
     # 中间隔着两次 netstat、state 读、一堆 echo，100-300ms 起步；
     # 对纳秒计时要救的"小文件"场景，这正好构成 10-30% 的偏差——
@@ -5081,7 +5254,7 @@ cmd_wifi() {
             [ -n "$ACTIVE_WIFI_DEV" ] || { echo "没有检测到 Wi-Fi 接口"; return 1; }
             echo "已保存的 Wi-Fi（靠前优先）："
             local n=0 ssid
-            while IFS= read -r ssid; do
+            while IFS= read -r ssid || [ -n "$ssid" ]; do
                 [ -n "$ssid" ] || continue
                 n=$((n+1)); printf '  %d. %s\n' "$n" "$ssid"
             done < <(wifi_saved_list)
@@ -5115,7 +5288,7 @@ cmd_wifi() {
             if [ -n "$near" ]; then
                 echo
                 echo "在范围的已保存网络（按信号排序，越靠前越好）："
-                while read -r s rssi ch; do
+                while read -r s rssi ch || [ -n "$s" ]; do
                     [ -n "$s" ] || continue
                     printf '  %-16s %5s dBm（%s/4 格）  信道 %s\n' \
                         "$s" "$rssi" "$(wifi_bars "$rssi")" "${ch:-?}"

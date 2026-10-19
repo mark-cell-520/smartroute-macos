@@ -159,7 +159,7 @@ struct StatusView: View {
 
 ⚠️ 「两条实时曲线同时起伏」不能证明流量被分摊：Wi-Fi 只要关联着就永远有
 背景心跳（mDNS/ARP/DHCP/iCloud），pf 没生效时那一侧也「有流量」。
-要看真实分摊，用 fetch 下载后读它打印的「实测分摊」。
+要看真实分摊，用 fetch 下载后读它打印的「流量分摊」，以及「两条线都在扛 / 只有一条线」那两行。
 """)
                 }
                 // 【链路能力差距】以太网协商速率远低于网卡能力时必须报警。
@@ -475,7 +475,7 @@ struct SpeedView: View {
                 }
                 // 多连接下载入口。放在这里而不是「并发」页：同网关时 pf 分流
                 // 已禁用，这页是用户找"怎么让下载更快"最自然的地方；
-                // 且它要看的实测分摊结论就该和速率曲线放在一起。
+                // 且它要看的分摊结论就该和速率曲线放在一起。
                 FetchCard(model: model)
                 qualityCard
                 // 用户装完最想知道的是"网变快了吗"。原来这页只有实时曲线，
@@ -582,7 +582,7 @@ struct SpeedView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
 
-                Text("曲线同时起伏不能证明流量被分摊——Wi-Fi 关联着就永远有背景心跳。要看真实分摊，用 fetch 下载后读它打印的「实测分摊」。")
+                Text("曲线同时起伏不能证明流量被分摊——Wi-Fi 关联着就永远有背景心跳。要看真实分摊，用 fetch 下载后读它打印的「流量分摊」，以及「两条线都在扛 / 只有一条线」那两行。")
                     .font(.caption).foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -658,7 +658,7 @@ struct FetchCard: View {
                 }
 
                 if !model.fetchNote.isEmpty {
-                    // 不许限行：成功时要显示脚本打印的「实测分摊」行，
+                    // 不许限行：成功时要显示脚本打印的分摊证据行，
                     // 那是证明流量真的分摊到两个接口的唯一证据。
                     Text(model.fetchNote)
                         .font(.caption)
@@ -952,7 +952,7 @@ struct BalanceView: View {
         // 唯独漏了这里——而这是用户开启 pf 分流后**真正盯着的页面**。
         //
         // 曲线只回答"有没有流量"，不回答"流量是怎么被分流的"。
-        // 后者只能看权威状态（同页 statusCard）或 fetch 打印的实测分摊。
+        // 后者只能看权威状态（同页 statusCard）或 fetch 打印的分摊结论。
         Card(title: "实时流量") {
             VStack(alignment: .leading, spacing: Theme.gapS) {
                 ForEach(model.monitoredDevices, id: \.self) { dev in
@@ -974,7 +974,7 @@ struct BalanceView: View {
                 Text("曲线同时起伏不能证明流量被分摊——Wi-Fi 只要关联着就永远有背景心跳（mDNS/ARP/DHCP/iCloud）。")
                     .font(.caption)
                     .foregroundStyle(.orange)
-                Text("要看真实分摊：看上面的「分流状态」，或用 fetch 下载后读它打印的「实测分摊」。")
+                Text("要看真实分摊：看上面的「分流状态」，或用 fetch 下载后读它打印的「流量分摊」，以及「两条线都在扛 / 只有一条线」那两行。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
