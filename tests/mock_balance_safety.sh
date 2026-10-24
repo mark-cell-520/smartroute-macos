@@ -135,5 +135,65 @@ sed -n "${S},$((S+90))p" smartroute.sh | grep -q "可能触发一次本不该发
 sed -n "${S},$((S+90))p" smartroute.sh | grep -q "本次不测实时延迟" \
     && ok "拿不到锁时降级提示，不卡住 status" || bad "没做降级"
 
+echo "== 8. 并发分流质量守门（v2.4）：同网关/延迟悬殊自动关闭 =="
+# 背景（2026-10-24 实测）：旧版本没有同网关拒绝，用户用旧版开了 round-robin，
+# 一半新连接被送到网关 RTT 1.1 秒的 Wi-Fi——原话"网速很快，但打开网页会卡"。
+# balance_on 的同网关拒绝拦不住"已经开着的"，守护进程必须运行时自愈。
+ACTIVE_ETH_DEV="en0";  ACTIVE_WIFI_DEV="en1"
+ACTIVE_ETH_SVC="Ethernet"; ACTIVE_WIFI_SVC="Wi-Fi"
+# mock：延迟指标按 LAT_EN0/LAT_EN1 返回；ensure_latency 空转（缓存由 mock 提供）
+_metric_val() {
+    case "$1" in
+        lat_en0) echo "${LAT_EN0:-}" ;;
+        lat_en1) echo "${LAT_EN1:-}" ;;
+        *)       echo "" ;;
+    esac
+}
+ensure_latency() { return 0; }
+
+# 8.1 同网关 → 关闭（一条 WAN 的两个入口，零收益+卡死风险）
+: > "$T/off.log"
+svc_router() { echo 192.168.1.1; }
+balance_quality_gate
+grep -q BALANCE_OFF_CALLED "$T/off.log" \
+    && ok "同网关：质量守门关闭并发分流（自愈旧版本开启的分流）" \
+    || bad "同网关没有关闭分流"
+
+# 8.2 不同网关 + 延迟悬殊（14 vs 400，28 倍）→ 关闭
+: > "$T/off.log"
+svc_router() { [ "$1" = "Ethernet" ] && echo 192.168.1.1 || echo 192.168.2.1; }
+LAT_EN0=14 LAT_EN1=400 balance_quality_gate
+grep -q BALANCE_OFF_CALLED "$T/off.log" \
+    && ok "延迟悬殊（28 倍）：关闭分流，不把一半新连接送慢线" \
+    || bad "延迟悬殊没有关闭分流"
+
+# 8.3 不同网关 + 延迟相当（14 vs 20）→ 不干预
+: > "$T/off.log"
+LAT_EN0=14 LAT_EN1=20 balance_quality_gate
+grep -q BALANCE_OFF_CALLED "$T/off.log" \
+    && bad "延迟相当也关（误伤正常分流）" || ok "延迟相当：不干预"
+
+# 8.4 一边没测到延迟 → 弃权，不基于不完整数据猜
+: > "$T/off.log"
+LAT_EN0=14 LAT_EN1="" balance_quality_gate
+grep -q BALANCE_OFF_CALLED "$T/off.log" \
+    && bad "一边无延迟数据也关（基于不完整数据决策）" || ok "一边无延迟数据：弃权"
+
+# 8.5 倍数够但绝对差不够（14 vs 60，差 46ms<50ms）→ 不关（防翻烧饼）
+: > "$T/off.log"
+LAT_EN0=14 LAT_EN1=60 balance_quality_gate
+grep -q BALANCE_OFF_CALLED "$T/off.log" \
+    && bad "绝对差不够也关（边界内误伤）" || ok "绝对差不够（46ms<50ms）：不关"
+
+# 8.6 调用点卫兵：fastest 模式有自己的周期重测，不被守门管辖
+grep -q 'balance_mode)" != "fastest"' smartroute.sh \
+    && ok "调用点跳过 fastest 模式（只走快线，无需守门）" \
+    || bad "fastest 模式被守门管辖，会与 balance_reevaluate 打架"
+
+# 8.7 反向验证锚点：判据用的是 auto 的同一套阈值，不许出现第二套魔法数字
+grep -q 'LATENCY_AUTO_RATIO:-2' smartroute.sh && grep -q 'LATENCY_AUTO_GAP_MS:-50' smartroute.sh \
+    && ok "守门复用 auto 的延迟阈值（不维护第二套）" \
+    || bad "守门用了独立的阈值常量"
+
 echo ""
 echo "结果: $PASS 通过, $FAIL 失败"

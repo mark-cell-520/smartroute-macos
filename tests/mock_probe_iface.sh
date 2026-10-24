@@ -12,8 +12,17 @@
 # 后果：MODE=latency 和 balance fastest 会拿着错的延迟选线。用户看到的现象是
 # "明明有线延迟低，它偏偏选 Wi-Fi"，而且没有任何报错。
 #
-# 修法：宁可返回"测不出"，也不能返回假数据。测不出时调用方保持现状，
-# 最坏是慢一点；假数据会主动选错线。
+# 修法（v2.13 时代）：宁可返回"测不出"，也不能返回假数据。
+#
+# [v2.4] 机制已变：measure_latency 主路径改成 ping -b 绑定接口——不依赖
+# root、不改路由表，从根上不存在"走错口"（绑定即接口）。旧的主机路由法
+# 降级为 -b 全部失败时的兜底（仍保留出口验证）。本文件相应更新：
+#   · ping mock 按 -b 的接口返回不同 RTT（en0=14.5 / en1=400.5），
+#     "测的是哪个接口"从此可被断言；
+#   · 第 6 节非 root 的期望反转：-b 在非 root 下就准，ensure_latency
+#     不再需要非 root 早退（那个早退的前提"非 root 只能测到默认路由"
+#     已被 -b 推翻），且写进去的两个值必须不同——不同才证明不是
+#     默认路由的同一个数。
 #
 # 运行: bash tests/mock_probe_iface.sh
 cd "$(dirname "$0")/.."
@@ -44,12 +53,23 @@ case "$*" in
 esac
 exit 0
 EOF
-# ping 替身：RTT_TAIL 拼出固定平均延迟，便于断言数值
+# ping 替身：[v2.4] 按 -b 绑定的接口返回不同 RTT——en0=14.5ms，en1=400.5ms。
+# 为什么必须区分：旧 mock 对所有调用返回同一个数，"测的是哪个接口"根本无法
+# 断言。v2.4 起 measure_latency 主路径是 ping -b，这个 mock 让"绑定生效"
+# 变成可验证的：en1 返回 400.5 而不是 14.5，就证明包真的从 en1 出去了。
 cat > "$T/bin/ping" <<'EOF'
 #!/bin/bash
-for a in "$@"; do case "$a" in [0-9]*.[0-9]*) t="$a";; esac; done
-echo "ping $t" >> "$MOCK_PING_LOG"
-printf 'round-trip min/avg/max/stddev = 14.1/14.5/14.9/0.3 ms\n'
+prev=""; dev=""
+for a in "$@"; do
+    [ "$prev" = "-b" ] && dev="$a"
+    prev="$a"
+done
+echo "ping $*" >> "$MOCK_PING_LOG"
+if [ "$dev" = "en1" ]; then
+    printf 'round-trip min/avg/max/stddev = 400.1/400.5/400.9/0.3 ms\n'
+else
+    printf 'round-trip min/avg/max/stddev = 14.1/14.5/14.9/0.3 ms\n'
+fi
 EOF
 # id 替身：必须报 0。探测路由只在 root 下加，不 mock 的话整个被测代码块
 # 会被跳过，测试等于没测。
@@ -80,18 +100,32 @@ ml() {   # $1=dev $2=iface_for $3=route_add_rc
 echo "== 1. 路由正确指向目标接口 → 正常测量 =="
 r="$(ml en0 en0 0)"
 [ "$r" = "14.5" ] && ok "出口正确时测出延迟（${r}）" || bad "出口正确却返回 '$r'"
+grep -q -- "-b en0" "$MOCK_PING_LOG" \
+    && ok "用 ping -b 绑定目标接口（v2.4 主路径）" \
+    || bad "没有用 -b 绑定接口，又在靠路由表碰运气"
 
-echo "== 2. 同网关双口陷阱：已存在路由指向另一个接口 =="
-# route add 成功（rc=0），但 route -n get 报告 interface: en1。
-# 这是这台机器的真实拓扑，也是原来会静默测错的地方。
+echo "== 2. 同网关双口陷阱：路由表指向别的接口也测不错（v2.4 重写）=="
+# route add 成功（rc=0），但 route -n get 报告 interface: en1——这台机器的
+# 真实拓扑。旧机制在这里全军覆没：出口验证发现走的是 en1 → 跳过全部目标
+# → 返回空 → lat_en1 永久缺失（Wi-Fi 网关 RTT 恶化到 1.1 秒都没触发切换）。
+# 新机制 ping -b en0：绑定即接口，路由表状态不影响测量对象。
 r="$(ml en0 en1 0)"
-[ -z "$r" ] && ok "出口是别的接口时返回空（拒绝假数据）" || bad "返回了 '$r'，这是属于 en1 的延迟"
-_n="$(grep -c '^ping' "$MOCK_PING_LOG")"
-[ "$_n" = "0" ] && ok "没有发任何 ping（没拿假数据）" || bad "还是发了 $_n 个 ping"
+[ "$r" = "14.5" ] && ok "路由表指向 en1 时仍测到 en0 的 14.5ms（绑定优先于路由表）" \
+    || bad "返回 '$r'——要么空（旧病复发）要么是 en1 的 400.5（走错口）"
+grep -q -- "-b en0" "$MOCK_PING_LOG" \
+    && ok "ping 确实绑定 en0（不是碰运气走到 en0）" || bad "ping 没有绑定 en0"
 
-echo "== 3. route add 全部失败，且已有路由也指向别的接口 =="
+echo "== 3. Wi-Fi 侧（en1）必须测得到——旧机制下它永远缺失 =="
+# 这是 v2.4 要修的核心病灶：同网关双接口机器上，旧主机路由法给 en1 加路由
+# 会加错口，lat_en1 连续多轮为空，auto 的延迟一票否决因"一边没数据"
+# 持续弃权。现在 ping -b en1 直接测。
+r="$(ml en1 en1 0)"
+[ "$r" = "400.5" ] && ok "measure_latency en1 返回 400.5ms（Wi-Fi 侧不再缺失）" \
+    || bad "en1 返回 '$r'，期望 400.5"
+echo "== 3b. route add 全部失败也不影响 -b 测量 =="
 r="$(ml en0 en1 1)"
-[ -z "$r" ] && ok "加不进去又指错口时返回空" || bad "返回了 '$r'"
+[ "$r" = "14.5" ] && ok "路由加不进去仍测到 en0 的 14.5ms（-b 不依赖路由操作）" \
+    || bad "返回 '$r'"
 
 echo "== 4. route add 失败，但已有路由确实指向目标接口 =="
 # 这种情况复用已有路由是合理的：ping 确实会走 en0，测出来是真的。
@@ -110,9 +144,12 @@ out="$(PATH="$T/bin:$PATH" bash -c ". '$T/sr.sh'; route_add_host 223.5.5.5 en0 1
 echo "$out" | grep -q "rc=0" \
     && ok "网关同、接口也同 → 返回 0（合理复用）" || bad "过于严格: $out"
 
-echo "== 6. 非 root 时不应假装能测指定接口 =="
-# 非 root 加不了探测路由，ping 只会走默认路由。此时对 en0/en1 会得到
-# 同一个数。原来的行为是静默返回那个数，让调用方以为测的是指定接口。
+echo "== 6. 非 root 也能分别测两个接口（v2.4 重写）=="
+# 旧前提"非 root 加不了探测路由 → 两次调用测的都是默认路由 → 得到同一个数"
+# 已被 ping -b 推翻：绑定接口不需要 root。实测普通用户下
+# ping -b en0=42ms / ping -b en1=524ms，分别测得准。
+# 所以 ensure_latency 的非 root 早退已移除；本节的"假对称"防线改成：
+# 两个缓存值必须不同——不同才证明各测各的，不是默认路由的同一个数。
 cat > "$T/bin/id" <<'EOF'
 #!/bin/bash
 [ "$1" = "-u" ] && echo 501
@@ -120,12 +157,11 @@ exit 0
 EOF
 chmod +x "$T/bin/id"
 : > "$MOCK_PING_LOG"
-r="$(ml en0 en0 0)"
-[ -n "$r" ] && ok "非 root 仍返回一个值（${r}）" || bad "非 root 直接失败，会破坏 measure 命令"
-echo "  （非 root 下这个数属于默认路由，调用方需知晓——见下条断言）"
-grep -q 'id -u.*-eq 0' "$SRC" && ok "探测路由仍限于 root" || bad "root 限制被去掉了"
-# ensure_latency 必须有非 root 护栏：否则会把默认路由的延迟同时存成
-# lat_en0 / lat_en1，状态页显示"两条线都测过"，实际只测了一条。
+r0="$(ml en0 en0 0)"; r1="$(ml en1 en1 0)"
+[ "$r0" = "14.5" ] && [ "$r1" = "400.5" ] \
+    && ok "非 root 下两口分别测得 14.5 / 400.5（不再是同一个数）" \
+    || bad "非 root 测量异常: en0=$r0 en1=$r1（相同就是旧病复发）"
+grep -q 'id -u.*-eq 0' "$SRC" && ok "主机路由兜底仍限于 root（-b 是主路径）" || bad "root 限制被去掉了"
 export MOCK_IFACE_FOR=en0 ROUTE_ADD_RC=0
 out="$(PATH="$T/bin:$PATH" bash -c "
     . '$T/sr.sh'
@@ -134,8 +170,8 @@ out="$(PATH="$T/bin:$PATH" bash -c "
     echo 'lat_en0='\$(state_get lat_en0)
     echo 'lat_en1='\$(state_get lat_en1)
 " 2>/dev/null)"
-echo "$out" | grep -q "lat_en0=$" && ok "非 root 不写 lat_en0 缓存（不制造假对称数据）" || bad "非 root 仍写缓存: $out"
-echo "$out" | grep -q "lat_en1=$" && ok "非 root 不写 lat_en1 缓存" || bad "非 root 仍写 lat_en1: $out"
+echo "$out" | grep -q "lat_en0=14.5" && ok "非 root 也写 lat_en0=14.5（数据是准的）" || bad "lat_en0 异常: $out"
+echo "$out" | grep -q "lat_en1=400.5" && ok "非 root 也写 lat_en1=400.5（两口数据不同=真测了）" || bad "lat_en1 异常: $out"
 
 echo ""
 echo "结果: $PASS 通过, $FAIL 失败"

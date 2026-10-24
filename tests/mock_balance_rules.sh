@@ -284,6 +284,15 @@ case "$r" in
   *) bad "measure_latency 返回值异常: [$r]" ;;
 esac
 
+# [v2.4] 新路径断言：measure_latency 必须用 ping -b 绑定接口。
+# 背景：旧的主机路由法在同网关双接口机器上给 en1 加路由会加错口
+# （内核选成默认口），出口验证全军覆没 → lat_en1 永远缺失 →
+# auto 的延迟一票否决持续弃权。实测这台机器 Wi-Fi 网关 RTT 恶化到
+# 1.1 秒都没能触发切换。ping -b 不需要 root、不受同网关歧义影响。
+grep -q "ping -b en1" "$MOCK_LOG" \
+    && ok "measure_latency 用 ping -b 绑定接口（不依赖 root 主机路由）" \
+    || bad "measure_latency 还在用旧的主机路由法（同网关双接口下 lat 会缺失）"
+
 export MOCK_RTT_A=10.0 MOCK_RTT_B=40.0
 w="$(run 'pick_fastest en0 10.0 en1 40.0' 2>/dev/null | tail -n 1)"
 [ "$w" = "en0" ] && ok "延迟差大时选出更快的 en0" || bad "选速失败: $w"

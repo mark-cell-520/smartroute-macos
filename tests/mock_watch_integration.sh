@@ -58,8 +58,17 @@ runwatch() {   # 在隔离环境里跑一次 watch
     bash -c "
         export PATH='$T/bin:$PATH'
         export MOCK_LOG='$MOCK_LOG' MOCK_ROUTES='$MOCK_ROUTES'
-        export MOCK_PF_STATUS='$MOCK_PF_STATUS' MOCK_ANCHOR_LOADED='$MOCK_ANCHOR_LOADED'
+        export MOCK_PF_STATUS='$MOCK_PF_STATUS' MOCK_ANCHOR_LOADED='$MOCK_ANCHOR_LOADED' MOCK_LAT="${MOCK_LAT:-14}"
         . '$T/sr.sh'
+        # [v2.4] 质量守门需要的受控环境：
+        #   · svc_router 返回不同网关——这是「真双 WAN」，健康场景的前提。
+        #     不 mock 的话跑真实 networksetup，这台机器两口同网关，
+        #     守门会按设计关闭（那是 2b 节要验的自愈，不是 2 节的场景）。
+        #   · ensure_latency 空转 + _metric_val 返回 MOCK_LAT：避免真 ping
+        #     （慢且依赖外网），让「延迟相当→不干预」可确定断言。
+        svc_router() { [ \"\$1\" = \"Ethernet\" ] && echo 192.168.1.1 || echo 192.168.2.1; }
+        ensure_latency() { return 0; }
+        _metric_val() { echo \"\${MOCK_LAT:-14}\"; }
         BALANCE='$1'
         cmd_watch
     " 2>&1
@@ -72,11 +81,44 @@ grep -q "pfctl" "$MOCK_LOG" && bad "BALANCE=0 不应调用 pfctl" || ok "BALANCE
 echo "$out" | grep -q "eth=" && ok "watch 正常输出状态行" || { bad "watch 输出"; echo "$out"; }
 grep -q "route add -net\|route delete -net" "$MOCK_LOG" && bad "BALANCE=0 不应动静态路由" || ok "BALANCE=0 不动静态路由"
 
-echo "== 2. BALANCE=1 + 两接口判定都 ok → 不动 pf =="
+echo "== 2. BALANCE=1 + 两接口判定都 ok（不同网关+延迟相当）→ 不动 pf =="
+# [v2.4] 这里的"健康"是严格意义的：不同网关（真双 WAN）+ 两边延迟相当。
+# 质量守门此时不应干预——否则用户开个正常分流也被天天关。
 : > "$MOCK_LOG"
 out="$(runwatch 1)"
 grep -q "pfctl -a com.apple/smartroute -F all" "$MOCK_LOG" && bad "健康时不应关闭并发" || ok "健康时不关闭并发"
 grep -q "route add -net\|route delete -net" "$MOCK_LOG" && bad "无规则时不应动静态路由" || ok "无规则不动静态路由"
+
+echo "== 2b. BALANCE=1 + 同网关 → 质量守门自愈关闭（v2.4）=="
+# 旧版本没有同网关拒绝，用户用旧版开了 round-robin：一半新连接被送到
+# 网关 RTT 1.1 秒的 Wi-Fi——"网速很快，但打开网页会卡"。balance_on 的
+# 同网关拒绝拦不住"已经开着的"，守护进程必须运行时自愈。
+# 注意：mock 的 pfctl 是无状态的，-F all 之后 -s rules 仍返回规则，
+# 所以这里直接验"守门关闭动作发生"。
+cat > "$T/bin/svc_router" <<'EOF'
+#!/bin/bash
+echo 192.168.1.1
+EOF
+chmod +x "$T/bin/svc_router"
+# svc_router 是 shell 函数不是外部命令，mock 要通过 runwatch 注入——
+# 用一个环境变量让函数按场景返回同网关。
+: > "$MOCK_LOG"
+out="$(MOCK_LAT=14 bash -c "
+    export PATH='$T/bin:$PATH' MOCK_LOG='$MOCK_LOG' MOCK_ROUTES='$MOCK_ROUTES'
+    export MOCK_PF_STATUS='$MOCK_PF_STATUS' MOCK_ANCHOR_LOADED='$MOCK_ANCHOR_LOADED' MOCK_LAT=14
+    . '$T/sr.sh'
+    svc_router() { echo 192.168.1.1; }
+    ensure_latency() { return 0; }
+    _metric_val() { echo 14; }
+    BALANCE=1
+    cmd_watch
+" 2>&1)"
+grep -q "pfctl -a com.apple/smartroute -F all" "$MOCK_LOG" \
+    && ok "同网关：质量守门关闭并发（自愈旧版本开启的分流）" \
+    || bad "同网关没有自愈关闭"
+grep -q "并发分流质量守门" "$T/log/smartroute.log" \
+    && ok "守门写了日志（用户能查到为什么被关）" || bad "守门没写日志"
+rm -f "$T/bin/svc_router"
 
 echo "== 3. BALANCE=1 + 以太网判定失败 → 安全阀关闭并发 =="
 # 让以太网探测失败：把 eth 的连续计数置负，超过 FAIL_N

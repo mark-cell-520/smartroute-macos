@@ -653,49 +653,39 @@ probe_out() {   # $1=判定 $2=明细
 # 接口，因此可以测"当前不是默认路由"的接口；测完立即删除，不影响正常流量。
 # 输出: 平均 RTT（如 "14.3"）；测不到返回空。多个目标取平均，避免单点抖动。
 measure_latency() {   # $1=设备 $2=网关 -> stdout: 平均 RTT 毫秒（如 14.3）；测不到返回空
-    local dev="$1" gw="$2" t out r vals="" seen="" n=0 max=4
+    local dev="$1" gw="$2" t out r vals="" n=0
     [ -n "$dev" ] || return 1
     dev_active "$dev" || return 1
-    # 目标去重后最多取 max 个。这个函数会被 balance status 频繁调用，
+    # 目标去重后最多取 4 个。这个函数会被 balance status 频繁调用，
     # 目标太多命令会变慢（每个目标最坏 2×PING_TIMEOUT），把 App 拖到超时。
+    local seen="" max=4 _n=0
     for t in $PROBE_TARGETS 1.1.1.1 8.8.8.8; do
         case " $seen " in
             *" $t "*) ;;
-            *) [ "$n" -ge "$max" ] && break; seen="$seen $t"; n=$((n+1)) ;;
+            *) [ "$_n" -ge "$max" ] && break; seen="$seen $t"; _n=$((_n+1)) ;;
         esac
     done
-    if [ "$(id -u)" -eq 0 ] && [ -n "$gw" ]; then
-        cleanup_probe_routes
-        # 每个目标都要**验证包真的会从 $dev 出去**，不能只信 route_add_host
-        # 的返回值。它的兜底分支是"已存在同网关的路由就复用"，而这台机器
-        # 两个口接同一台路由器（同网关 192.168.1.1）——那条已存在的路由
-        # 很可能指向另一个接口。复用之后 ping 走错口，测到的是另一条线的
-        # 延迟，latency/fastest 模式会据此选错线。
-        #
-        # 宁可少测几个目标，也不能拿假数据做决策。全部目标都指不进去时
-        # 返回空（调用方按"测不出"处理，保持现状），而不是返回一个
-        # 属于别的接口的数字。
-        local _ok="" _nok=0 _via
-        for t in $seen; do
-            route_add_host "$t" "$dev" "$gw" >/dev/null 2>&1 || continue
-            _via="$(route -n get "$t" 2>/dev/null | sed -n 's/^[[:space:]]*interface:[[:space:]]*//p' | head -1)"
-            # _via 为空说明没探到出口，交给 route_add_host 的判断；
-            # 非空且不是目标设备，才是确凿的走错口。
-            if [ -n "$_via" ] && [ "$_via" != "$dev" ]; then
-                continue
-            fi
-            _ok="$_ok $t"; _nok=$((_nok+1))
-        done
-        if [ "$_nok" -eq 0 ]; then
-            cleanup_probe_routes >/dev/null 2>&1
-            return 1
-        fi
-        seen="$_ok"
-    fi
-    n=0
+    seen="${seen# }"
+
+    # [v2.4] 主方法：ping -b 绑定接口。不需要 root、不改路由表。
+    #
+    # 为什么取代 root 主机路由法（2026-10-24 实测）：这台机器两个口接同一台
+    # 路由器（同网关 192.168.1.1）。主机路由法给 en1 加
+    # `route add -host 1.1.1.1 -interface en1 192.168.1.1` 加不上（同网关
+    # 双宿主冲突），兜底形态 `route add -host 1.1.1.1 192.168.1.1`（不带
+    # -interface）由内核选出口——选成默认口 en0。于是：
+    #   · measure_latency 的出口验证发现走的是 en0 → 跳过该目标 →
+    #     全部目标跳完 → 返回空 → **lat_en1 永远缺失**，
+    #     v2.3 的延迟一票否决因"任一边没数据"持续弃权（实测连续多轮为空，
+    #     Wi-Fi 网关 RTT 已恶化到 1.1 秒都没能触发一票否决）；
+    #   · probe_dev 没有出口验证，会拿 en0 的探测结果冒充 en1 的可用性
+    #     （Wi-Fi 真死了也会探成 ok——故障切换的安全隐患）。
+    # 实测对照：`ping -b en1` 在普通用户（非 root）下就测到 524ms，
+    # 与 `ping -b en0` 的 42ms 差异显著——绑定接口真实生效。
+    # ping -b 的附带好处：不留残留路由（崩溃/ kill -9 也不用清理）、
+    # 非 root 也能分别测两个口（ensure_latency 的 non-root 早退因此移除）。
     for t in $seen; do
-        # -i 0.2 缩短包间隔：ping -c 2 默认间隔 1 秒，4 个目标要 4 秒+
-        out="$(ping -c 2 -i 0.2 -W "$PING_TIMEOUT" "$t" 2>/dev/null | tail -n 1)"
+        out="$(ping -b "$dev" -c 2 -i 0.2 -W "$PING_TIMEOUT" "$t" 2>/dev/null | tail -n 1)"
         case "$out" in
             *round-trip*)
                 r="$(printf '%s' "$out" | sed -n 's|.*= *[0-9.]*/\([0-9.]*\)/.*|\1|p')"
@@ -703,7 +693,36 @@ measure_latency() {   # $1=设备 $2=网关 -> stdout: 平均 RTT 毫秒（如 1
                 ;;
         esac
     done
-    [ "$(id -u)" -eq 0 ] && cleanup_probe_routes >/dev/null 2>&1
+
+    # 兜底：-b 一个都没测到时（极端老的 macOS 不支持 -b，或接口异常），
+    # 且是 root 带网关，退回原主机路由法。保留它是为了不 loss 兼容性，
+    # 不是因为它更好——同网关双宿主机器上它本来就测不到（见上）。
+    if [ "$n" -eq 0 ] && [ "$(id -u)" -eq 0 ] && [ -n "$gw" ]; then
+        cleanup_probe_routes
+        local _ok="" _nok=0 _via
+        for t in $seen; do
+            route_add_host "$t" "$dev" "$gw" >/dev/null 2>&1 || continue
+            _via="$(route -n get "$t" 2>/dev/null | sed -n 's/^[[:space:]]*interface:[[:space:]]*//p' | head -1)"
+            # _via 为空说明没探到出口；非空且不是目标设备，是确凿的走错口。
+            if [ -n "$_via" ] && [ "$_via" != "$dev" ]; then
+                continue
+            fi
+            _ok="$_ok $t"; _nok=$((_nok+1))
+        done
+        if [ "$_nok" -gt 0 ]; then
+            for t in $_ok; do
+                out="$(ping -c 2 -i 0.2 -W "$PING_TIMEOUT" "$t" 2>/dev/null | tail -n 1)"
+                case "$out" in
+                    *round-trip*)
+                        r="$(printf '%s' "$out" | sed -n 's|.*= *[0-9.]*/\([0-9.]*\)/.*|\1|p')"
+                        if [ -n "$r" ]; then vals="$vals $r"; n=$((n+1)); fi
+                        ;;
+                esac
+            done
+        fi
+        cleanup_probe_routes >/dev/null 2>&1
+    fi
+
     [ "$n" -gt 0 ] || return 1
     printf '%s' "$vals" | awk '{s+=$1; n++} END{ printf "%.1f", s/n }'
     return 0
@@ -1320,6 +1339,16 @@ cmd_watch() {
                 balance_reevaluate
             fi
         fi
+    fi
+
+    # 【v2.4 并发分流质量守门】上面的安全阀跑完后，如果并发分流还开着、
+    # 且不是 fastest 模式（fastest 只走快线，有自己的周期重测），
+    # 检查两件让"分流变成伤害"的事：同网关、延迟悬殊。
+    # 放在链后面而不是链里面：weighted 的周期重评估要继续跑，不能被我抢占。
+    if [ "$BALANCE" = "1" ] && [ "$(id -u)" -eq 0 ] \
+       && pfctl -a "$PF_ANCHOR" -s rules 2>/dev/null | grep -q . \
+       && [ "$(state_get balance_mode)" != "fastest" ]; then
+        balance_quality_gate
     fi
 
     # 【分流规则】把用户级规则文件落地为静态路由（root 才做）
@@ -3702,6 +3731,45 @@ MSG
     return 0
 }
 
+# 【v2.4 并发分流质量守门】round-robin / weighted 按配比把新连接分发到两个
+# 接口——其中一条延迟爆炸时，被分到它的连接全程卡死。实测这台机器：
+# Wi-Fi 网关 RTT 在 30ms 与 1.1 秒之间剧烈波动，round-robin 开着的时候
+# 网页周期性转圈（用户原话："网速很快，但打开网页会卡"）。
+#
+# balance_on 有同网关一次性拒绝（一条 WAN 的两个入口，分流零收益且有
+# 卡死风险——"页面打不开一直转圈"的故障被报告过两次），但开启时检查
+# 拦不住三种来路：旧版本开的、App 直接写配置开的、网关后来变成相同的。
+# 这里做运行时自愈。关闭走 balance_off（先写配置再清规则），
+# 不会被下一轮的"规则丢失重新加载"打架。
+#
+# 延迟判据复用 auto 的延迟一票否决（LATENCY_AUTO_RATIO /
+# LATENCY_AUTO_GAP_MS）——不维护第二套阈值，两边行为一致。
+# 依赖 v2.4 的 measure_latency（ping -b）：旧的主机路由法在同网关双接口
+# 下测不到 Wi-Fi 侧，守门会因"一边没数据"弃权——那正是要防的情况。
+balance_quality_gate() {
+    local _qge _qgw _qle _qlw
+    _qge="$(svc_router "$ACTIVE_ETH_SVC")"; _qgw="$(svc_router "$ACTIVE_WIFI_SVC")"
+    if [ -n "$_qge" ] && [ "$_qge" = "$_qgw" ]; then
+        log "并发分流质量守门: 两接口同网关（$_qge）——一条 WAN 的两个入口，分流零收益且有卡死风险，关闭"
+        balance_off quiet
+        notify "SmartRoute 双网并发" "两个接口走同一台路由器（同网关），双网并发不会提速反而会让网页卡壳，已自动关闭"
+        return 0
+    fi
+    ensure_latency "$ACTIVE_ETH_DEV" "$_qge" "$ACTIVE_WIFI_DEV" "$_qgw"
+    _qle="$(_metric_val "lat_$ACTIVE_ETH_DEV")"
+    _qlw="$(_metric_val "lat_$ACTIVE_WIFI_DEV")"
+    if [ -n "$_qle" ] && [ -n "$_qlw" ] \
+       && awk -v a="$_qle" -v b="$_qlw" -v r="${LATENCY_AUTO_RATIO:-2}" \
+              -v g="${LATENCY_AUTO_GAP_MS:-50}" \
+              'BEGIN{ hi=(a+0>b+0)?a+0:b+0; lo=(a+0>b+0)?b+0:a+0;
+                      exit !(a+0>0 && b+0>0 && hi>=lo*r && hi-lo>=g) }'; then
+        log "并发分流质量守门: 延迟悬殊 eth=${_qle}ms wifi=${_qlw}ms，轮询/权重分流会把一半新连接送到慢线，关闭"
+        balance_off quiet
+        notify "SmartRoute 双网并发" "两条线路延迟差距过大（以太网 ${_qle}ms / Wi-Fi ${_qlw}ms），继续分流会让一半连接卡死，已自动关闭；链路恢复后可重新开启"
+    fi
+    return 0
+}
+
 # 写一个配置键，成功返回 0。给 cmd_boost 用——它要连续写多个键，
 # 每个都要单独报成功/失败，不能一个失败就 die 把后面的全跳过。
 #
@@ -5842,20 +5910,14 @@ ensure_throughput() {   # $1=eth_dev $2=wifi_dev [$3=force 非空则忽略缓存
 
 ensure_latency() {   # $1=eth_dev $2=eth_gw $3=wifi_dev $4=wifi_gw
     local pair d gw v
-    # 非 root 时根本没法分别测两个接口：measure_latency 的探测路由只在 root 下加，
-    # 于是两次调用测的都是**默认路由**，得到同一个数。
-    #
-    # 原来会把这两个相同的数分别存成 lat_en0 / lat_en1，状态页接着显示
-    # "以太网 24.5ms / Wi-Fi 24.5ms"——看上去两条线都认真测过，实际只测了
-    # 默认路由那一条。选路判断倒是安全的（两边相等 → pick_fastest 判 tie →
-    # 保持现状），但展示是假的。
-    #
-    # 所以非 root 直接不写缓存，让上层看到"没有数据"，而不是看到一份
-    # 以假乱真的对称数据。守护进程由 launchd 以 root 跑，正常不受影响；
-    # 手动 bash smartroute watch 跑时才会走到这里。
-    if [ "$(id -u)" -ne 0 ]; then
-        return 0
-    fi
+    # [v2.4] 非 root 早退已移除。原前提是"非 root 没法分别测两个接口"
+    # （探测路由只在 root 下加，两次调用测的都是默认路由）——那个前提
+    # 在 measure_latency 改用 ping -b 之后不再成立：绑定接口不需要 root，
+    # 实测普通用户下 ping -b en0=42ms / ping -b en1=524ms，分别测得准。
+    # 留着早退只会让手动 `bash smartroute watch` 和 App 的体检页继续
+    # 显示"没有数据"——而数据本来是能拿到的。
+    # 非 root 写不了 /var/db 状态文件，_metric_set 静默失败，行为天然降级，
+    # 不需要在这里提前拦一道。
     for pair in "$1:$2:eth" "$3:$4:wifi"; do
         d="${pair%%:*}"
         gw="${pair#*:}"; gw="${gw%:*}"
