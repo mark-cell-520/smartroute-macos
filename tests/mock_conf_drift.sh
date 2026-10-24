@@ -60,7 +60,9 @@ grep -q 'prefix.count' SmartRouteApp/NetworkModel.swift \
     || bad "判定基准写死成 https:// 的长度，会误拒短 http:// URL"
 
 # 4) 布尔键集合一致
-BASH_BOOL="$(grep -m1 'TLS_PROBE|NOTIFY|AUTO_WIFI_POWER|BALANCE|WIFI_FAILOVER)' smartroute.sh | sed 's/ *TLS_PROBE|/TLS_PROBE|/; s/) *$//')"
+# 锚点只写前三个键（前缀匹配），末尾追加新键不用改这行——曾经写死完整键表
+# 加右括号，v2.3 末尾补 LATENCY_AUTO 后直接匹配失败，bash 侧提取成空串。
+BASH_BOOL="$(grep -m1 'TLS_PROBE|NOTIFY|AUTO_WIFI_POWER' smartroute.sh | sed 's/^ *//; s/) *$//' | tr -d ' ')"
 SWIFT_BOOL="$(grep -m1 'let boolKeys: Set<String>' SmartRouteApp/NetworkModel.swift | grep -o '\[.*\]' | tr -d '[]"' | tr ',' '\n' | sed 's/^ *//; s/ *$//' | grep -v '^$' | tr '\n' '|' | sed 's/|$//')"
 if [ "$(printf '%s' "$BASH_BOOL" | tr '|' '\n' | sort | tr '\n' ',')" = "$(printf '%s' "$SWIFT_BOOL" | tr '|' '\n' | sort | tr '\n' ',')" ]; then
     ok "布尔键集合一致（$(printf '%s' "$SWIFT_BOOL" | tr '|' ' ' | wc -w | tr -d ' ') 个）"

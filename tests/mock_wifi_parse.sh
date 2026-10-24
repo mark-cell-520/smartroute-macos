@@ -136,6 +136,10 @@ fi
 echo "=== 6b. wifi current --raw：一次调用拿全（App 走这条） ==="
 # 这条格式存在的理由：system_profiler 一次要约 1.7 秒，App 原来为了速率和噪声
 # 去跑两次 status（各 1.8 秒），Wi-Fi 页刷新要 5 秒。
+# pre.sh（入口前的纯函数段）必须在 if 外生成：下面的档位循环无条件执行，
+# 而 /tmp/cur_raw.txt 不是每台机器都有——没有它时 pre.sh 从未被创建，
+# 循环里 source 不存在的文件，7 个档位全假失败（2026-10-24 实测）。
+awk '/^# ---------------- 入口 ----------------/{exit} {print}' "$SRC" > "$T/pre.sh"
 if [ -s /tmp/cur_raw.txt ]; then
     echo "  真实输出: $(cat /tmp/cur_raw.txt)"
     out="$("$T/parse" current /tmp/cur_raw.txt)"
@@ -147,7 +151,6 @@ if [ -s /tmp/cur_raw.txt ]; then
     # bars 必须和脚本的 wifi_bars 一致（同一个 dBm 必须得到同一个格数）。
     # 这条断言抓到一起真实的档位错位：脚本按 -5*/-4*→4、-6*→3、-7*→2 分档，
     # 而 Swift 那边原来是 -50~-59→3，导致 -52 dBm 在命令行显示 4 格、App 显示 3 格。
-    awk '/^# ---------------- 入口 ----------------/{exit} {print}' "$SRC" > "$T/pre.sh"
     rssi="${out%%|*}"
     want="$(bash -c ". '$T/pre.sh'; wifi_bars '$rssi'")"
     got="$(printf '%s' "$out" | cut -d'|' -f3)"
@@ -164,12 +167,15 @@ out="$("$T/parse" current "Wi-Fi en1  信号 -70 dBm（2/4 格）  信道 44")"
 out="$("$T/parse" current "rssi=-52 channel=6 rate=432 noise=-96")"
 [ "$out" = "-52|6|4" ] && ok "纯 key=value 也能解析（-52 是 4 格）" || bad "得到: $out"
 # 逐个档位和脚本比对，防止再次错位
+# 汇总行必须等循环真跑完再判——原来是循环后无条件 ok，7 个全失败也打印
+# "全部一致"，输出自相矛盾，失败被一行 ✓ 盖掉。
+_lv_bad=0
 for dbm in -45 -52 -60 -65 -70 -75 -85; do
     want="$(bash -c ". '$T/pre.sh'; wifi_bars '$dbm'")"
     got="$("$T/parse" current "rssi=$dbm channel=6" | cut -d'|' -f3)"
-    [ "$want" = "$got" ] || bad "档位不一致：$dbm dBm 脚本=$want Swift=$got"
+    [ "$want" = "$got" ] || { _lv_bad=$((_lv_bad+1)); bad "档位不一致：$dbm dBm 脚本=$want Swift=$got"; }
 done
-ok "7 个档位全部与脚本一致"
+[ "$_lv_bad" -eq 0 ] && ok "7 个档位全部与脚本一致" || bad "$_lv_bad/7 个档位与脚本不一致"
 
 echo "=== 7. 附近网络：喂真实 scan 输出 ==="
 if [ -s /tmp/real_scan.txt ]; then

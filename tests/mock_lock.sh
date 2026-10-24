@@ -89,10 +89,14 @@ printf '%s' "$seg" | grep -q 'deadline' \
     && ok "有锁可争时仍然等待" || bad "有锁时不等了"
 
 echo "== 9. 放行是安全的（非 root 确实不碰路由表）=="
-# 互斥的目的只是保护主机路由增删，那件事需要 root。
-# 三个命令在非 root 下都必须走「按当前默认路由」的分支。
-awk '/^probe_dev\(\)/,/^}/' "$SRC" | grep -q '非 root：按当前默认路由探测' \
-    && ok "probe_dev 非 root 不加主机路由" || bad "probe_dev 非 root 也动路由"
+# 互斥的目的只是保护主机路由增删，那件事需要 root。非 root 下三个命令都不得
+# 碰路由表（probe_dev v2.5 起走接口绑定探测，measure/quality 直接跳过）。
+# v2.5 起非 root 分支改成接口绑定探测（ping -b / nc -b / curl --interface），
+# 仍然不碰路由表，而且比"按当前默认路由探测"更准——同网关双宿主下不会
+# 把默认口的探测结果当成这个接口的状态（那是假数据）。
+awk '/^probe_dev\(\)/,/^}/' "$SRC" | grep -q '非 root：按接口绑定探测' \
+    && ok "probe_dev 非 root 不加主机路由（接口绑定探测同样不碰路由表）" \
+    || bad "probe_dev 非 root 分支没了接口绑定探测，需确认不加主机路由"
 # measure_latency 的加路由条件是 root 且有网关，压平了查（分处两行）
 printf '%s\n' "$(awk '/^measure_latency\(\)/,/^}/' "$SRC")" | tr '\n' ' ' | tr -s ' ' \
     | grep -q 'id -u.*-eq 0.*&&.*-n "$gw"' \

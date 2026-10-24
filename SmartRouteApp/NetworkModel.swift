@@ -810,13 +810,19 @@ final class NetworkModel: ObservableObject {
             "TLS_PROBE","NOTIFY","AUTO_WIFI_POWER","BALANCE","BALANCE_MODE",
             "FASTEST_SWITCH_RATIO","FASTEST_RECHECK","WIFI_FAILOVER","WIFI_PREFERRED",
             "WIFI_FAILOVER_COOLDOWN","SPEED_TEST_URL","SPEED_TEST_URLS","SPEED_TEST_TIMEOUT",
-            "SPEED_RECHECK","LATENCY_RECHECK","SPEED_SWITCH_RATIO","WEIGHT_RECHECK",
+            "SPEED_RECHECK","LATENCY_RECHECK","LATENCY_AUTO","LATENCY_AUTO_RATIO",
+            "LATENCY_AUTO_GAP_MS","SPEED_SWITCH_RATIO","WEIGHT_RECHECK",
         ]
         let modes: Set<String> = ["auto","ethernet","wifi","speed","latency"]
-        let boolKeys: Set<String> = ["TLS_PROBE","NOTIFY","AUTO_WIFI_POWER","BALANCE","WIFI_FAILOVER"]
+        // LATENCY_AUTO 三键是 v2.3 延迟一票否决加的（smartroute.sh 的
+        // conf_value_ok 布尔/整数分支都在）。曾漏加：App 导入配置时这三行
+        // 被静默判 rejected，用户看到"已导入"，守护进程重载后键没了——
+        // 延迟一票否决形同虚设。mock_conf_drift.sh 守着这条线。
+        let boolKeys: Set<String> = ["TLS_PROBE","NOTIFY","AUTO_WIFI_POWER","BALANCE","WIFI_FAILOVER","LATENCY_AUTO"]
         let intKeys: Set<String> = ["OK_N","FAIL_N","COOLDOWN","PING_TIMEOUT","NC_TIMEOUT",
             "FASTEST_SWITCH_RATIO","FASTEST_RECHECK","WIFI_FAILOVER_COOLDOWN",
-            "SPEED_TEST_TIMEOUT","SPEED_RECHECK","LATENCY_RECHECK","SPEED_SWITCH_RATIO"]
+            "SPEED_TEST_TIMEOUT","SPEED_RECHECK","LATENCY_RECHECK","LATENCY_AUTO_RATIO",
+            "LATENCY_AUTO_GAP_MS","SPEED_SWITCH_RATIO"]
         var out = ""
         var rejected = 0
         for line in raw.components(separatedBy: "\n") {

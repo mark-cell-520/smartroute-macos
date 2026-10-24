@@ -767,7 +767,7 @@ probe_dev() {   # $1=设备 $2=网关
     targets="${targets# }"
     [ "$TLS_PROBE" = "1" ] || targets="$PROBE_TARGETS"
 
-    # [v2.5] 探测目标的出口必须真的是 $dev。同网关双宿主（这台机器两口都接
+    # [v2.5] 探测目标的出口必须真的是 ${dev}。同网关双宿主（这台机器两口都接
     # 192.168.1.1）时，route_add_host 的兜底形态（不带 -interface）由内核选
     # 出口——选成默认口。此时 added>0、函数返回成功，但 ping/nc/curl 一个都
     # 不会从 $dev 出去：三轮探测全部测的是另一个接口。后果不是"测错数"这么
@@ -1844,7 +1844,7 @@ cmd_status() {
     networksetup -listnetworkserviceorder 2>/dev/null | grep -v '^An asterisk' | sed '/^[[:space:]]*$/d;s/^/  /'
     echo
     if [ "$(id -u)" -ne 0 ]; then
-        echo "提示：未使用 sudo 运行，探测只能按“当前默认路由”进行，仅供参考。"
+        echo "提示：未使用 sudo 运行。本页展示的是守护进程（root）写入的状态；守护进程未安装或未运行时，判定结果可能为空或过期。"
     fi
     if [ -n "$eth_ip" ] && [ -n "$wifi_ip" ]; then
         local a b
@@ -1865,7 +1865,7 @@ cmd_test() {
     local verbose=0
     case "$1" in -v|--verbose) verbose=1 ;; esac
     if [ "$(id -u)" -ne 0 ]; then
-        echo "提示：非 root 运行，只能按“当前默认路由”探测，建议使用 sudo smartroute test"
+        echo "提示：非 root 运行也能分别探测两个接口——v2.5 起探测按接口绑定（ping -b / nc -b / curl --interface），不走默认路由，结果准确。sudo 仅在需要用主机路由法交叉验证时才值得。"
     fi
     find_active
     local eth_res="na" wifi_res="na" eth_detail="" wifi_detail="" _p
@@ -4826,8 +4826,8 @@ acquire_lock_wait() {   # $1=最多等待秒数（默认 8）
     # （App 调 quality 不带 sudo）。
     #
     # 而互斥的目的只是保护主机路由的增删，那件事本身就需要 root：
-    # probe_dev / measure_latency / cmd_quality 在非 root 下都走
-    # "按当前默认路由"的分支，根本不碰路由表，没有东西需要互斥。
+    # probe_dev / measure_latency / cmd_quality 在非 root 下都不碰路由表
+    # （probe_dev 走接口绑定，measure_latency 主路径 ping -b），没有东西需要互斥。
     # 所以非 root 放行是安全的，不是"放弃保护"。
     if [ ! -d "$LOCK_DIR" ] && [ "$(id -u)" -ne 0 ]; then
         return 0
@@ -4847,7 +4847,7 @@ acquire_lock_wait() {   # $1=最多等待秒数（默认 8）
     #
     # 旁路的论证对"目录已存在"同样成立：互斥只是为了保护主机路由的增删，
     # 而那件事本身就需要 root。非 root 下 probe_dev / measure_latency /
-    # cmd_quality 都走"按当前默认路由"的分支，根本不碰路由表，
+    # cmd_quality 都不碰路由表（接口绑定探测，v2.4/v2.5 起），
     # 没有东西需要互斥。所以放行是安全的，不是"放弃保护"。
     if [ "$(id -u)" -ne 0 ] && [ -d "$LOCK_DIR" ] && [ ! -w "$(dirname "$LOCK_DIR")" ]; then
         return 0
