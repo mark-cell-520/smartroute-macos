@@ -236,6 +236,12 @@ final class NetworkModel: ObservableObject {
     @Published var routeOkN = 2
     @Published var routeFailN = 3
     @Published var routeCooldown = 45
+    // [v2.3] 延迟一票否决（LATENCY_AUTO 三键）。默认值与 smartroute.sh 的
+    // 默认值区保持一致——App 显示 1/2/50，守护进程用的也是 1/2/50，
+    // 用户看到的和实际生效的必须是同一套。
+    @Published var routeLatencyAuto = true
+    @Published var routeLatencyAutoRatio = 2
+    @Published var routeLatencyAutoGapMs = 50
     // 网速/延时优先模式下展示的实测结果
     @Published var ethSpeed = "未测"
     @Published var wifiSpeed = "未测"
@@ -880,6 +886,9 @@ final class NetworkModel: ObservableObject {
         routeCooldown = Int(conf["COOLDOWN"] ?? "45") ?? 45
         speedRecheck = Int(conf["SPEED_RECHECK"] ?? "300") ?? 300
         latencyRecheck = Int(conf["LATENCY_RECHECK"] ?? "60") ?? 60
+        routeLatencyAuto = (conf["LATENCY_AUTO"] ?? "1") == "1"
+        routeLatencyAutoRatio = Int(conf["LATENCY_AUTO_RATIO"] ?? "2") ?? 2
+        routeLatencyAutoGapMs = Int(conf["LATENCY_AUTO_GAP_MS"] ?? "50") ?? 50
     }
 
     func saveRoutingConfig() {
@@ -895,6 +904,9 @@ final class NetworkModel: ObservableObject {
         check("OK_N", String(routeOkN))
         check("FAIL_N", String(routeFailN))
         check("COOLDOWN", String(routeCooldown))
+        check("LATENCY_AUTO", routeLatencyAuto ? "1" : "0")
+        check("LATENCY_AUTO_RATIO", String(routeLatencyAutoRatio))
+        check("LATENCY_AUTO_GAP_MS", String(routeLatencyAutoGapMs))
 
         guard !pending.isEmpty else {
             routingSavedText = "没有需要保存的更改"

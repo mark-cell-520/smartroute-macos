@@ -1111,7 +1111,7 @@ struct RoutingView: View {
         // 如果有线只有 100baseTX 而 Wi-Fi 快 3 倍，恢复后并不会切回去。
         // 描述和实际行为不一致时，用户会以为工具坏了——而他读的字面意思
         // 正是我们亲手写上去的。
-        "auto": "自动：两个接口谁有外网就走谁；两边都能上网时，挑实测吞吐更快的那条。\n差距不足 30% 会维持当前线路，避免来回切换。某条线断了会自动转移。",
+        "auto": "自动：两个接口谁有外网就走谁；两边都能上网时，挑实测吞吐更快的那条。\n差距不足 30% 会维持当前线路，避免来回切换。某条线断了会自动转移。\n例外：一条的延迟达到另一条的几倍且绝对差太大时，按延迟选（见下方「延迟一票否决」）——否则吞吐只快一点、延迟高二十倍的链路会把每个网页点击拖成卡顿。",
         "ethernet": "强制有线：只要以太网有外网就走以太网；以太网没外网时回退到 Wi-Fi（可用性优先于偏好），两条都没有才保持现状。",
         "wifi": "强制无线：只要 Wi-Fi 有外网就走 Wi-Fi，没外网时回退到以太网。适合网线口是局域网/坏口的情况。",
         // 名字造成的误解必须在这里拆掉。"网速优先"听起来像"让网变快"，
@@ -1179,6 +1179,23 @@ struct RoutingView: View {
                 Toggle("TLS 层探测（识别“假互联网”）", isOn: $model.routeTLS)
                 Toggle("切换时弹出系统通知", isOn: $model.routeNotify)
                 Toggle("以太网无外网时自动打开 Wi-Fi", isOn: $model.routeAutoWifi)
+            }
+            Section("延迟一票否决（仅自动模式）") {
+                Toggle("两边都能上网时，延迟差太悬殊按延迟选", isOn: $model.routeLatencyAuto)
+                if model.routeLatencyAuto {
+                    Stepper("慢的一条达到快条的 \(model.routeLatencyAutoRatio) 倍",
+                            value: $model.routeLatencyAutoRatio, in: 2...5)
+                    Stepper("且绝对差至少 \(model.routeLatencyAutoGapMs) 毫秒",
+                            value: $model.routeLatencyAutoGapMs, in: 20...500, step: 10)
+                    Text("自动模式两边都能上网时，默认挑实测吞吐更快的。但吞吐只差一点、"
+                         + "延迟却差出十几倍的链路，开网页照样卡——所以延迟太悬殊时延迟说了算。"
+                         + "两个条件都满足才否决；任一边测不到延迟则弃权，维持原判。")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+                if model.routeMode != "auto" {
+                    Text("当前不是自动模式，这一节暂不生效；切回“自动”后生效。")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
             }
             Section("判定阈值（防抖动）") {
                 Stepper("连续 \(model.routeOkN) 次成功 → 判定可用", value: $model.routeOkN, in: 1...10)
