@@ -143,6 +143,13 @@ let (_, rejBool) = NetworkModel.sanitizeConf("NOTIFY=yes\n")
 eqI(rejBool, 1, "NOTIFY=yes 被拒")
 isTrue(NetworkModel.sanitizeConf("NOTIFY=0\n").1 == 0, "NOTIFY=0 通过")
 
+// LATENCY_AUTO 三键曾漏加白名单（v2.3 加了 bash 侧忘了 Swift 侧），App 导入
+// 配置时这三行被静默判 rejected——界面显示"已导入"，守护进程重载后键没了。
+// 现在键表由 tools/gen_config_keys.py 从 bash 生成，这条断言守着生成链路
+// 真的通：生成文件被编译进来、三键都认。
+isTrue(NetworkModel.sanitizeConf("LATENCY_AUTO=1\nLATENCY_AUTO_RATIO=2\nLATENCY_AUTO_GAP_MS=50\n").1 == 0,
+       "LATENCY_AUTO 三键导入通过（bash->Swift 生成链路通）")
+
 // 数字键必须是非负整数
 let (_, rejNeg) = NetworkModel.sanitizeConf("OK_N=-1\n")
 eqI(rejNeg, 1, "负数被拒")

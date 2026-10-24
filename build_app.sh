@@ -49,6 +49,13 @@ fi
 echo "==> 注意：本脚本只编主机架构（$(uname -m)），仅用于本地开发调试"
 echo "          发布请用: bash build_release.sh"
 
+echo "==> 生成配置键白名单（从 smartroute.sh，杜绝 App/脚本清单漂移）"
+# sanitizeConf 的键表曾经在 Swift 里手写，和 bash 的 conf_value_ok 漂移过四次，
+# 每次都是"App 显示已导入、实际没生效"。现在 bash 是唯一事实源，每次构建前
+# 重生——打包进的 App 永远和它自带的 smartroute.sh 一致。
+# 仓库里那份提交版本由 tests/mock_conf_drift.sh 的 --check 盯着防腐烂。
+python3 tools/gen_config_keys.py || { echo "错误：生成配置键白名单失败" >&2; exit 1; }
+
 echo "==> 编译 Swift 源码（SwiftUI + AppKit）"
 # 源码用 glob，不手写清单：手写过两份（本文件和 build_release.sh 各一份），
 # 两次新增 .swift 都只改了一处，另一处漏掉直接编译失败。glob 从根上消除这个问题。

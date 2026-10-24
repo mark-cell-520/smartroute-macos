@@ -65,6 +65,11 @@ else
 fi
 
 # ---------- 2. 编译两个架构 ----------
+# 配置键白名单从 smartroute.sh 生成（ GeneratedConfigKeys.swift ）：
+# 手写时和 bash 的 conf_value_ok 漂移过四次，用户后果都是"App 显示已导入、
+# 实际没生效"。bash 是唯一事实源，发布构建前重生，保证 App 里的白名单和
+# 它自带的 smartroute.sh 一致。
+python3 tools/gen_config_keys.py || { echo "错误：生成配置键白名单失败" >&2; exit 1; }
 # 源码用 glob，和 build_app.sh 用同一套规则。
 # 曾经这里是手写清单，和 build_app.sh 各一份，两次新增 .swift 都只改了一处，
 # 另一处漏掉直接编译报 "cannot find 'X' in scope"。glob 从根上消除这个问题。

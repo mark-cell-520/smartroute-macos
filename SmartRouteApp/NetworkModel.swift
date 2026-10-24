@@ -805,24 +805,16 @@ final class NetworkModel: ObservableObject {
     /// 但 App 要先说清楚哪些行被丢了，不能假报"已导入并生效"）。
     /// - Returns: (干净内容, 被拒行数)
     static func sanitizeConf(_ raw: String) -> (String, Int) {
-        let validKeys: Set<String> = [
-            "MODE","OK_N","FAIL_N","COOLDOWN","PROBE_TARGETS","PING_TIMEOUT","NC_TIMEOUT",
-            "TLS_PROBE","NOTIFY","AUTO_WIFI_POWER","BALANCE","BALANCE_MODE",
-            "FASTEST_SWITCH_RATIO","FASTEST_RECHECK","WIFI_FAILOVER","WIFI_PREFERRED",
-            "WIFI_FAILOVER_COOLDOWN","SPEED_TEST_URL","SPEED_TEST_URLS","SPEED_TEST_TIMEOUT",
-            "SPEED_RECHECK","LATENCY_RECHECK","LATENCY_AUTO","LATENCY_AUTO_RATIO",
-            "LATENCY_AUTO_GAP_MS","SPEED_SWITCH_RATIO","WEIGHT_RECHECK",
-        ]
+        // 配置键白名单不手写：由 tools/gen_config_keys.py 从 smartroute.sh 的
+        // VALID_KEYS / conf_value_ok 分支生成（见 GeneratedConfigKeys.swift）。
+        // 手写时代码和 bash 漂移过四次（BALANCE_MODE 漏 weighted、SPEED_TEST_URL
+        // 没限协议、WEIGHT_RECHECK 缺失、LATENCY_AUTO 三键漏同步），用户后果
+        // 都是"App 显示已导入、实际没生效"。加配置键请改 smartroute.sh 后
+        // 重新生成，不要改这里。
+        let validKeys = GeneratedConfigKeys.valid
         let modes: Set<String> = ["auto","ethernet","wifi","speed","latency"]
-        // LATENCY_AUTO 三键是 v2.3 延迟一票否决加的（smartroute.sh 的
-        // conf_value_ok 布尔/整数分支都在）。曾漏加：App 导入配置时这三行
-        // 被静默判 rejected，用户看到"已导入"，守护进程重载后键没了——
-        // 延迟一票否决形同虚设。mock_conf_drift.sh 守着这条线。
-        let boolKeys: Set<String> = ["TLS_PROBE","NOTIFY","AUTO_WIFI_POWER","BALANCE","WIFI_FAILOVER","LATENCY_AUTO"]
-        let intKeys: Set<String> = ["OK_N","FAIL_N","COOLDOWN","PING_TIMEOUT","NC_TIMEOUT",
-            "FASTEST_SWITCH_RATIO","FASTEST_RECHECK","WIFI_FAILOVER_COOLDOWN",
-            "SPEED_TEST_TIMEOUT","SPEED_RECHECK","LATENCY_RECHECK","LATENCY_AUTO_RATIO",
-            "LATENCY_AUTO_GAP_MS","SPEED_SWITCH_RATIO"]
+        let boolKeys = GeneratedConfigKeys.boolKeys
+        let intKeys = GeneratedConfigKeys.intKeys
         var out = ""
         var rejected = 0
         for line in raw.components(separatedBy: "\n") {

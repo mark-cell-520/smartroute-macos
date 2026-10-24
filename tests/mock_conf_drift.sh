@@ -15,8 +15,13 @@ bad() { FAIL=$((FAIL+1)); printf '  XX %s\n' "$1"; }
 
 # 1) 键集合必须一致
 BASH_KEYS="$(grep -m1 '^VALID_KEYS=' smartroute.sh | sed 's/^VALID_KEYS="//; s/"$//' | tr ' ' '\n' | sed '/^$/d' | sort)"
-SWIFT_KEYS="$(sed -n '/let validKeys: Set<String> = \[/,/\]/p' SmartRouteApp/NetworkModel.swift \
-              | grep -o '"[A-Z_]*"' | tr -d '"' | sed '/^$/d' | sort)"
+# 键表改从生成文件读（bash 是唯一事实源，tools/gen_config_keys.py 产出）。
+# 多行数组必须用 sed 行域抓；单行 grep -o 只能抓到声明行。
+swift_set() {  # $1=声明锚点 -> 竖线分隔键表
+    sed -n "/$1/,/]/p" SmartRouteApp/GeneratedConfigKeys.swift \
+        | grep -o '"[A-Z_]*"' | tr -d '"' | tr '\n' '|' | sed 's/|$//'
+}
+SWIFT_KEYS="$(swift_set 'static let valid: Set<String> = \[' | tr '|' '\n' | sed '/^$/d' | sort)"
 n_b="$(printf '%s\n' "$BASH_KEYS" | wc -l | tr -d ' ')"
 n_s="$(printf '%s\n' "$SWIFT_KEYS" | wc -l | tr -d ' ')"
 if [ "$n_b" = "$n_s" ] && [ "$BASH_KEYS" = "$SWIFT_KEYS" ]; then
@@ -63,7 +68,7 @@ grep -q 'prefix.count' SmartRouteApp/NetworkModel.swift \
 # 锚点只写前三个键（前缀匹配），末尾追加新键不用改这行——曾经写死完整键表
 # 加右括号，v2.3 末尾补 LATENCY_AUTO 后直接匹配失败，bash 侧提取成空串。
 BASH_BOOL="$(grep -m1 'TLS_PROBE|NOTIFY|AUTO_WIFI_POWER' smartroute.sh | sed 's/^ *//; s/) *$//' | tr -d ' ')"
-SWIFT_BOOL="$(grep -m1 'let boolKeys: Set<String>' SmartRouteApp/NetworkModel.swift | grep -o '\[.*\]' | tr -d '[]"' | tr ',' '\n' | sed 's/^ *//; s/ *$//' | grep -v '^$' | tr '\n' '|' | sed 's/|$//')"
+SWIFT_BOOL="$(swift_set 'static let boolKeys: Set<String> = \[')"
 if [ "$(printf '%s' "$BASH_BOOL" | tr '|' '\n' | sort | tr '\n' ',')" = "$(printf '%s' "$SWIFT_BOOL" | tr '|' '\n' | sort | tr '\n' ',')" ]; then
     ok "布尔键集合一致（$(printf '%s' "$SWIFT_BOOL" | tr '|' ' ' | wc -w | tr -d ' ') 个）"
 else
@@ -73,7 +78,7 @@ fi
 
 # 5) 整数键集合一致
 BASH_INT="$(grep -m1 'OK_N|FAIL_N|COOLDOWN|PING_TIMEOUT' smartroute.sh | sed 's/^ *//; s/)$//' | tr -d ' ')"
-SWIFT_INT="$(sed -n '/let intKeys: Set<String> = \[/,/\]/p' SmartRouteApp/NetworkModel.swift | grep -o '"[A-Z_]*"' | tr -d '"' | tr '\n' '|' | sed 's/|$//')"
+SWIFT_INT="$(swift_set 'static let intKeys: Set<String> = \[')"
 if [ "$(printf '%s' "$BASH_INT" | tr '|' '\n' | sort | tr '\n' ',')" = "$(printf '%s' "$SWIFT_INT" | tr '|' '\n' | sort | tr '\n' ',')" ]; then
     ok "整数键集合一致（$(printf '%s' "$SWIFT_INT" | tr '|' ' ' | wc -w | tr -d ' ') 个）"
 else
@@ -82,11 +87,22 @@ else
 fi
 
 # 6) Swift 语法仍可解析（防改坏）
-if swiftc -parse SmartRouteApp/NetworkModel.swift >/dev/null 2>&1; then
-    ok "NetworkModel.swift 仍可解析"
+if swiftc -parse SmartRouteApp/NetworkModel.swift \
+        SmartRouteApp/GeneratedConfigKeys.swift >/dev/null 2>&1; then
+    ok "NetworkModel.swift 与生成文件仍可解析"
 else
-    bad "NetworkModel.swift 解析失败"
-    swiftc -parse SmartRouteApp/NetworkModel.swift 2>&1 | head -3 | sed 's/^/    /'
+    bad "NetworkModel.swift 或 GeneratedConfigKeys.swift 解析失败"
+    swiftc -parse SmartRouteApp/NetworkModel.swift \
+        SmartRouteApp/GeneratedConfigKeys.swift 2>&1 | head -3 | sed 's/^/    /'
+fi
+
+# 7) 生成文件必须与 bash 源同步——防腐烂的最后一道闸。
+#    改了 smartroute.sh 的键表却忘了重新生成/提交，这里必须红。
+#    生成器确定性输出，--check 只比对不写回。
+if python3 tools/gen_config_keys.py --check >/dev/null 2>&1; then
+    ok "生成文件与 smartroute.sh 同步（--check 通过）"
+else
+    bad "GeneratedConfigKeys.swift 与 bash 源不同步——跑 python3 tools/gen_config_keys.py 重新生成"
 fi
 
 echo ""
