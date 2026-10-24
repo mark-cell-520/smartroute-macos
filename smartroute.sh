@@ -103,11 +103,18 @@ SPEED_RECHECK=300           # 多久重新测一次网速（秒）。测速要�
 LATENCY_DEGRADE_RATIO=2     # 当前线路延迟是另一条的这个倍数以上，视为"可能变慢"，
                             # 提前重测吞吐（延迟探测只要几个包，比真下载便宜得多）
 LATENCY_RECHECK=60          # 多久重新测一次延迟（秒）
+# [v2.3] auto 模式的「延迟一票否决」。2026-10-24 实测案例：以太网 14ms /
+# Wi-Fi 400ms，而 Wi-Fi 的 bulk 吞吐只快 10%。只比吞吐会把用户钉在 400ms
+# 的链路上——"测速很快，开网页卡成狗"（每个交互往返 300-500ms）。
+# 延迟差悬殊时延迟说了算，差不多时才轮到吞吐。
+LATENCY_AUTO=1              # 1=开启延迟一票否决（默认）；0=关闭，恢复纯吞吐选路
+LATENCY_AUTO_RATIO=2        # 慢的一条 RTT 达到快条的几倍，算"悬殊"
+LATENCY_AUTO_GAP_MS=50      # 且两条的绝对差至少这么多 ms（防微差翻烧饼）
 SPEED_SWITCH_RATIO=30       # 判定"明显更快"的吞吐差阈值（百分比）。低于它就继续用当前线路，
                             # 避免在两条差不多的线路间来回切
 
 # 可用 set 命令修改的配置项
-VALID_KEYS="MODE OK_N FAIL_N COOLDOWN PROBE_TARGETS PING_TIMEOUT NC_TIMEOUT TLS_PROBE NOTIFY AUTO_WIFI_POWER BALANCE BALANCE_MODE FASTEST_SWITCH_RATIO WIFI_FAILOVER WIFI_PREFERRED WIFI_FAILOVER_COOLDOWN SPEED_TEST_URL SPEED_TEST_TIMEOUT SPEED_RECHECK LATENCY_RECHECK SPEED_SWITCH_RATIO FASTEST_RECHECK WEIGHT_RECHECK SPEED_TEST_URLS"
+VALID_KEYS="MODE OK_N FAIL_N COOLDOWN PROBE_TARGETS PING_TIMEOUT NC_TIMEOUT TLS_PROBE NOTIFY AUTO_WIFI_POWER BALANCE BALANCE_MODE FASTEST_SWITCH_RATIO WIFI_FAILOVER WIFI_PREFERRED WIFI_FAILOVER_COOLDOWN SPEED_TEST_URL SPEED_TEST_TIMEOUT SPEED_RECHECK LATENCY_RECHECK LATENCY_AUTO LATENCY_AUTO_RATIO LATENCY_AUTO_GAP_MS SPEED_SWITCH_RATIO FASTEST_RECHECK WEIGHT_RECHECK SPEED_TEST_URLS"
 
 CONF="/etc/smartroute.conf"                     # 系统级配置（root 维护，install.sh 生成）
 USER_CONF="/Users/Shared/smartroute.conf"       # 用户级配置（App/普通用户可写，优先级更高）
@@ -142,7 +149,7 @@ conf_value_ok() {
         #     尽管这个值是工具自己生成的
         #   · weighted 会话之后裸跑 balance on，静默变成 round-robin
         BALANCE_MODE)  case "$val" in round-robin|fastest|weighted) ;; *) return 1 ;; esac ;;
-        OK_N|FAIL_N|COOLDOWN|PING_TIMEOUT|NC_TIMEOUT|FASTEST_SWITCH_RATIO|FASTEST_RECHECK|WIFI_FAILOVER_COOLDOWN|SPEED_TEST_TIMEOUT|SPEED_RECHECK|LATENCY_RECHECK|SPEED_SWITCH_RATIO)
+        OK_N|FAIL_N|COOLDOWN|PING_TIMEOUT|NC_TIMEOUT|FASTEST_SWITCH_RATIO|FASTEST_RECHECK|WIFI_FAILOVER_COOLDOWN|SPEED_TEST_TIMEOUT|SPEED_RECHECK|LATENCY_RECHECK|LATENCY_AUTO_RATIO|LATENCY_AUTO_GAP_MS|SPEED_SWITCH_RATIO)
                        case "$val" in ''|*[!0-9]*) return 1 ;; esac
                        # 上界也要查。查过的实例：
                        #   OK_N=999999999999999999999 → 通过校验，
@@ -155,7 +162,7 @@ conf_value_ok() {
                        # 86400（一天）对这些键都是荒谬的上限：没有任何一个是
                        # "等一天"才有意义的配置。真实值远在它下面。
                        [ "$val" -le 86400 ] || return 1 ;;
-        TLS_PROBE|NOTIFY|AUTO_WIFI_POWER|BALANCE|WIFI_FAILOVER)
+        TLS_PROBE|NOTIFY|AUTO_WIFI_POWER|BALANCE|WIFI_FAILOVER|LATENCY_AUTO)
                        case "$val" in 0|1) ;; *) return 1 ;; esac ;;
         PROBE_TARGETS) case "$val" in *[!0-9.\ ]*) return 1 ;; esac ;;
         WIFI_PREFERRED) case "$val" in *[$'\n\r']*) return 1 ;; esac ;;
@@ -184,9 +191,9 @@ conf_value_hint() {   # $1=key -> stdout: 说明
     case "$1" in
         MODE)          echo "MODE 只能是 auto|ethernet|wifi|speed|latency" ;;
         BALANCE_MODE)  echo "BALANCE_MODE 只能是 round-robin|fastest|weighted" ;;
-        OK_N|FAIL_N|COOLDOWN|PING_TIMEOUT|NC_TIMEOUT|FASTEST_SWITCH_RATIO|FASTEST_RECHECK|WIFI_FAILOVER_COOLDOWN|SPEED_TEST_TIMEOUT|SPEED_RECHECK|LATENCY_RECHECK|SPEED_SWITCH_RATIO)
+        OK_N|FAIL_N|COOLDOWN|PING_TIMEOUT|NC_TIMEOUT|FASTEST_SWITCH_RATIO|FASTEST_RECHECK|WIFI_FAILOVER_COOLDOWN|SPEED_TEST_TIMEOUT|SPEED_RECHECK|LATENCY_RECHECK|LATENCY_AUTO_RATIO|LATENCY_AUTO_GAP_MS|SPEED_SWITCH_RATIO)
                        echo "$1 必须是非负整数" ;;
-        TLS_PROBE|NOTIFY|AUTO_WIFI_POWER|BALANCE|WIFI_FAILOVER)
+        TLS_PROBE|NOTIFY|AUTO_WIFI_POWER|BALANCE|WIFI_FAILOVER|LATENCY_AUTO)
                        echo "$1 只能是 0 或 1" ;;
         PROBE_TARGETS) echo "PROBE_TARGETS 只能是空格分隔的 IP" ;;
         WIFI_PREFERRED) echo "WIFI_PREFERRED 不能含换行" ;;
@@ -1463,35 +1470,70 @@ cmd_watch() {
             # 单连接测速时代两个数只差 4%（78.9 vs 82.3），加了也是噪声；
             # 多连接测速修好后差值稳定在 2.6-3.3 倍，这时候再不加就说不过去了。
             #
-            # 做法：两边都可用时，用实测吞吐当 tiebreaker；测不出来就退回原行为
-            # （有线优先）。不改变 auto 的可用性语义——某条线不通时照样转移。
+            # 【延迟一票否决】（2026-10-24 实测案例后追加，v2.3）
+            # 只比吞吐仍然会挑错线。实测这台机器：以太网 14ms，Wi-Fi 400ms，
+            # 而 Wi-Fi 的 bulk 吞吐只快 10%（50 vs 45 Mbps）。按吞吐选就把用户
+            # 钉在 400ms 的链路上——体感是"测速很快，开网页卡成狗"：
+            # 每个交互往返 300-500ms，一个页面十几个往返就是 5-10 秒，
+            # 而 10% 的吞吐差在体感上几乎不存在。延迟差悬殊时延迟说了算。
+            #
+            # 判据（两个条件同时满足才动用一票否决，避免把"差不多"的两条线
+            # 来回翻烧饼）：
+            #   1. 慢的一条 RTT >= LATENCY_AUTO_RATIO × 快的一条（默认 2 倍）
+            #   2. 两条绝对差 >= LATENCY_AUTO_GAP_MS（默认 50ms）
+            # 任一边没测到延迟（_metric_val 对 0/非数字/非正数返回空）→ 弃权，
+            # 走下面的吞吐逻辑，不基于不完整的数据猜。
+            # 代价：ensure_latency 缓存过期时多花约 1 秒（几个包的事），
+            # LATENCY_RECHECK（默认 60s）内走缓存，不拖慢 20 秒轮询。
             if [ "$eth_ok" -eq 1 ] && [ "$wifi_ok" -eq 1 ] \
                && [ -n "$ACTIVE_ETH_DEV" ] && [ -n "$ACTIVE_WIFI_DEV" ]; then
-                # 复用缓存（SPEED_RECHECK 秒内不真下载），不拖慢轮询。
-                # force 传空：auto 不该为了选路而强制下载，那会把 20 秒的
-                # 轮询周期拉长好几秒。
-                ensure_throughput "$ACTIVE_ETH_DEV" "$ACTIVE_WIFI_DEV"
-                local _ae _aw _apick
-                _ae="$(_metric_val "speed_$ACTIVE_ETH_DEV")"
-                _aw="$(_metric_val "speed_$ACTIVE_WIFI_DEV")"
-                _apick="$(pick_by_speed "$ACTIVE_ETH_DEV" "$_ae" "$ACTIVE_WIFI_DEV" "$_aw")"
-                # ⚠️ 空值的含义是"任一边没测到"，不只是"两边都没测到"。
-                # pick_by_speed 已改成一方缺数据就整体弃权——因为一方是 0
-                # 表示没测到（探测超时/源不可用/刚装上前两轮为空），
-                # 不表示另一方更快。据此切走会把用户从一条可能完全正常的
-                # 线上赶走，而依据根本不存在。
-                # 弃权后保持现状；线真坏了由 probe_dev 的可用性探测兜底切走，
-                # 两条机制互补，不会卡住。代价是这一轮不按速度选路，
-                # 而下一次 ensure_throughput 最多等 SPEED_RECHECK（默认 300 秒）。
-                case "$_apick" in
-                    "")   want="" ;;      # 任一边没测到 → 保持现状，不猜
-                    tie)  want="$cur" ;;  # 差距不够大，别折腾
-                    *)    want="$_apick" ;;
-                esac
-                # 只在真的选了更快的那条时才说话。tie/测不出来时安静，
-                # 否则每轮都刷一条日志，用户看不过来。
-                if [ -n "$_apick" ] && [ "$_apick" != "tie" ]; then
-                    log "自动选路: eth=$(fmt_bps "${_ae:-0}") wifi=$(fmt_bps "${_aw:-0}") -> ${_apick}"
+                local _ae _aw _apick _le _lw
+                _ae=""; _aw=""; _le=""; _lw=""
+                if [ "${LATENCY_AUTO:-1}" = "1" ]; then
+                    ensure_latency "$ACTIVE_ETH_DEV" "$(svc_router "$ACTIVE_ETH_SVC")" \
+                                   "$ACTIVE_WIFI_DEV" "$(svc_router "$ACTIVE_WIFI_SVC")"
+                    _le="$(_metric_val "lat_$ACTIVE_ETH_DEV")"
+                    _lw="$(_metric_val "lat_$ACTIVE_WIFI_DEV")"
+                fi
+                # awk 比小数：延迟是 14.3 这样的值，shell 整数比较要先补齐
+                # 位数还要防八进制（08），pick_fastest 本来就用 awk，统一做法。
+                if [ -n "$_le" ] && [ -n "$_lw" ] \
+                   && awk -v a="$_le" -v b="$_lw" -v r="${LATENCY_AUTO_RATIO:-2}" \
+                          -v g="${LATENCY_AUTO_GAP_MS:-50}" \
+                          'BEGIN{ hi=(a+0>b+0)?a+0:b+0; lo=(a+0>b+0)?b+0:a+0;
+                                  exit !(a+0>0 && b+0>0 && hi>=lo*r && hi-lo>=g) }'; then
+                    _apick="$(awk -v a="$_le" -v b="$_lw" \
+                              -v e="$ACTIVE_ETH_DEV" -v w="$ACTIVE_WIFI_DEV" \
+                              'BEGIN{ print (a+0<=b+0)?e:w }')"
+                    want="$_apick"
+                    log "自动选路(延迟优先): eth=${_le}ms wifi=${_lw}ms -> ${_apick}"
+                    log "  延迟差距达到 ${LATENCY_AUTO_RATIO:-2} 倍且超过 ${LATENCY_AUTO_GAP_MS:-50}ms，交互优先，吞吐让位"
+                else
+                    # 复用缓存（SPEED_RECHECK 秒内不真下载），不拖慢轮询。
+                    # force 传空：auto 不该为了选路而强制下载，那会把 20 秒的
+                    # 轮询周期拉长好几秒。
+                    ensure_throughput "$ACTIVE_ETH_DEV" "$ACTIVE_WIFI_DEV"
+                    _ae="$(_metric_val "speed_$ACTIVE_ETH_DEV")"
+                    _aw="$(_metric_val "speed_$ACTIVE_WIFI_DEV")"
+                    _apick="$(pick_by_speed "$ACTIVE_ETH_DEV" "$_ae" "$ACTIVE_WIFI_DEV" "$_aw")"
+                    # ⚠️ 空值的含义是"任一边没测到"，不只是"两边都没测到"。
+                    # pick_by_speed 已改成一方缺数据就整体弃权——因为一方是 0
+                    # 表示没测到（探测超时/源不可用/刚装上前两轮为空），
+                    # 不表示另一方更快。据此切走会把用户从一条可能完全正常的
+                    # 线上赶走，而依据根本不存在。
+                    # 弃权后保持现状；线真坏了由 probe_dev 的可用性探测兜底切走，
+                    # 两条机制互补，不会卡住。代价是这一轮不按速度选路，
+                    # 而下一次 ensure_throughput 最多等 SPEED_RECHECK（默认 300 秒）。
+                    case "$_apick" in
+                        "")   want="" ;;      # 任一边没测到 → 保持现状，不猜
+                        tie)  want="$cur" ;;  # 差距不够大，别折腾
+                        *)    want="$_apick" ;;
+                    esac
+                    # 只在真的选了更快的那条时才说话。tie/测不出来时安静，
+                    # 否则每轮都刷一条日志，用户看不过来。
+                    if [ -n "$_apick" ] && [ "$_apick" != "tie" ]; then
+                        log "自动选路: eth=$(fmt_bps "${_ae:-0}") wifi=$(fmt_bps "${_aw:-0}") -> ${_apick}"
+                    fi
                 fi
             elif [ "$eth_ok" -eq 1 ] && [ -n "$ACTIVE_ETH_DEV" ]; then
                 want="$ACTIVE_ETH_DEV"
@@ -2076,6 +2118,11 @@ cmd_doctor() {
     # 五个模式都要列。原来只写三个，用户选了"网速优先"后看体检报告，
     # 会以为自己的设置没生效——又是"界面说的和实际不一样"。
     echo "    选路模式: ${MODE}（auto=谁有外网走谁 / ethernet=强制有线 / wifi=强制无线 / speed=网速优先 / latency=延时优先）"
+    # [v2.3] auto 模式的延迟一票否决要在体检里可见，否则用户看不到
+    # "为什么流量在这条线上"——又是界面说的和实际不一样。
+    if [ "${LATENCY_AUTO:-1}" = "1" ] && [ "$MODE" = "auto" ]; then
+        echo "    延迟一票否决: 开启（两条线延迟差 ${LATENCY_AUTO_RATIO} 倍以上且超过 ${LATENCY_AUTO_GAP_MS}ms 时按延迟选，否则按吞吐选）"
+    fi
 
     echo
     echo "[7] smartroute 运行状态"

@@ -55,6 +55,7 @@ sed -e "s|^CONF=.*|CONF=\"$T/etc/smartroute.conf\"|" \
 #   ETH_LAT / WIFI_LAT   测得的延迟（latency 模式用）
 runwatch() {
     : > "$T/calls.log"
+    : > "$T/watch.log"
     bash -c "
         export PATH='$T/bin:/usr/bin:/bin:/usr/sbin:/sbin'
         . '$T/sr.sh'
@@ -70,7 +71,7 @@ runwatch() {
         default_dev() { echo \"\${CUR_DEV:-en1}\"; }
         svc_router()  { [ \"\$1\" = 'Ethernet' ] && echo '192.168.1.1' || echo '192.168.1.1'; }
         do_switch()   { echo \"switch \$1\" >> '$T/calls.log'; }
-        log()         { :; }
+        log()         { echo \"\$*\" >> '$T/watch.log'; }
         notify()      { :; }
         apply_rules() { :; }
         wifi_failover_if_needed() { :; }
@@ -86,6 +87,9 @@ runwatch() {
         }
         _metric_fresh() { return 0; }
         MODE=\"\$MODE_V\"
+        LATENCY_AUTO=\"\${LATENCY_AUTO_V:-1}\"
+        LATENCY_AUTO_RATIO=\"\${LATENCY_AUTO_RATIO_V:-2}\"
+        LATENCY_AUTO_GAP_MS=\"\${LATENCY_AUTO_GAP_MS_V:-50}\"
         COOLDOWN=\"\${COOLDOWN_V:-45}\"
         [ -n \"\${LAST_SWITCH:-}\" ] && state_set last_switch \"\$LAST_SWITCH\"
         cmd_watch
@@ -373,3 +377,67 @@ echo "$out" | grep -q "默认路由已稳定" && bad "退避途中谎报稳定" 
 echo ""
 echo "结果: $PASS 通过, $FAIL 失败"
 [ "$FAIL" -eq 0 ]
+
+# ════════════════════════════════════════════════════════════════
+# 5. MODE=auto：延迟一票否决（v2.3，2026-10-24 实测案例）
+#
+# 背景：这台机器以太网 14ms、Wi-Fi 400ms，而 Wi-Fi 的 bulk 吞吐只快
+# 10%（50 vs 45 Mbps）。auto 原来只比吞吐，于是把用户钉在 400ms 的
+# 链路上——"测速很快，开网页卡成狗"：每个交互往返 300-500ms，
+# 一个页面十几个往返就是 5-10 秒，而 10% 的吞吐差体感上几乎不存在。
+#
+# 修法：两边都可用时，延迟差达到 LATENCY_AUTO_RATIO 倍以上**且**
+# 绝对差超过 LATENCY_AUTO_GAP_MS，按延迟选；否则才轮到吞吐。
+# 任一边没测到延迟 → 弃权走吞吐逻辑，不猜。
+#
+# 反向验证：摘除延迟分支（恢复纯吞吐逻辑）后，下面第 1、2 两例
+# 必然失败——mock 里两边吞吐都是 0（没测速），pick_by_speed 判 tie，
+# want=cur，绝不会切到另一条线。
+# ════════════════════════════════════════════════════════════════
+echo "== 5. MODE=auto：延迟一票否决（v2.3）=="
+
+# 1. 实测场景：当前在 Wi-Fi（400ms），有线 14ms → 拉回有线
+rm -f "$T/state/state"; seed_ok eth 2; seed_ok wifi 2
+o="$(ETH_RES=ok WIFI_RES=ok CUR_DEV=en1 MODE_V=auto ETH_LAT=14 WIFI_LAT=400 runwatch)"
+[ "$(want_of "$o")" = "en0" ] && ok "Wi-Fi 延迟 28 倍于有线 → 切回有线（延迟一票否决）" \
+    || bad "延迟悬殊时 want=$(want_of "$o")，期望 en0"
+grep -q "^switch en0$" "$T/calls.log" && ok "真的执行了切换到有线" || bad "算出 want=en0 却没切换"
+grep -q "延迟优先" "$T/watch.log" && ok "日志说明选路依据是延迟（不是黑箱切换）" || bad "日志没说按延迟选"
+
+# 2. 反向：当前在有线（400ms），Wi-Fi 14ms → 切 Wi-Fi
+rm -f "$T/state/state"; seed_ok eth 2; seed_ok wifi 2
+o="$(ETH_RES=ok WIFI_RES=ok CUR_DEV=en0 MODE_V=auto ETH_LAT=400 WIFI_LAT=14 runwatch)"
+[ "$(want_of "$o")" = "en1" ] && ok "有线延迟爆炸 → 切 Wi-Fi" || bad "反向场景 want=$(want_of "$o")，期望 en1"
+
+# 3. 差距不够悬殊（差 6ms < 50ms）→ 不吃一票否决，不翻烧饼
+rm -f "$T/state/state"; seed_ok eth 2; seed_ok wifi 2
+o="$(ETH_RES=ok WIFI_RES=ok CUR_DEV=en0 MODE_V=auto ETH_LAT=14 WIFI_LAT=20 runwatch)"
+grep -q "^switch" "$T/calls.log" && bad "微延迟差（6ms<50ms）也切换，会翻烧饼" || ok "微延迟差（6ms<50ms）→ 不切换"
+
+# 4. 倍数够但绝对差不够（14 vs 60ms：4.3 倍但差 46ms<50ms）→ 不切换
+rm -f "$T/state/state"; seed_ok eth 2; seed_ok wifi 2
+o="$(ETH_RES=ok WIFI_RES=ok CUR_DEV=en1 MODE_V=auto ETH_LAT=14 WIFI_LAT=60 runwatch)"
+grep -q "^switch" "$T/calls.log" && bad "倍数够但绝对差不够（46ms<50ms）也切换" || ok "倍数够但绝对差不够（46ms<50ms）→ 不切换"
+
+# 5. 一边没测到延迟（0=没数据，_metric_val 对 0 返回空）→ 弃权，不猜
+rm -f "$T/state/state"; seed_ok eth 2; seed_ok wifi 2
+o="$(ETH_RES=ok WIFI_RES=ok CUR_DEV=en1 MODE_V=auto ETH_LAT=14 WIFI_LAT=0 runwatch)"
+grep -q "^switch" "$T/calls.log" && bad "一边没测到延迟却切换（基于不完整数据决策）" || ok "一边无延迟数据 → 弃权保持"
+
+# 6. LATENCY_AUTO=0 → 恢复纯吞吐行为（延迟再悬殊也不动用
+rm -f "$T/state/state"; seed_ok eth 2; seed_ok wifi 2
+o="$(ETH_RES=ok WIFI_RES=ok CUR_DEV=en1 MODE_V=auto LATENCY_AUTO_V=0 ETH_LAT=14 WIFI_LAT=400 runwatch)"
+grep -q "^switch" "$T/calls.log" && bad "LATENCY_AUTO=0 还在按延迟切" || ok "LATENCY_AUTO=0 → 延迟一票否决关闭"
+
+# 7. 自定义阈值：GAP=100ms 时，86ms 的差不再算悬殊（阈值真的在起作用）
+rm -f "$T/state/state"; seed_ok eth 2; seed_ok wifi 2
+o="$(ETH_RES=ok WIFI_RES=ok CUR_DEV=en1 MODE_V=auto LATENCY_AUTO_GAP_MS_V=100 ETH_LAT=14 WIFI_LAT=100 runwatch)"
+grep -q "^switch" "$T/calls.log" && bad "GAP=100ms 时 86ms 差仍切换（自定义阈值没生效）" || ok "GAP=100ms 时 86ms 差不切换（阈值生效）"
+rm -f "$T/state/state"; seed_ok eth 2; seed_ok wifi 2
+o="$(ETH_RES=ok WIFI_RES=ok CUR_DEV=en1 MODE_V=auto LATENCY_AUTO_GAP_MS_V=80 ETH_LAT=14 WIFI_LAT=100 runwatch)"
+[ "$(want_of "$o")" = "en0" ] && ok "GAP=80ms 时 86ms 差触发切换（阈值下限可调）" || bad "阈值调小却不触发，want=$(want_of "$o")"
+
+# 8. 有一条线不通时，一票否决不适用——可用性探测照常切（断网优先于选优）
+rm -f "$T/state/state"; seed_streak wifi 3; seed_ok eth 2
+o="$(ETH_RES=ok WIFI_RES=fail CUR_DEV=en1 MODE_V=auto ETH_LAT=14 WIFI_LAT=400 runwatch)"
+[ "$(want_of "$o")" = "en0" ] && ok "Wi-Fi 断了照样切有线（可用性语义不变）" || bad "断网场景 want=$(want_of "$o")，期望 en0"
