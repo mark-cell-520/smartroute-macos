@@ -19,7 +19,9 @@ PAT='\$[A-Za-z_][A-Za-z0-9_]*[^ -~]'
 
 for f in smartroute.sh install.sh uninstall.sh; do
     [ -f "$f" ] || continue
-    n="$(grep -c "$PAT" "$f" 2>/dev/null)"; n="${n:-0}"
+    # 注释行不展开变量，是安全的（文件头声明过）——剔除注释行再数，
+    # 否则每条提到 $var。的注释都会把这个检查烤红，真信号被淹没。
+    n="$(grep -v '^[[:space:]]*#' "$f" 2>/dev/null | grep -c "$PAT")"; n="${n:-0}"
     if [ "$n" -eq 0 ]; then
         ok "$f 无全角紧跟变量名"
     else
@@ -48,3 +50,6 @@ rm -f /tmp/sr_trap_probe.$$
 
 echo ""
 echo "结果: $((checks - failures)) 通过, $failures 失败"
+# 必须非零退出：这个文件曾经只打印失败数、rc 恒为 0，全套测试的循环
+# 永远看不到它红——"打印了失败"不等于"会失败"。
+[ "$failures" -eq 0 ]

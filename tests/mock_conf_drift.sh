@@ -37,7 +37,7 @@ check_mode() {  # $1=键 $2=合法值列表（bash 的 case 分支）
         *) s="" ;;
     esac
     [ -n "$s" ] || return 0
-    if [ "$b" = "$s" ]; then ok "$1 取值一致（$s）"; else bad "$1 取值不一致：bash=[$b] 期望=[$s]"; fi
+    if [ "$b" = "$s" ]; then ok "$1 取值一致（${s}）"; else bad "$1 取值不一致：bash=[$b] 期望=[$s]"; fi
 }
 check_mode MODE
 check_mode BALANCE_MODE

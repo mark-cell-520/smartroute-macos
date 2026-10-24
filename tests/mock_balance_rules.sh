@@ -533,7 +533,7 @@ _pf_line=$(awk -v t="$_trap_line" 'NR>t && /pfctl -a "\$PF_ANCHOR" -f "\$PF_ANCH
 if [ -n "$_trap_line" ] && [ -n "$_pf_line" ] && [ "$_trap_line" -lt "$_pf_line" ]; then
     ok "trap 挂在加载 pf 之前（第 $_trap_line 行 < 第 $_pf_line 行）"
 else
-    bad "trap 挂在加载 pf 之后或没挂（$_trap_line / $_pf_line），中断会漏还原"
+    bad "trap 挂在加载 pf 之后或没挂（${_trap_line} / ${_pf_line}），中断会漏还原"
 fi
 # 成功路径必须摘掉 trap，否则它会渗到后续命令里。
 #
@@ -552,7 +552,7 @@ if [ -n "$_winner_line" ]; then
     if [ "$_next_line" = "    trap - INT TERM" ]; then
         ok "成功路径摘掉 trap（紧跟在 winner 之后，不渗到后续命令）"
     else
-        bad "成功路径没紧跟着摘 trap（下一行是: $_next_line）"
+        bad "成功路径没紧跟着摘 trap（下一行是: ${_next_line}）"
     fi
 else
     bad "找不到 state_set balance_winner \"\$only\""

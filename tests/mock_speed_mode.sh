@@ -180,7 +180,7 @@ out="$(run 'pick_by_speed en0 1000000 en1 1400000')"
 # 改成弃权（返回空），由调用方按可用性兜底。这和 probe_dev 的可用性
 # 探测是互补的：线真坏了时可用性会判 fail 并切走，不会卡住。
 out="$(run 'pick_by_speed en0 0 en1 1100000')"
-[ -z "$out" ] && ok "一边没测到 → 弃权（不假设另一边更快）" || bad "得到: $out（会把没测到当成另一边更快）"
+[ -z "$out" ] && ok "一边没测到 → 弃权（不假设另一边更快）" || bad "得到: ${out}（会把没测到当成另一边更快）"
 out="$(run 'pick_by_speed en0 1100000 en1 0')"
 [ -z "$out" ] && ok "另一边没测到 → 同样弃权" || bad "得到: $out"
 out="$(run 'pick_by_speed en0 0 en1 0')"

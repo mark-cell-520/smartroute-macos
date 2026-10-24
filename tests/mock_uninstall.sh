@@ -217,13 +217,13 @@ if [ -f "$UNI" ]; then
         printf '%s\n' $_defs | grep -qx "$_c" && continue
         # 只报告"smartroute.sh 里有定义、而 uninstall.sh 里没有"的
         if grep -q "^${_c}()" "$SRC" 2>/dev/null; then
-            bad "uninstall.sh 调用了 smartroute.sh 才有的函数：$_c（本文件未定义也未 source）"
+            bad "uninstall.sh 调用了 smartroute.sh 才有的函数：${_c}（本文件未定义也未 source）"
             _cross=$(( _cross + 1 ))
         fi
     done
     [ "$_cross" -eq 0 ] && ok "uninstall.sh 没有跨脚本调用未定义函数（不会把用户留在断网状态）"
 else
-    bad "找不到 uninstall.sh（$UNI）"
+    bad "找不到 uninstall.sh（${UNI}）"
 fi
 
 

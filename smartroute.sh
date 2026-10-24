@@ -767,6 +767,18 @@ probe_dev() {   # $1=设备 $2=网关
     targets="${targets# }"
     [ "$TLS_PROBE" = "1" ] || targets="$PROBE_TARGETS"
 
+    # [v2.5] 探测目标的出口必须真的是 $dev。同网关双宿主（这台机器两口都接
+    # 192.168.1.1）时，route_add_host 的兜底形态（不带 -interface）由内核选
+    # 出口——选成默认口。此时 added>0、函数返回成功，但 ping/nc/curl 一个都
+    # 不会从 $dev 出去：三轮探测全部测的是另一个接口。后果不是"测错数"这么
+    # 轻——**Wi-Fi 死了也会被探成 ok**，该故障切换时切过去，用户直接断网。
+    # measure_latency（v2.4）已用出口验证解决同一问题，这里补上。
+    #
+    # 兜底：一个目标都验证不过 → 改用接口绑定探测（ping -b / nc -b /
+    # curl --interface，macOS 三者都支持，2026-10-24 实测有效），不依赖
+    # 路由表。路由模式只探测验证过出口的目标；未验证的目标会走进错口，
+    # 宁可不用（这是"拒绝假数据"原则在可用性探测上的应用）。
+    local _pb="" _nb="" _cb="" _ptargets="" _vok=0 _via
     if [ "$(id -u)" -eq 0 ] && [ -n "$gw" ]; then
         # 先清理上次被中断时残留的探测路由，保证每次探测环境干净、可重复
         cleanup_probe_routes
@@ -778,13 +790,37 @@ probe_dev() {   # $1=设备 $2=网关
             set_probe_detail "网关 $gw 不可达（无法添加主机路由）"
             probe_out fail "网关 $gw 不可达（无法添加主机路由）"; return
         fi
+        # 逐目标验证出口。_via 为空 = 没探到出口，采信 route_add_host 的判断；
+        # 非空且不是 $dev = 确凿的走错口（同网关双宿主的典型形态）。
+        for t in $targets; do
+            _via="$(route -n get "$t" 2>/dev/null | sed -n 's/^[[:space:]]*interface:[[:space:]]*//p' | head -1)"
+            if [ -z "$_via" ] || [ "$_via" = "$dev" ]; then
+                _ptargets="$_ptargets $t"; _vok=$((_vok+1))
+            fi
+        done
+        _ptargets="${_ptargets# }"
+        if [ "$_vok" -eq 0 ]; then
+            # 全部目标都指不出去：路由层帮不上忙。清掉刚加的路由——留着它们，
+            # 后续的 ping/nc/curl 会经错口"成功"，正是要防的假活。
+            cleanup_probe_routes
+            added=0
+            _pb="-b $dev"; _nb="-b $dev"; _cb="--interface $dev"
+            set_probe_detail "主机路由无法绑定 ${dev}（同网关双宿主），改用接口绑定探测"
+        fi
     elif [ -z "$gw" ]; then
         # 有 IP 但没有网关（例如 169.254 自分配地址），不可能有外网
         set_probe_detail "有 IP 但无网关（可能是 169.254 自分配地址）"
         probe_out fail "有 IP 但无网关（可能是 169.254 自分配地址）"; return
     else
-        set_probe_detail "非 root：按当前默认路由探测"
+        # [v2.5] 非 root 也不再"按默认路由探测"——那会把默认路由的探测结果
+        # 当成另一个接口的状态（假数据）。改用接口绑定：ping -b / nc -b /
+        # curl --interface 都不需要 root，实测普通用户下分别测得准。
+        _pb="-b $dev"; _nb="-b $dev"; _cb="--interface $dev"
+        _ptargets="$targets"
+        set_probe_detail "非 root：按接口绑定探测"
     fi
+    # 路由模式下只探测验证过出口的目标；绑定模式下用全部目标
+    [ -n "$_ptargets" ] || _ptargets="$targets"
 
     # ── 三轮探测：并行发出，但不等全部，谁先通谁算 ──
     #
@@ -871,10 +907,10 @@ probe_dev() {   # $1=设备 $2=网关
     if [ -n "$_T" ]; then
         _tried=""
         _n=0
-        for t in $targets; do
+        for t in $_ptargets; do
             _tried="$_tried $t"
             _n=$(( _n + 1 ))
-            if ping -c 1 -W "$PING_TIMEOUT" "$t" >/dev/null 2>&1; then
+            if ping $_pb -c 1 -W "$PING_TIMEOUT" "$t" >/dev/null 2>&1; then
                 ping_ok=1; ok=0; : > "$_T/ping_$t"; break
             fi
             [ "$_n" -ge 2 ] && break
@@ -883,9 +919,9 @@ probe_dev() {   # $1=设备 $2=网关
         # 再串行下去还要 4s；并行只要 0.8s。
         if [ "$ping_ok" -ne 1 ] && [ -n "$_T" ]; then
             _pids=""
-            for t in $targets; do
+            for t in $_ptargets; do
                 case " $_tried " in *" $t "*) continue ;; esac
-                ( ping -c 1 -W "$PING_TIMEOUT" "$t" >/dev/null 2>&1 && : > "$_T/ping_$t" ) &
+                ( ping $_pb -c 1 -W "$PING_TIMEOUT" "$t" >/dev/null 2>&1 && : > "$_T/ping_$t" ) &
                 _pids="$_pids $!"
             done
             # PING_TIMEOUT 是毫秒，这里换算成秒（向上取整，至少 1 秒）
@@ -897,7 +933,7 @@ probe_dev() {   # $1=设备 $2=网关
             else
                 wait 2>/dev/null
             fi
-            for t in $targets; do [ -f "$_T/ping_$t" ] && { ping_ok=1; break; }; done
+            for t in $_ptargets; do [ -f "$_T/ping_$t" ] && { ping_ok=1; break; }; done
         fi
     fi
 
@@ -905,9 +941,9 @@ probe_dev() {   # $1=设备 $2=网关
     # 最坏从 28s 降到 2s。
     if [ "$ok" -ne 0 ] && [ -n "$_T" ]; then
         _pids=""
-        for t in $targets; do
+        for t in $_ptargets; do
             for p_ in 53 443; do
-                ( nc -z -w "$NC_TIMEOUT" "$t" "$p_" >/dev/null 2>&1 && : > "$_T/tcp_${t}_${p_}" ) &
+                ( nc $_nb -z -w "$NC_TIMEOUT" "$t" "$p_" >/dev/null 2>&1 && : > "$_T/tcp_${t}_${p_}" ) &
                 _pids="$_pids $!"
             done
         done
@@ -917,7 +953,7 @@ probe_dev() {   # $1=设备 $2=网关
         else
             wait 2>/dev/null
         fi
-        for t in $targets; do
+        for t in $_ptargets; do
             for p_ in 53 443; do
                 [ -f "$_T/tcp_${t}_${p_}" ] && { tcp_ok=1; break 2; }
             done
@@ -928,8 +964,8 @@ probe_dev() {   # $1=设备 $2=网关
     if [ "$ok" -ne 0 ] && [ "$TLS_PROBE" = "1" ] && command -v curl >/dev/null 2>&1 && [ -n "$_T" ]; then
         _pids=""
         for t in 1.1.1.1 8.8.8.8; do
-            case " $targets " in *" $t "*) ;; *) continue ;; esac
-            ( curl -s -m 4 -o /dev/null "https://$t/" 2>/dev/null && : > "$_T/tls_$t" ) &
+            case " $_ptargets " in *" $t "*) ;; *) continue ;; esac
+            ( curl $_cb -s -m 4 -o /dev/null "https://$t/" 2>/dev/null && : > "$_T/tls_$t" ) &
             _pids="$_pids $!"
         done
         if _probe_wait_any "$_T" "tls_" 4; then
@@ -939,7 +975,7 @@ probe_dev() {   # $1=设备 $2=网关
             wait 2>/dev/null
         fi
         for t in 1.1.1.1 8.8.8.8; do
-            case " $targets " in *" $t "*) ;; *) continue ;; esac
+            case " $_ptargets " in *" $t "*) ;; *) continue ;; esac
             [ -f "$_T/tls_$t" ] && { tls_ok=1; break; }
         done
     fi
@@ -3750,7 +3786,7 @@ balance_quality_gate() {
     local _qge _qgw _qle _qlw
     _qge="$(svc_router "$ACTIVE_ETH_SVC")"; _qgw="$(svc_router "$ACTIVE_WIFI_SVC")"
     if [ -n "$_qge" ] && [ "$_qge" = "$_qgw" ]; then
-        log "并发分流质量守门: 两接口同网关（$_qge）——一条 WAN 的两个入口，分流零收益且有卡死风险，关闭"
+        log "并发分流质量守门: 两接口同网关（${_qge}）——一条 WAN 的两个入口，分流零收益且有卡死风险，关闭"
         balance_off quiet
         notify "SmartRoute 双网并发" "两个接口走同一台路由器（同网关），双网并发不会提速反而会让网页卡壳，已自动关闭"
         return 0
