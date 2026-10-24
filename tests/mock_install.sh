@@ -226,6 +226,39 @@ grep -q 'sudo launchctl print "system/\$PLIST_LABEL"' install.sh \
 _code_or="$(grep -v '^[[:space:]]*#' install.sh | grep -c '|| true')"
 [ "$_code_or" -eq 0 ] && ok "没有 '|| true' 静默吞失败" || bad "原文件里还有 $_code_or 处 '|| true' 吞失败"
 
+echo "== 13. App 候选按版本号选最新，且不提供降级命令 =="
+# 出过真事：候选列表写死顺序，永远取 dist/SmartRoute-2.2（10 月 19 日的 2.2
+# 构建），install.sh 于是每次重装都提示"App 是旧版"并给出把用户降级回 2.2 的
+# 复制命令——而仓库根的 SmartRoute.app 才是当前源码构建的 2.5。用户照抄提示
+# 就把 v2.3-v2.5 的改进全丢了。现在按 CFBundleShortVersionString 选最大。
+
+# 13a) 抽真的选择逻辑来跑（不重写一遍，重写就会和源漂移）
+_sel_block="$(awk '/^NEWAPP=""; NEWVER=""$/,/^fi$/' install.sh)"
+[ -n "$_sel_block" ] && ok "能从 install.sh 抽出候选选择块" || bad "选择块没了（被改名或删了？）"
+NEWAPP=""; NEWVER=""; _cands=""
+eval "$_sel_block"
+if [ "$NEWVER" = "2.5" ] && [ "$NEWAPP" = "$(pwd)/SmartRoute.app" ]; then
+    ok "三个候选里选中版本最高的（$NEWVER → 仓库根 SmartRoute.app）"
+else
+    bad "选错了：版本 $NEWVER 路径 $NEWAPP（dist 里两个 2.2 不应赢）"
+fi
+
+# 13b) 版本比较的语义：sort -V 必须是版本序不是字典序
+#     （2.10 > 2.9；字符串比较会判反，于是"不降级"闸门形同虚设）
+_max="$(printf '%s\n%s\n' 2.9 2.10 | sort -V | tail -1)"
+[ "$_max" = "2.10" ] && ok "sort -V 版本序正确（2.10 > 2.9）" || bad "版本序错成字典序：max=$_max"
+# 闸门表达式本身（和 install.sh 的 elif 条件同构）
+_g2() { [ -n "$2" ] && [ "$(printf '%s
+%s
+' "$1" "$2" | sort -V | tail -1)" = "$2" ]; }
+_g2 2.2 2.5 && ok "候选 2.2 vs 已装 2.5 → 判为不更新（拒降级）" || bad "2.2 竟算比 2.5 新"
+_g2 2.5 2.5 && ok "同版本 → 判为不更新（不给无意义重装命令）" || bad "同版本判定反了"
+_g2 2.5 2.2 && bad "2.5 vs 2.2 竟判成不更新" || ok "候选 2.5 vs 已装 2.2 → 判为可更新"
+
+# 13c) 静态：降级拒绝分支和版本选择必须在原文件里
+grep -q 'sort -V' install.sh && ok "候选排序用 sort -V（版本序）" || bad "没有 sort -V，选择逻辑被改了"
+grep -q '不提供降级命令' install.sh && ok "拒绝降级的提示在位" || bad "拒绝降级分支被删了"
+
 echo
 echo "结果: $PASS 通过, $FAIL 失败"
 [ "$FAIL" -eq 0 ]

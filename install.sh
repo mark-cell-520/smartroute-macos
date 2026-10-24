@@ -204,17 +204,35 @@ echo
 APP="/Applications/SmartRoute.app"
 # install.sh 第 13 行已经 cd 到脚本所在目录，所以相对路径可用；
 # 回显时用 pwd 拼成绝对路径，用户照抄命令时不管当前在哪个目录都对。
-NEWAPP=""
+# 候选按**版本号**挑最新的，不按写死顺序。
+# 曾经写死顺序取 dist/SmartRoute-2.2/SmartRoute.app（一个 10 月 19 日的
+# 2.2 构建），于是每次重装都提示"App 是旧版"并给出把用户降级回 2.2 的
+# 复制命令——而仓库根的 SmartRoute.app 才是当前源码构建的 2.5。
+# 2026-10-24 实测踩到：提示里的路径是 dist/SmartRoute-2.2，照抄即降级。
+NEWAPP=""; NEWVER=""
+_cands=""
 for c in "dist/SmartRoute-2.2/SmartRoute.app" "dist/SmartRoute/SmartRoute.app" "SmartRoute.app"; do
-    if [ -d "$c" ]; then NEWAPP="$(pwd)/$c"; break; fi
+    [ -d "$c" ] || continue
+    _v="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$c/Contents/Info.plist" 2>/dev/null || echo 0.0.0)"
+    _cands="$_cands${_v}"$'\t'"$(pwd)/${c}"$'\n'
 done
+if [ -n "$_cands" ]; then
+    NEWVER="$(printf '%s' "$_cands" | sort -V | tail -1 | cut -f1)"
+    NEWAPP="$(printf '%s' "$_cands" | sort -V | tail -1 | cut -f2)"
+fi
 if [ -d "$APP" ]; then
     APP_BIN="$APP/Contents/MacOS/SmartRoute"
+    APPVER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist" 2>/dev/null || echo)"
     if [ -n "$NEWAPP" ] && [ -f "$NEWAPP/Contents/MacOS/SmartRoute" ]; then
         if cmp -s "$APP_BIN" "$NEWAPP/Contents/MacOS/SmartRoute" 2>/dev/null; then
             echo "App 版本    : 已是最新（/Applications/SmartRoute.app）"
+        elif [ -n "$APPVER" ] && [ "$(printf '%s\n%s\n' "$NEWVER" "$APPVER" | sort -V | tail -1)" = "$APPVER" ]; then
+            # 本地候选不比已装的更新——给复制命令就是让人降级。
+            echo "App 版本    : 已安装 ${APPVER}，本地最新候选仅 ${NEWVER}，不提供降级命令"
+            echo "              确要强制换成本地候选（会丢较新版本的改进）："
+            echo "              rm -rf \"$APP\" && cp -R \"$NEWAPP\" /Applications/"
         else
-            echo "⚠️  App 是旧版：刚才只更新了命令行部分，/Applications/SmartRoute.app 没动。"
+            echo "⚠️  App 是旧版（已装 ${APPVER:-?} / 本地候选 ${NEWVER}）：刚才只更新了命令行部分，/Applications/SmartRoute.app 没动。"
             echo "    界面上看到的还是旧结论（比如旧的双网并发提示）。更新它："
             echo "      rm -rf \"$APP\" && cp -R \"$NEWAPP\" /Applications/"
             echo "      xattr -dr com.apple.quarantine \"$APP\""
