@@ -94,14 +94,16 @@ rm -f "$T/run/state"
 
 echo "=== 5. 候选排序：有信号的在前，其余保持原序垫后 ==="
 MOCK_SCAN_OUT=$'CZ-BH-407\t-60\t1\t1\n'
-out="$(run 'wifi_rank_candidates "CZ-305 CZ-BH-407 mm A9-5G"')"
+# 候选用换行分隔（一行一个 SSID），断言同样归一成 | 再比——
+# 表示法以后再变，断言不用跟着改。
+out="$(run 'wifi_rank_candidates "$(printf '"'"'%s\n'"'"' CZ-305 CZ-BH-407 mm A9-5G)"' | tr '\n' '|')"
 # CZ-BH-407 有信号排第一；其余按原顺序
-[ "$out" = "CZ-BH-407 CZ-305 mm A9-5G " ] && ok "有信号的提前，其余原序" || bad "得到: [$out]"
+[ "$out" = "CZ-BH-407|CZ-305|mm|A9-5G|" ] && ok "有信号的提前，其余原序" || bad "得到: [$out]"
 
 echo "=== 6. helper 缺失时排序原样返回（不改变语义）==="
-out="$(run 'wifi_scan_bin() { return 1; }; wifi_rank_candidates "A B C"')"
-[ "$out" = "A B C" ] && ok "helper 缺失时原样返回" || bad "得到: [$out]"
-out="$(run 'wifi_scan_bin() { return 1; }; wifi_scan "A B" 0; echo "avail=$WIFI_SCAN_AVAILABLE unknown=$WIFI_SCAN_UNKNOWN"')"
+out="$(run 'wifi_scan_bin() { return 1; }; wifi_rank_candidates "$(printf '"'"'%s\n'"'"' A B C)"' | tr '\n' '|')"
+[ "$out" = "A|B|C|" ] && ok "helper 缺失时原样返回" || bad "得到: [$out]"
+out="$(run 'wifi_scan_bin() { return 1; }; wifi_scan "$(printf '"'"'%s\n'"'"' A B)" 0; echo "avail=$WIFI_SCAN_AVAILABLE unknown=$WIFI_SCAN_UNKNOWN"')"
 printf '%s' "$out" | grep -q "avail=0" && ok "标记 helper 不可用" || bad "没标记: $out"
 
 echo "=== 7. 多 BSSID：取信号最强的 ==="

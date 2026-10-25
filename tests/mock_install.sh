@@ -237,10 +237,35 @@ _sel_block="$(awk '/^NEWAPP=""; NEWVER=""$/,/^fi$/' install.sh)"
 [ -n "$_sel_block" ] && ok "能从 install.sh 抽出候选选择块" || bad "选择块没了（被改名或删了？）"
 NEWAPP=""; NEWVER=""; _cands=""
 eval "$_sel_block"
-if [ "$NEWVER" = "2.5" ] && [ "$NEWAPP" = "$(pwd)/SmartRoute.app" ]; then
-    ok "三个候选里选中版本最高的（$NEWVER → 仓库根 SmartRoute.app）"
+# 要守的回归是"别选中 dist/ 里那个 10 月 19 日的 2.2 旧构建"。
+# 所以断言**胜出者是仓库根的 SmartRoute.app**，而不是"它的版本号等于 VERSION"。
+#
+# 为什么不能拿 VERSION 当期望值：VERSION 一升（发版），仓库根的 App 不会自动
+# 跟着重建，于是 NEWVER < VERSION 是**正常的中间状态**。拿它当期望值会把
+# "还没跑 build_app.sh"和真回归混在一起，而后者会被这条天天红的噪音埋掉。
+# 版本文件落后于已构建的 App 才是真问题，单独一条断言守着（见下）。
+if [ "$NEWAPP" = "$(pwd)/SmartRoute.app" ]; then
+    ok "三个候选里选中仓库根的 SmartRoute.app（版本 $NEWVER，dist 里两个 2.2 没赢）"
 else
-    bad "选错了：版本 $NEWVER 路径 $NEWAPP（dist 里两个 2.2 不应赢）"
+    bad "胜出者不是仓库根 App：$NEWAPP（版本 $NEWVER）——dist 里的旧构建又被选中了"
+fi
+# 胜出版本必须是所有候选里最大的。现算一遍候选版本，避免"期望值写死"。
+_maxcand=""
+for c in "dist/SmartRoute-2.2/SmartRoute.app" "dist/SmartRoute/SmartRoute.app" "SmartRoute.app"; do
+    [ -d "$c" ] || continue
+    v="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$c/Contents/Info.plist" 2>/dev/null || echo 0.0.0)"
+    _maxcand="$(printf '%s\n%s\n' "${_maxcand:-0.0.0}" "$v" | sort -V | tail -1)"
+done
+[ "$NEWVER" = "$_maxcand" ] \
+    && ok "胜出版本是所有候选里最大的（$_maxcand）" \
+    || bad "胜出版本 $NEWVER 不是候选里最大的（$_maxcand）"
+# VERSION 不许落后于已构建的 App——那是"版本号没跟着升"，会让 install.sh
+# 的把关（拒绝降级）失效。反过来（VERSION 领先、还没重建）是正常的。
+SRVER="$(cat VERSION 2>/dev/null | tr -d '[:space:]')"; SRVER="${SRVER:-0.0.0}"
+if [ "$(printf '%s\n%s\n' "$SRVER" "$NEWVER" | sort -V | tail -1)" = "$SRVER" ]; then
+    ok "VERSION（$SRVER）不落后于已构建的 App（$NEWVER）"
+else
+    bad "VERSION=$SRVER 落后于已构建的 App $NEWVER——升版本后忘了跑 build_app.sh"
 fi
 
 # 13b) 版本比较的语义：sort -V 必须是版本序不是字典序

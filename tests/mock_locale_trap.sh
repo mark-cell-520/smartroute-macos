@@ -10,6 +10,8 @@
 #
 # 这个检查跑在三个脚本上，任何新增的全角紧跟都要么改成花括号，
 # 要么确认不在双引号内（单引号/注释里不展开，是安全的）。
+# 运行: bash tests/mock_locale_trap.sh（可从任意目录跑）
+cd "$(dirname "$0")/.." || exit 1
 checks=0; failures=0
 ok()  { checks=$((checks+1)); printf '  ✓ %s\n' "$1"; }
 bad() { failures=$((failures+1)); printf '  ✗ %s\n' "$1"; }

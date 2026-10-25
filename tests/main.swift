@@ -155,6 +155,21 @@ let (_, rejNeg) = NetworkModel.sanitizeConf("OK_N=-1\n")
 eqI(rejNeg, 1, "负数被拒")
 isTrue(NetworkModel.sanitizeConf("COOLDOWN=abc\n").1 == 1, "非数字被拒")
 
+// 上界必须和脚本一致。脚本侧（conf_value_ok）对每个整数键都查 ≤86400，
+// 漏掉这一条的后果不是"少一道校验"而是**假导入**：App 放行 → 写进
+// userConf → 弹"✅ 已导入并生效" → 脚本解析层把该行丢掉、回落默认值。
+// 用户看到 App 界面显示的是他导入的那个数，守护进程用的是默认值，
+// 同屏自相矛盾，且没有任何一方告诉他被丢了。
+isTrue(NetworkModel.sanitizeConf("COOLDOWN=86400\n").1 == 0, "COOLDOWN=86400（上界本身）通过")
+isTrue(NetworkModel.sanitizeConf("COOLDOWN=86401\n").1 == 1, "COOLDOWN=86401 超过上界被拒")
+isTrue(NetworkModel.sanitizeConf("OK_N=999999\n").1 == 1, "OK_N=999999 超过上界被拒")
+isTrue(NetworkModel.sanitizeConf("PING_TIMEOUT=999999999999999999999\n").1 == 1,
+       "超出 Int 范围的巨数被拒（不能因 Int(val)==nil 而放过）")
+// 上界要从 bash 生成过来，不能在 Swift 里再手写一个数——手写就又是一条
+// 会漂移的平行事实源（本项目已经被这种漂移绊倒四次）。
+isTrue(GeneratedConfigKeys.intBound == 86400,
+       "intBound 由 gen_config_keys.py 从 bash 生成（当前 \(GeneratedConfigKeys.intBound)）")
+
 // 注释和空行不算被拒（用户配置文件里很常见）
 let (cleanC, rejC) = NetworkModel.sanitizeConf("# 注释\n\nMODE=wifi\n")
 isTrue(cleanC.contains("MODE=wifi"), "注释不影响合法行")

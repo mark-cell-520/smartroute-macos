@@ -839,7 +839,17 @@ final class NetworkModel: ObservableObject {
             // "已保存"但实际没生效，而且下次守护进程重载配置又回落 round-robin。
             case "BALANCE_MODE": ok = (val == "round-robin" || val == "fastest" || val == "weighted")
             case _ where boolKeys.contains(key): ok = (val == "0" || val == "1")
-            case _ where intKeys.contains(key):  ok = !val.isEmpty && val.allSatisfy { $0.isNumber }
+            // 上界和"是不是整数"是同一条规则的两半，少查一半就是假导入：
+            // 脚本侧 conf_value_ok 对每个整数键都查 ≤intBound，App 这里漏查时，
+            // 超界值会被放行、写进 userConf、弹"已导入并生效"，然后被脚本解析层
+            // 丢掉、回落默认值——App 界面显示用户导入的数，守护进程用默认值，
+            // 没有任何一方告诉他被丢了。intBound 由 tools/gen_config_keys.py
+            // 从 bash 生成，不在这里手写数字（手写就又是一条会漂移的平行事实源）。
+            // Int(val) 为 nil（超出 Int64）时按超界算：那种值脚本侧同样过不了
+            // `[ "$val" -le N ]`（bash 报 integer expression expected 后返回非 0）。
+            case _ where intKeys.contains(key):
+                ok = !val.isEmpty && val.allSatisfy { $0.isNumber }
+                    && (Int(val) ?? Int.max) <= GeneratedConfigKeys.intBound
             // 必须和脚本一致地同时拒 \n 和 \r。脚本侧是
             // *[$'\n\r']*，这里以前只查了 \n——于是带 \r 的行 App 放进去了、
             // 脚本却丢掉，用户看到的是已导入但实际没生效。

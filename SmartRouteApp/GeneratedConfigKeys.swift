@@ -69,4 +69,13 @@ enum GeneratedConfigKeys {
         "SPEED_TEST_TIMEOUT",
         "WIFI_FAILOVER_COOLDOWN"
     ]
+
+    /// conf_value_ok 里整数键的统一上界（`[ "$val" -le N ]`）
+    ///
+    /// 为什么要把这个数字也生成过来：App 的 sanitizeConf 曾经只查"是不是非负
+    /// 整数"，没查上界。于是 COOLDOWN=999999 这类值 App 放行、写进 userConf、
+    /// 弹"已导入并生效"，而脚本解析层按上界把它丢掉、回落默认值——用户看到的
+    /// 是 App 界面显示他导入的数，守护进程用的是默认值，且没人告诉他被丢了。
+    /// 上界和键表是同一条规则的两半，只生成一半照样漂移。
+    static let intBound: Int = 86400
 }

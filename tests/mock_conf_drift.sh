@@ -48,8 +48,15 @@ check_mode MODE
 check_mode BALANCE_MODE
 
 # 3) SPEED_TEST_URL 两边都必须限 http/https
-grep -q 'SPEED_TEST_URL) case "\$val" in http://\*|https://\*)' smartroute.sh \
+# 判据不能是"整行匹配"：v2.7 为了加"剥掉协议头再判空"把那个 case 拆成了多行，
+# 单行 grep 会假失败。改成按函数体抓出来再查关键子串——重排版式不影响。
+_conf_body="$(awk '/^conf_value_ok\(\)/,/^}/' smartroute.sh)"
+printf '%s\n' "$_conf_body" | grep -q 'http://\*|https://\*' \
     && ok "脚本侧 SPEED_TEST_URL 限 http/https" || bad "脚本侧没限协议"
+# 光限协议头不够：必须连"半截值"（只有协议头）一起拒。
+# v2.7 修的正是这个——原来的 [ -n "$val" ] 放在模式匹配之后是死判断。
+printf '%s\n' "$_conf_body" | grep -q '\${val#\*://}' \
+    && ok "脚本侧拒掉只有协议头的半截值" || bad "半截 URL 仍被收（测速会每轮失败）"
 grep -q 'case "SPEED_TEST_URL"' SmartRouteApp/NetworkModel.swift \
     && ok "App 侧对 SPEED_TEST_URL 有专门分支" || bad "App 侧没限协议"
 # 光有协议头（http:// 后面什么都没有）脚本侧是拒的，App 以前放过——

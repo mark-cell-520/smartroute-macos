@@ -45,7 +45,9 @@ case "$1" in
         ;;
     -listpreferredwirelessnetworks)
         echo "Preferred networks on en1:"
-        printf '%s\n' $MOCK_SAVED | sed '/^$/d' | sed 's/^/\t/'
+        # 必须加引号：MOCK_SAVED 是换行分隔的串，未加引号的 $MOCK_SAVED 会被
+        # 词分割，于是 mock 自己就把 "My Home" 拆成两个——被测代码再对也测不出来。
+        printf '%s\n' "$MOCK_SAVED" | sed '/^$/d' | sed 's/^/\t/'
         ;;
     -setairportnetwork)
         ssid="$3"
@@ -193,7 +195,7 @@ echo "=== 4. tryall：跳过不能上网的，找到第一个能用的 ==="
 # 注意：上一节的 wifi_join 把 current 留在了 CZ-BH-407（正好是有外网的那个），
 # 不复位的话会触发"已能上网就不动"的护栏，本节就永远测不到东西了。
 echo m > "$MOCK_STATE/current"
-out="$(run 'wifi_try_candidates "CZ-305 CZ-BH-407 mm" 1')"
+out="$(run 'wifi_try_candidates "$(printf '"'"'%s\n'"'"' CZ-305 CZ-BH-407 mm)" 1')"
 [ "$out" = "CZ-BH-407" ] && ok "跳过头两个假连接，返回 $out" || bad "期望 CZ-BH-407，得到: $out"
 cur="$(cat "$T/state/current")"
 [ "$cur" = "CZ-BH-407" ] && ok "确实切到了 $cur" || bad "当前仍是 $cur"
@@ -214,7 +216,7 @@ echo "=== 8. 候选列表尊重传入顺序 ==="
 # 第 5/6 节把 current 留在了一个没有外网的状态，但第 7 节空列表测试没动它；
 # 这里显式复位，避免受前面章节影响
 echo m > "$MOCK_STATE/current"
-out="$(run 'wifi_try_candidates "mm CZ-BH-407" 1')"
+out="$(run 'wifi_try_candidates "$(printf '"'"'%s\n'"'"' mm CZ-BH-407)" 1')"
 [ "$out" = "CZ-BH-407" ] && ok "按给定顺序试（mm 先失败）" || bad "得到: $out"
 
 echo "=== 9. 命令分派与用法提示 ==="
@@ -272,14 +274,25 @@ printf '%s' "$out" | grep -q "cur=m" && ok "冷却期内不动作" || bad "冷�
 
 echo "=== 13. WIFI_PREFERRED 决定试连顺序 ==="
 # 首选放最前：即使 CZ-305 排第一，指定 mm 优先就应该先试 mm
-out="$(run 'echo m > "$MOCK_STATE/current"; WIFI_FAILOVER=1; WIFI_FAILOVER_COOLDOWN=0
-    WIFI_PREFERRED="CZ-BH-407,mm"; echo "cands=[$(wifi_preferred_candidates)]"')"
-[ "$out" = "cands=[CZ-BH-407 mm CZ-305 m]" ] && ok "首选靠前且去重：$out" || bad "得到: $out"
-out="$(run 'WIFI_PREFERRED=""; echo "cands=[$(wifi_preferred_candidates)]"')"
-[ "$out" = "cands=[CZ-305 m CZ-BH-407 mm]" ] && ok "留空=按系统保存顺序：$out" || bad "得到: $out"
+# 候选用换行分隔（一行一个 SSID），断言把换行归一成 | 再比——
+# 这样表示法以后再变，断言不用跟着改。
+cands_of() { run "$1" | tr '\n' '|'; }
+out="$(cands_of 'echo m > "$MOCK_STATE/current"; WIFI_FAILOVER=1; WIFI_FAILOVER_COOLDOWN=0
+    WIFI_PREFERRED="CZ-BH-407,mm"; wifi_preferred_candidates')"
+[ "$out" = "CZ-BH-407|mm|CZ-305|m|" ] && ok "首选靠前且去重" || bad "得到: $out"
+out="$(cands_of 'WIFI_PREFERRED=""; wifi_preferred_candidates')"
+[ "$out" = "CZ-305|m|CZ-BH-407|mm|" ] && ok "留空=按系统保存顺序" || bad "得到: $out"
 # 首选里出现没保存过的名字，不能因此挡住后面的
-out="$(run 'WIFI_PREFERRED="GHOST,CZ-305"; echo "cands=[$(wifi_preferred_candidates)]"')"
-[ "$out" = "cands=[GHOST CZ-305 m CZ-BH-407 mm]" ] && ok "保留未保存的首选名（让 join 去失败）: $out" || bad "得到: $out"
+out="$(cands_of 'WIFI_PREFERRED="GHOST,CZ-305"; wifi_preferred_candidates')"
+[ "$out" = "GHOST|CZ-305|m|CZ-BH-407|mm|" ] && ok "保留未保存的首选名（让 join 去失败）" || bad "得到: $out"
+# SSID 带空格时必须保持完整——这是改成换行分隔的全部理由。
+# 旧表示法把 "My Home" 拆成 My / Home 两个候选，真正的网络永远试不到。
+# run 会用父作用域的 MOCK_SAVED 覆盖内联 export，所以在父层临时换，跑完还原
+_saved_bak="$MOCK_SAVED"
+export MOCK_SAVED=$'My Home\nOffice\nCZ-305'
+out="$(cands_of 'wifi_preferred_candidates')"
+export MOCK_SAVED="$_saved_bak"
+[ "$out" = "My Home|Office|CZ-305|" ] && ok "带空格的 SSID 不被拆开" || bad "带空格 SSID 被拆了: $out"
 
 echo "=== 14. tryall 护栏：当前 Wi-Fi 已能上网时绝不切换（用户实测踩到的坑）==="
 # 真实 case：当前 Wi-Fi 有网，tryall 却把当前网络重新 join 了一遍，
@@ -292,7 +305,7 @@ export MOCK_NET_OK="m"        # 当前网络有外网
 out="$(run 'wifi_current_ok && echo OK || echo NO')"
 [ "$out" = "OK" ] && ok "wifi_current_ok 认出当前网络能上网" || bad "得到: $out"
 # wifi_try_candidates 必须直接放弃，且一个网络都不碰
-out="$(run 'wifi_try_candidates "CZ-305 CZ-BH-407 mm" 1; echo "rc=$? tried=$WIFI_TRY_TOTAL already=$WIFI_TRY_ALREADY_OK"')"
+out="$(run 'wifi_try_candidates "$(printf '"'"'%s\n'"'"' CZ-305 CZ-BH-407 mm)" 1; echo "rc=$? tried=$WIFI_TRY_TOTAL already=$WIFI_TRY_ALREADY_OK"')"
 printf '%s' "$out" | grep -q "tried=0" && ok "已能上网时一个网络都不试" || bad "还是试了: $out"
 printf '%s' "$out" | grep -q "already=1" && ok "置上 ALREADY_OK 标志" || bad "没置标志: $out"
 cur="$(cat "$T/state/current")"
@@ -303,7 +316,7 @@ echo "=== 15. 失败原因要分类，不能一律说"没有外网" ==="
 export MOCK_NET_OK="__none__"     # 谁都没有外网
 export MOCK_JOIN_OK="CZ-305 mm"   # 这两个"在范围"，其它不在
 echo m > "$T/state/current"
-out="$(run 'wifi_try_candidates "CZ-305 CZ-BH-407 mm" 1
+out="$(run 'wifi_try_candidates "$(printf '"'"'%s\n'"'"' CZ-305 CZ-BH-407 mm)" 1
     echo "total=$WIFI_TRY_TOTAL oor=$WIFI_TRY_OUTOFRANGE jf=$WIFI_TRY_JOINFAIL ni=$WIFI_TRY_NOINET"')"
 printf '%s' "$out" | grep -q "total=3" && ok "试了 3 个" || bad "总数错: $out"
 printf '%s' "$out" | grep -q "oor=1" && ok "识别出 1 个不在范围（CZ-BH-407）" || bad "不在范围数错: $out"

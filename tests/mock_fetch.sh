@@ -554,8 +554,21 @@ grep -qF 'if [ "$http" = "429" ] || [ "$http" = "503" ]; then' smartroute.sh \
 grep -qF 'sleep $(( try ))' smartroute.sh \
     && ok "退避时长递增（1s/2s）" || bad "没有递增退避，立刻重试只会再吃一个 429"
 # 限流时必须停止扩连，否则加连接只会招来更多 429
-grep -qF '[ ! -f "$T/ratelimited" ]' smartroute.sh \
-    && ok "撞到 429/503 后停止扩连" || bad "限流了还在往上加连接，只会招来更多 429"
+# 判据从"标记文件存在"改成 _fetch_rl_hot（带时间窗）：原来是
+# `[ ! -f "$T/ratelimited" ]`，而那个标记会被任一分片的成功删掉，
+# 多 worker 下平均只活几十毫秒，父进程 0.2 秒一轮基本看不见——闩锁形同虚设。
+# 现在断言的是"扩连守卫确实调用 _fetch_rl_hot"，语义比原来的 grep 更强：
+# 既要求限流时真的停，也要求它是时间窗判断而不是裸文件存在。
+grep -q '_fetch_rl_hot()' smartroute.sh \
+    && ok "限流闩锁有时间窗判据（_fetch_rl_hot）" || bad "_fetch_rl_hot 没了，限流判断退回裸文件存在"
+grep -qF '[ "$_spawned" -lt "$n" ] && ! _fetch_rl_hot' smartroute.sh \
+    && ok "扩连守卫调用 _fetch_rl_hot（撞到 429/503 后停止扩连）" \
+    || bad "限流了还在往上加连接，只会招来更多 429"
+# worker 成功时不许再删限流标记——那是闩锁失效的根因
+awk '/^                    # 成功了要清掉前几次失败留下的 connfail/,/^                    return 0$/' smartroute.sh \
+    | grep -q 'rm -f "\$d/ratelimited"' \
+    && bad "worker 成功仍在删限流标记（全局闩锁会被任一成功清掉）" \
+    || ok "worker 成功不删限流标记（全局闩锁保得住）"
 
 # 假死检测参数
 grep -qF -- '--speed-limit 20480 --speed-time 20' smartroute.sh \

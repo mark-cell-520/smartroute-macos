@@ -170,14 +170,31 @@ conf_value_ok() {
         # 而它会被原样交给 curl --interface 去下载。攻击者能借此让 root
         # 的 curl 去打内网地址、或消耗带宽。限制协议后最坏也只是指向一个
         # 公网 HTTP 地址，与"用户自己配错了测速地址"同级。
-        SPEED_TEST_URL) case "$val" in http://*|https://*) [ -n "$val" ] || return 1 ;; *) return 1 ;; esac ;;
+        #
+        # ⚠️ `[ -n "$val" ]` 放在模式匹配之后是**死判断**：能走到这里说明
+        # $val 已经匹配 http://*|https://*，必然非空。原意是拒掉 "http://"
+        # 这种光有协议头的半截值——写成剥掉协议头再判空才有效。
+        # 漏了的后果：`smartroute set SPEED_TEST_URL http://` 报"已设置"并落盘，
+        # 之后每一轮测速都拿它去打 curl，全部失败，网速优先模式静默失灵，
+        # 用户分不清是源坏了还是线坏了。
+        # 顺带这是**反方向的配置漂移**：App 的 sanitizeConf 一直拒这个值
+        # （用 val.count > prefix.count），同一个文件 App 导入判 rejected、
+        # bash 的 set 却收。tests/mock_conf_drift.sh 只盯"App 比脚本严"那一边。
+        SPEED_TEST_URL) case "$val" in
+                          http://*|https://*) [ -n "${val#*://}" ] || return 1 ;;
+                          *) return 1 ;;
+                       esac ;;
         # 列表里每个条目都要限协议。只整体判非空是不够的：列表按空格拆分后
         # 逐条交给 curl，任一条是 file:// 或内网地址都会被执行。
+        # 每条同样要剥掉协议头再判空（同上的死判断）。
         SPEED_TEST_URLS)
             case "$val" in *[!\ ]*) ;; *) return 1 ;; esac
             local _u
             for _u in $val; do
-                case "$_u" in http://*|https://*) ;; *) return 1 ;; esac
+                case "$_u" in
+                    http://*|https://*) [ -n "${_u#*://}" ] || return 1 ;;
+                    *) return 1 ;;
+                esac
             done
             ;;
         *) return 1 ;;
@@ -191,14 +208,20 @@ conf_value_hint() {   # $1=key -> stdout: 说明
     case "$1" in
         MODE)          echo "MODE 只能是 auto|ethernet|wifi|speed|latency" ;;
         BALANCE_MODE)  echo "BALANCE_MODE 只能是 round-robin|fastest|weighted" ;;
+        # 提示必须和真实规则一致：校验处除了"非负整数"还有 ≤86400 的上界
+        # （见 conf_value_ok）。以前只说前半句，用户照提示填 604800 会被拒，
+        # 而提示让他以为那个值合法——排查时完全使不上劲。
         OK_N|FAIL_N|COOLDOWN|PING_TIMEOUT|NC_TIMEOUT|FASTEST_SWITCH_RATIO|FASTEST_RECHECK|WIFI_FAILOVER_COOLDOWN|SPEED_TEST_TIMEOUT|SPEED_RECHECK|LATENCY_RECHECK|LATENCY_AUTO_RATIO|LATENCY_AUTO_GAP_MS|SPEED_SWITCH_RATIO)
-                       echo "$1 必须是非负整数" ;;
+                       echo "$1 必须是非负整数，且不超过 86400" ;;
         TLS_PROBE|NOTIFY|AUTO_WIFI_POWER|BALANCE|WIFI_FAILOVER|LATENCY_AUTO)
                        echo "$1 只能是 0 或 1" ;;
         PROBE_TARGETS) echo "PROBE_TARGETS 只能是空格分隔的 IP" ;;
         WIFI_PREFERRED) echo "WIFI_PREFERRED 不能含换行" ;;
-        SPEED_TEST_URL) echo "SPEED_TEST_URL 不能为空" ;;
-        SPEED_TEST_URLS) echo "SPEED_TEST_URLS 不能为空，且每个条目都必须是 http/https 地址" ;;
+        # 提示必须和真实规则一致。以前写"不能为空"，而真实规则是"必须是
+        # http/https 开头且后面得有内容"——用户漏打协议头时被告知"为空"，
+        # 只会去检查是不是少打了值，永远想不到要加 http://。
+        SPEED_TEST_URL) echo "SPEED_TEST_URL 必须是 http:// 或 https:// 开头的完整地址（光有协议头不行）" ;;
+        SPEED_TEST_URLS) echo "SPEED_TEST_URLS 每个条目都必须是 http:// 或 https:// 开头的完整地址（光有协议头不行）" ;;
         *) echo "不支持的配置项: $1" ;;
     esac
 }
@@ -290,13 +313,45 @@ conf_parse_file() {   # $1=文件路径
 }
 
 # 某个键是否由用户在配置文件里显式设置过
+#
+# ⚠️ case 的两侧必须补空格：`case " $list " in *" $1 "*`。
+# 以前写成 case "${_CONF_SET_KEYS:-}" in *" $1 "*，**没有外层空格**，
+# 于是只有"既不是第一个也不是最后一个"的键才匹配得上——实际只配一两个键时
+# 恒为假。后果是 measure_throughput 的 _conf_set SPEED_TEST_URL 永远说
+# "用户没配"，用户写在配置里的测速地址被脚本默认的 SPEED_TEST_URLS 列表
+# 静默顶掉：他改了配置、重启守护进程、发现测速结果毫无变化。
+# 项目里另外五处同类判断（VALID_KEYS / PROBE_TARGETS 去重 /
+# wifi_preferred_candidates）都写了外层空格，只有这里漏了。
 _conf_set() {
-    case "${_CONF_SET_KEYS:-}" in
+    case " ${_CONF_SET_KEYS:-} " in
         *" $1 "*) return 0 ;;
         *) return 1 ;;
     esac
 }
-conf_parse_file "$USER_CONF"                     # 用户级覆盖系统级
+
+# 把系统级配置里显式设置的键也登记进 _CONF_SET_KEYS。
+#
+# 为什么需要：/etc/smartroute.conf 是 `.` source 进来的（见上面第 131 行），
+# 不过 conf_parse_file，所以它设置的键从来没进过 _CONF_SET_KEYS。而 README
+# 恰恰三处教用户往 /etc 写配置——照做的人，_conf_set 对他的键一律返回假，
+# 效果和上面那个漏空格的 bug 一样：值被脚本默认值静默顶掉。
+# 只认白名单键，且值由 conf_parse_file 之后不再校验（/etc 由 root 维护，
+# install.sh 生成，第 131 行注释已声明为可信来源）。
+_conf_set_from_system_conf() {
+    [ -r "$CONF" ] || return 0
+    local _k _line
+    for _k in $VALID_KEYS; do
+        case " ${_CONF_SET_KEYS:-} " in *" $_k "*) continue ;; esac
+        while IFS= read -r _line || [ -n "$_line" ]; do
+            _line="${_line%$'\r'}"
+            case "$_line" in ''|\#*) continue ;; esac
+            case "$_line" in
+                "$_k="*|"$_k ="*|" $_k="*) _CONF_SET_KEYS="${_CONF_SET_KEYS:+$_CONF_SET_KEYS }$_k"; break ;;
+            esac
+        done < "$CONF"
+    done
+    return 0
+}
 
 log() {
     local msg="$*"
@@ -319,6 +374,20 @@ log() {
     done
     return 0
 }
+
+# 用户级配置在这里加载——**必须在 log() 定义之后**。
+#
+# 以前这行紧跟在 conf_parse_file 定义后面（log 之前）。而 conf_parse_file 的
+# 权限拒绝分支要调 log：/Users/Shared 是 1777，任何本地用户都能先建一个
+# /Users/Shared/smartroute.conf，umask 002 建出来就是 664（群可写），正好命中
+# 拒绝分支。此时 bash 找不到 log 函数，落到 PATH 里的 **/usr/bin/log**
+# （macOS 统一日志 CLI），往 stderr 打 21 行 usage——
+#     log: Unknown subcommand '跳过配置 …：群/他人可写（664），拒绝解析'
+#     usage: log <command> …
+# 终端里出现一段跟 smartroute 毫无关系的用法页，/var/log/smartroute.err 也被占满。
+# 第 132 行的注释只记得"conf_parse_file 要先定义"，漏了它内部还依赖 log。
+conf_parse_file "$USER_CONF"                     # 用户级覆盖系统级
+_conf_set_from_system_conf                       # /etc 里显式设置的键也要登记
 
 die() { echo "错误: $*" >&2; exit 1; }
 
@@ -933,7 +1002,23 @@ probe_dev() {   # $1=设备 $2=网关
             else
                 wait 2>/dev/null
             fi
-            for t in $_ptargets; do [ -f "$_T/ping_$t" ] && { ping_ok=1; break; }; done
+            # ⚠️ 这里必须补 ok=0，不能只置 ping_ok=1。
+            #
+            # 等待窗口用的是 `$SECONDS` 整数秒差，实测墙上时长均匀分布在
+            # (0, tmo]（30 次采样 146ms~1025ms，19 次 <600ms），而 ping 自己的
+            # 超时是 PING_TIMEOUT=800ms。于是"前两个探测目标的 ICMP 被墙"
+            # （被迫走并行分支）且链路 RTT 有几百毫劣化时，一半以上的成功回包
+            # 落在等待窗口外——上面那个 if 走 else 分支，但探测其实成功了。
+            # 只置 ping_ok 不置 ok，最终判定（probe_out 只看 ok）就说 fail，
+            # **同一份输出里结论和明细自相矛盾**：ping=1 却"无外网"。
+            #
+            # 后果不是难看的输出：cmd_watch 的当场确认会在**一轮内**记满 3 笔
+            # → streak ≤ -FAIL_N → eth_ok=0 → 从一条好线切走。用户跑
+            # smartroute test -v 看到 ping=1 和"无外网"同屏，无法自证链路是好的。
+            # 三处（ping/TCP/TLS）同一个毛病，一起补。
+            for t in $_ptargets; do
+                [ -f "$_T/ping_$t" ] && { ping_ok=1; ok=0; break; }
+            done
         fi
     fi
 
@@ -955,7 +1040,9 @@ probe_dev() {   # $1=设备 $2=网关
         fi
         for t in $_ptargets; do
             for p_ in 53 443; do
-                [ -f "$_T/tcp_${t}_${p_}" ] && { tcp_ok=1; break 2; }
+                # 同上：等窗口没赶上但探测成功时，也要把 ok 置 0，
+                # 否则结论说 fail、明细说 tcp=1，自相矛盾。
+                [ -f "$_T/tcp_${t}_${p_}" ] && { tcp_ok=1; ok=0; break 2; }
             done
         done
     fi
@@ -976,7 +1063,8 @@ probe_dev() {   # $1=设备 $2=网关
         fi
         for t in 1.1.1.1 8.8.8.8; do
             case " $_ptargets " in *" $t "*) ;; *) continue ;; esac
-            [ -f "$_T/tls_$t" ] && { tls_ok=1; break; }
+            # 同上：等窗口没赶上但握手成功时也要置 ok=0，否则结论与明细矛盾
+            [ -f "$_T/tls_$t" ] && { tls_ok=1; ok=0; break; }
         done
     fi
 
@@ -1013,7 +1101,25 @@ state_set() {
     mkdir -p "$(dirname "$STATE_FILE")" 2>/dev/null
     local tmp="$STATE_FILE.$$"
     if [ -f "$STATE_FILE" ]; then
-        grep -v "^$1=" "$STATE_FILE" > "$tmp" 2>/dev/null
+        # grep 的退出码必须分开处理：rc=1 是"没有匹配行"（正常，全部保留），
+        # rc>=2 才是真出错。而**出错时 grep 的 stdout 一个字节都不输出**——
+        # 于是 $tmp 是空文件，紧接着 printf + mv 用它覆盖 STATE_FILE，
+        # 除新写的这一行外全丢。
+        #
+        # 真实触发路径：键名来自 SSID（_metric_set "wifiscan_$ssid"）。
+        # SSID 含正则元字符（"[" 最常见）时 BRE 不合法，/usr/bin/grep 返回 2。
+        # 实测一次 wifi scan 就把 state 从 8 行打成 1 行，丢掉的东西包括
+        # streak_eth/wifi（滞回记忆）、eth_ok/wifi_ok、switch_count 与
+        # flap 退避、wifi_failover_last（故障转移冷却）、测速/延迟缓存。
+        # 下一个 watch 周期从零重建判定，可能触发一次本不必要的切换。
+        # 出错时保守起见**放弃这次写入**：宁可少记一个缓存值，
+        # 也不能拿一个空文件去覆盖状态。
+        local _rc=0
+        grep -v "^$1=" "$STATE_FILE" > "$tmp" 2>/dev/null || _rc=$?
+        if [ "$_rc" -gt 1 ]; then
+            rm -f "$tmp" 2>/dev/null
+            return 0
+        fi
     fi
     printf '%s=%s\n' "$1" "$2" >> "$tmp" 2>/dev/null && mv "$tmp" "$STATE_FILE" 2>/dev/null
     rm -f "$tmp" 2>/dev/null
@@ -1129,11 +1235,22 @@ do_switch() {   # $1=目标设备 $2=原默认设备 $3=eth探测 $4=wifi探测 
         notify "SmartRoute 选路不稳定" "macOS 已累计 $flap_n 次把默认路由改回 $(dev_cn "${cur:-}")。若网线和 Wi-Fi 接同一台路由器，系统会反复这样判——请看状态页的提示。"
     fi
 
-    # 一进来就记尝试时间。原来只在两条成功路径的末尾才写 last_switch，
-    # 失败的尝试不落时间——于是冷却期形同虚设：目标接口持续不可用时，
-    # 每 20 秒就重试一次，每次都走一遍"删默认路由再添加"。
-    # 失败的尝试同样会动路由表，一样该被节流。
-    state_set last_switch "$(date +%s)"
+    # ⚠️ 这里原来有一句无条件 `state_set last_switch "$(date +%s)"`，注释还写着
+    # "一进来就记尝试时间"。它与下面 1280 行"（无需调整时）也不写 last_switch"
+    # 的承诺直接相反，而且后果不止是注释说谎：
+    #
+    # last_switch 同时是**冷却期**和 flap 1800s staleness 窗口的时间基准。
+    # 两条线都健康、Wi-Fi 更快（want=en1）、服务顺序本来就对——某一轮探测期间
+    # macOS 把默认路由判回了 en1，而 cmd_watch 在探测开始前采到的 cur 还是 en0
+    # → do_switch 被调用 → last_switch 被刷新 → 发现"默认路由已是 en1"→
+    # 什么都不做返回。紧接着 macOS 又判回 en0：下一轮 want=en1 仍成立，
+    # 但冷却期刚被这次**无操作**续满 45 秒 → 跳过切换。用户多等最多 45 秒
+    # 才回到快的那条线；若 macOS 每 30 秒判回一次，工具可能每次都被自己
+    # 刷新出来的冷却期挡掉。
+    #
+    # 现在改成：只在**确定要动手**的那一刻记（见下面"2) 兜底"之前）。
+    # 失败的尝试照样会被记到——它确实动了路由表，原注释"失败的尝试也要节流"
+    # 那个意图不受影响；只是"什么都没做"的那条路不再续冷却期。
 
     # 1) 首选：调整服务顺序（持久，网络重连后依然有效）
     #
@@ -1181,6 +1298,10 @@ do_switch() {   # $1=目标设备 $2=原默认设备 $3=eth探测 $4=wifi探测 
     fi
 
     # 2) 兜底：直接改路由表，立即生效（configd 之后若重建默认路由，下次 watch 会再修正）
+    #
+    # 到这里说明**确实要动路由表了**，此刻才记尝试时间（见上面那段说明为什么
+    # 不能一进函数就记）。失败的尝试也记：它一样动过路由表，一样该被节流。
+    state_set last_switch "$(date +%s)"
     gw="$(svc_router "$svc")"
     if [ -n "$gw" ]; then
         # 先把当前默认路由的参数记下来。原来是先 route delete default 再 add，
@@ -1333,13 +1454,49 @@ cmd_watch() {
             # 说明白为什么关——用户可能根本没开过这个开关，突然收到"已关闭"会很慌
         notify "SmartRoute 双网并发" "有个接口上不了网，已自动关闭双网并发，改为单线路选路"
         elif ! pfctl -a "$PF_ANCHOR" -s rules 2>/dev/null | grep -q .; then
-            # 规则丢失（系统重启后 pf 会恢复默认状态），尝试重新加载
-            if [ -f "$PF_ANCHOR_FILE" ]; then
-                log "并发分流: pf 规则丢失，重新加载"
+            # 规则丢失（系统重启后 pf 会恢复默认状态）。
+            #
+            # ⚠️ 必须**按当前拓扑重写**后再加载，不能直接 pfctl -f 磁盘上的旧文件。
+            # 旧文件是上一次 balance_on 时按当时的接口/网关/网段生成的。用户换过
+            # Wi-Fi（网段和网关都变了）之后，守护进程重启回来的第一轮看到的就是
+            # 这份旧规则，直接加载进去 → 新局域网不在排除表里 → 去新路由器的
+            # 流量被 route-to 赶到另一个接口并被 NAT 改写源地址，新局域网全部
+            # 不可达（打印机/NAS/隔壁机器全断），而日志只有一句"规则丢失，重新加载"。
+            # balance_on 开工前的三道安检（VPN、同网关、网段解析）在这条路上
+            # 原本全部形同虚设。
+            #
+            # 现在：先重算，任何前置条件不满足就关掉并发开关——那比留着一条
+            # 会打死局域网的规则安全得多。
+            local _eg _wg
+            _eg="$(svc_router "$ACTIVE_ETH_SVC")"
+            _wg="$(svc_router "$ACTIVE_WIFI_SVC")"
+            if [ -n "$_eg" ] && [ -n "$_wg" ] && [ "$_eg" != "$_wg" ] \
+               && _balance_nets_ok "$ACTIVE_ETH_DEV" "$ACTIVE_WIFI_DEV" \
+               && write_pf_rules "$ACTIVE_ETH_DEV" "$_eg" \
+                        "$ACTIVE_WIFI_DEV" "$_wg" \
+                        "$(other_nets | tr '\n' ' ')"; then
+                log "并发分流: pf 规则丢失，按当前拓扑重写并加载"
                 pfctl -e 2>/dev/null
                 pfctl -a "$PF_ANCHOR" -f "$PF_ANCHOR_FILE" 2>/dev/null
             else
-                log "并发分流: 规则文件不存在，关闭并发开关"
+                log "并发分流: 拓扑已变或网段不确定，关闭并发开关"
+                balance_off quiet
+            fi
+        elif ! pfctl -s info 2>/dev/null | grep -q "Status: Enabled"; then
+            # pf 被关掉但 anchor 规则还在内核里。
+            #
+            # pfctl -d 只清"运行中"标志，**规则集仍留在内核**，于是上面那个
+            # "规则非空"的判据一直认为规则好好的，自愈分支永远不再执行。
+            # macOS 自己就是用 -E/-X 引用计数管理 pf 的（见 /etc/pf.conf 头部
+            # 注释），任何组件释放引用、或有人跑 sudo pfctl -d，都会走到这个状态：
+            # route-to/NAT 全部停止作用，而 balance status 照样显示
+            # "规则已加载 / BALANCE=1"，用户看到的是"显示全都正常，但两条线并没合起来"。
+            # 这里补一次 pfctl -e，并说清楚。
+            log "并发分流: 系统 pf 被关闭（规则仍在），重新启用"
+            if pfctl -e 2>/dev/null; then
+                log "并发分流: 系统 pf 已重新启用，分流恢复"
+            else
+                log "并发分流: 重新启用系统 pf 失败，关闭并发开关"
                 balance_off quiet
             fi
         elif [ "$(state_get balance_mode)" = "weighted" ]; then
@@ -1393,14 +1550,35 @@ cmd_watch() {
     fi
 
     # 【可选】以太网没有外网、Wi-Fi 却被关闭时，自动打开 Wi-Fi（需 AUTO_WIFI_POWER=1）
-    if [ "$AUTO_WIFI_POWER" = "1" ] && [ -n "$ACTIVE_WIFI_DEV" ] \
-       && [ "$wifi_res" = "na" ] && [ "$eth_ok" -ne 1 ] \
-       && [ "$(wifi_power "$ACTIVE_WIFI_DEV")" = "off" ]; then
-        log "以太网无外网且 Wi-Fi 已关闭，自动打开 Wi-Fi ($ACTIVE_WIFI_DEV)"
-        set_wifi_power "$ACTIVE_WIFI_DEV" on
-        # 补上原因。用户在手动关掉 Wi-Fi 的场景下收到"已自动打开 Wi-Fi" 格外不安，
-        # 像软件在偷偷改他的设置——说清是因为网线也没网了，才能安心。
-        notify "SmartRoute" "网线上不了网，已自动打开 Wi-Fi 保持联网"
+    #
+    # ⚠️ 这里**不能**要求 [ -n "$ACTIVE_WIFI_DEV" ]。
+    #
+    # find_active 只收"有 IPv4 地址"的接口（dev_active），而 Wi-Fi 关闭时恰好
+    # 拿不到 IP——于是 ACTIVE_WIFI_DEV 为空。而这个分支存在的全部意义就是
+    # "Wi-Fi 关着，去把它打开"。原来的三个前提因此互相矛盾：
+    #     ACTIVE_WIFI_DEV 非空 ⇒ Wi-Fi 有 IP ⇒ 不可能是 power=off、不可能是 na
+    # 实测（mock 网线断 + Wi-Fi 关）：分支一次都没进过，AUTO_WIFI_POWER=1
+    # 形同虚设，日志里连一行相关记录都没有——用户无从得知开关没生效。
+    #
+    # 改成：设备名从 hardware_ports 里找。那张表列的是**硬件端口**，
+    # 与 Wi-Fi 开关状态无关，关着也能列出 en1。判据只留"电源确实是关的"——
+    # 它比原来的 wifi_res=na 更准确（开着但没外网时 power=on，不会误触）。
+    if [ "$AUTO_WIFI_POWER" = "1" ] && [ "$eth_ok" -ne 1 ]; then
+        local _aw_dev="$ACTIVE_WIFI_DEV" _aw_port _aw_pdev
+        if [ -z "$_aw_dev" ]; then
+            while IFS="	" read -r _aw_port _aw_pdev; do
+                [ -n "$_aw_pdev" ] || continue
+                is_wifi_port "$_aw_port" || continue
+                _aw_dev="$_aw_pdev"; break
+            done < <(hardware_ports)
+        fi
+        if [ -n "$_aw_dev" ] && [ "$(wifi_power "$_aw_dev")" = "off" ]; then
+            log "以太网无外网且 Wi-Fi 已关闭，自动打开 Wi-Fi ($_aw_dev)"
+            set_wifi_power "$_aw_dev" on
+            # 补上原因。用户在手动关掉 Wi-Fi 的场景下收到"已自动打开 Wi-Fi" 格外不安，
+            # 像软件在偷偷改他的设置——说清是因为网线也没网了，才能安心。
+            notify "SmartRoute" "网线上不了网，已自动打开 Wi-Fi 保持联网"
+        fi
     fi
 
     # 【Wi-Fi 自动故障转移】Wi-Fi 上不了网、以太网也没外网时，自动换个能上网的 Wi-Fi
@@ -1456,30 +1634,44 @@ cmd_watch() {
                     # 用 awk 比而不是 shell 整数：延迟是小数（14.3），
                     # 自己转整数要处理补齐位数、八进制（08）一堆坑，
                     # 而 pick_fastest 本来就用 awk，统一做法更不容易错。
+                    #
+                    # ⚠️ 必须写成 (b+0)*r，不能写 b+0*r：
+                    # awk 里 * 的优先级高于 +，于是 b+0*r 等于
+                    # b+0 等于 b，**LATENCY_DEGRADE_RATIO 完全
+                    # 没有参与运算**，"变慢预警"退化成"另一条快任意
+                    # 一点点就重下全量"。
+                    #
+                    # 实测数值表（LATENCY_DEGRADE_RATIO=2）：
+                    #   lat_cur=13.1 lat_oth=13.0 比值 1.01x
+                    #     → 代码判定 FORCE，设计意图 keep
+                    #   lat_cur=25.9 lat_oth=13.0 比值 1.99x
+                    #     → 代码判定 FORCE，设计意图 keep
+                    # 端到端：mock lat_en0=13.4 / lat_en1=12.8，
+                    # 每周期都打"变慢预警…超过…的 2 倍"并做两次
+                    # 全量 4 连接下载，而 13.4 < 2×12.8=25.6——
+                    # **日志这句话本身是假的，软件在自己的日志里
+                    # 说谎**。lat 缓存 60s 内不刷新，同一对值被反复
+                    # 比较 → 每分钟约 3 次全量测速，设计意图是 5 分钟 1 次。
+                    #
+                    # 顺带：1350 行附近的日志文案也只在条件真满足时
+                    # 才与数值自洽。
+                    # 全脚本只有这一处漏括号（pick_by_speed 和
+                    # pick_fastest 都正确写了 lo * (100 + r) / 100）。
+                    #
+                    # ⚠️⚠️ 上面这些注释必须留在 if 语句**外面**，一行都不要
+                    # 挪进续行中间。2026-10-25 实测：续行（行尾 \）中间插一整
+                    # 行 # 注释，bash 会在注释那一行把命令切断——awk 只剩
+                    # -v 参数、拿不到程序文本，stderr 每周期多两行
+                    #     awk: no program given
+                    #     BEGIN{ exit !(a+0 > (b+0)*r) }: command not found
+                    # 而 if 条件恒为假，"变慢预警"整个功能静默失效：
+                    # 线路劣化要等 SPEED_RECHECK（300 秒）到期才发现，
+                    # 用户体感正是这段注释开头描述的"变慢了半天也不换"。
+                    # 注释和代码矛盾时代码赢，但读代码的人会按注释改——
+                    # 所以宁可把注释挪到上面，也不要相信"注释不影响执行"。
+                    # tests/mock_audit_degrade_warn.sh 锁定了这个行为。
                     if [ -n "$_lc" ] && [ -n "$_lo" ] \
                        && awk -v a="$_lc" -v b="$_lo" -v r="$LATENCY_DEGRADE_RATIO" \
-                              # ⚠️ 必须写成 (b+0)*r，不能写 b+0*r：
-                              # awk 里 * 的优先级高于 +，于是 b+0*r 等于
-                              # b+0 等于 b，**LATENCY_DEGRADE_RATIO 完全
-                              # 没有参与运算**，"变慢预警"退化成"另一条快任意
-                              # 一点点就重下全量"。
-                              #
-                              # 实测数值表（LATENCY_DEGRADE_RATIO=2）：
-                              #   lat_cur=13.1 lat_oth=13.0 比值 1.01x
-                              #     → 代码判定 FORCE，设计意图 keep
-                              #   lat_cur=25.9 lat_oth=13.0 比值 1.99x
-                              #     → 代码判定 FORCE，设计意图 keep
-                              # 端到端：mock lat_en0=13.4 / lat_en1=12.8，
-                              # 每周期都打"变慢预警…超过…的 2 倍"并做两次
-                              # 全量 4 连接下载，而 13.4 < 2×12.8=25.6——
-                              # **日志这句话本身是假的，软件在自己的日志里
-                              # 说谎**。lat 缓存 60s 内不刷新，同一对值被反复
-                              # 比较 → 每分钟约 3 次全量测速，设计意图是 5 分钟 1 次。
-                              #
-                              # 顺带：1350 行附近的日志文案也只在条件真满足时
-                              # 才与数值自洽。
-                              # 全脚本只有这一处漏括号（pick_by_speed 和
-                              # pick_fastest 都正确写了 lo * (100 + r) / 100）。
                               'BEGIN{ exit !(a+0 > (b+0)*r) }'; then
                         log "变慢预警: ${cur} 延迟 ${_lc}ms 超过 ${_oth_dev} 的 ${_lo}ms 的 ${LATENCY_DEGRADE_RATIO} 倍，提前重测吞吐"
                         _force=1
@@ -1896,7 +2088,13 @@ cmd_set() {
     # "无法识别: MODE"——而 MODE 明明是个合法配置键。用户看到这句只会
     # 更困惑：到底是模式名写错了，还是这个键不存在？
     # 判定"长得像配置键"用全大写+下划线，不会和模式名（全小写）混淆。
-    if [ -n "${2:-}" ] && printf '%s' "$1" | grep -qE '^[A-Z][A-Z0-9_]*$'; then
+    #
+    # ⚠️ 判据必须是 **$# -ge 2**（确实传了第二个参数），不能是 $2 非空。
+    # `smartroute set NOTIFY ""` 想显式清空一个值：用非空判断时 kv 保持成裸
+    # 键名，落到下面的 *) 报"无法识别: NOTIFY"——而 NOTIFY 是合法键，
+    # 用户会以为这个配置项不存在。参数个数不受值内容影响，才是对的判据。
+    # `set MODE wifi extra` 行为不变（仍取前两个）。
+    if [ $# -ge 2 ] && printf '%s' "$1" | grep -qE '^[A-Z][A-Z0-9_]*$'; then
         kv="$1=$2"
     fi
     if [ -z "$kv" ]; then
@@ -2006,13 +2204,23 @@ conf_set_auto() {   # $1=KEY $2=VALUE
     # 而 /Users/Shared 带 sticky 位，普通用户之后再也改不动它（App 保存会失败）。
     # 但用户级优先级更高，所以若用户级里已有同一项，必须一并更新，
     # 否则用户级里的旧值会盖掉 root 的改动（例如安全阀置 0 被用户级的 1 抵掉）。
+    #
+    # ⚠️ 每一次写的返回码都必须纳入函数返回值。
+    # 以前的写法把 root 分支第一次 conf_set 的退出码直接丢掉，紧随的
+    # `if [ -f ] && grep -q` 在条件为假时整条 if 返回 0 —— 于是函数返回"成功"。
+    # 后果：root 下 /etc/smartroute.conf 写不进去（只读卷、磁盘满、权限被改、
+    # MDM 管控）且用户级没有该键时，balance_on 一路跑到最后，打印
+    # "✅ 双网并发已开启"，而配置文件里一个字节都没改。此后守护进程的并发
+    # 安全阀、balance_weight_reevaluate、balance_reevaluate 全部以 BALANCE=1
+    # 为前提，**静默停摆**；重启后回落 BALANCE=0。pf 规则确实在跑所以不会
+    # 断网，但用户拿到的是一份假确认。
     if [ "$(id -u)" -eq 0 ]; then
-        conf_set "$1" "$2" "$CONF"
+        conf_set "$1" "$2" "$CONF" || return 1
         if [ -f "$USER_CONF" ] && grep -q "^$1=" "$USER_CONF" 2>/dev/null; then
-            conf_set "$1" "$2" "$USER_CONF"
+            conf_set "$1" "$2" "$USER_CONF" || return 1
         fi
     elif [ -w "$USER_CONF" ] || [ -w "$(dirname "$USER_CONF")" ]; then
-        conf_set "$1" "$2" "$USER_CONF"
+        conf_set "$1" "$2" "$USER_CONF" || return 1
     else
         return 1
     fi
@@ -2968,6 +3176,25 @@ MSG
     # 失败就会让父进程建 $T/stop、把整个下载毙掉。降级之后这条线不再接
     # 新片，已派出去的片也有 _fetch_seg 的兜底，下载能继续下完。
     FETCH_DEV_FAIL_MAX=2
+    # 限流闩锁是否"还热着"：最近 RL_HOT_WINDOW 秒内还有 worker 撞到 429/503。
+    #
+    # 为什么需要时间窗：worker 撞到限流时只写一个时间戳（不再删标记，理由见
+    # _fetch_seg 里那段注释）。若只看"文件存在"，那么下载早期撞过一次瞬时
+    # 429 就会把整次下载的连接数永久钉死在 2 条——实测 A/B（同一 24MB、
+    # -n 8、桩每请求固定 400ms）：起始撞一次 429 → 起到 2 条；全程无 429 →
+    # 起到 5 条。文件都正确，所以那是纯吞吐损失，而用户看到"-n 8 却只起了
+    # 2 条"且没有任何说明。
+    # 时间窗把两种极端都避开了：持续限流（窗口内一直有新 429）→ 不加连接；
+    # 早期抖了一下之后就正常了（窗口内没有新 429）→ 照常扩连。
+    FETCH_RL_HOT_WINDOW=10
+    _fetch_rl_hot() {
+        local f="$T/ratelimited" t now
+        [ -f "$f" ] || return 1
+        t="$(cat "$f" 2>/dev/null)"
+        case "$t" in ''|*[!0-9]*) return 1 ;; esac
+        now="$(date +%s)"
+        [ $(( now - t )) -le "$FETCH_RL_HOT_WINDOW" ]
+    }
     _fetch_dev_fail() {   # $1=设备名（空则什么都不做）
         [ -n "$1" ] || return 0
         local f="$T/devfail_$1" n=0
@@ -3110,6 +3337,17 @@ MSG
     # 诊断完全错误，用户会跑去换源，而真正的原因只是 URL 写错了。
     _fetch_seg() {   # $1=分片号 $2=start $3=end $4=URL $5=目录 $6=设备(空=不绑) $7=总大小
         local idx="$1" st="$2" en="$3" u="$4" d="$5" dev="${6:-}" sz="${7:-}" try got http rc
+        # _rl：最后一次失败是不是被服务端限流（429/503）。_fetch_try 通过动态
+        # 作用域写它（_fetch_try 定义在本函数内部）。重试耗尽后据此决定记账方式：
+        #   · 限流 → 写 rlfail_$idx，**不**记到网卡账上（线是好的，是服务端扛不住）
+        #   · 其它 → 走原来的 fail_$idx
+        # 以前不区分：429 耗尽后和"字节数不符"走同一条路，父进程打出
+        # "这个服务端的 Range 行为不一致…请换一个源"——而工具自己刚刚才用
+        # 416+Content-Range 证明过这个源支持 Range。用户照着换源、或者按建议
+        # 改单连接，两条都是错的（单连接同样会被限流）；正确处置"降 -n"
+        # 一次都没出现。附带"期望 2000000 实得 0 字节"也是纯噪音——
+        # 429 根本没有字节数可言。
+        local _rl=0
         # 不用数组拼 --interface：bash 3.2 下空数组展开有坑，而设备名
         # （en0/en1）不可能含空格，未加引号的 $ifpre 展开是安全的。
         local ifpre=""
@@ -3127,13 +3365,30 @@ MSG
         #   假死时要 3 次 × 600 秒才发现，用户早以为软件死了。
         _fetch_try() {
             # --fail 让 4xx/5xx 返回非 0；-w 把状态码写出来，即使失败也有值
-            # （连不上时是 000，正好和 HTTP 错误区分开）。
-            http="$(curl -sS -L --fail --connect-timeout 10 --speed-limit 20480 \
-                    --speed-time 20 --max-time 300 --range "${st}-${en}" \
-                    $ifpre \
-                    -D "$d/h$idx" \
-                    -o "$d/p$idx" -w '%{http_code}' "$u" 2>/dev/null)"
+            # （连不上时是 000，正好和 HTTP 错误分开）。
+            #
+            # ⚠️ 必须是"后台 + wait"，不能写成 $(curl …) 命令替换。
+            # bash 会把发给"正在等前台子命令的 shell"的 SIGTERM **推迟到该子命令
+            # 结束**才处理——worker 前台跑的是 curl，所以父进程 kill worker 对它
+            # 无效，在途分片会整片下完（或等到 --speed-time 20 才中止），父进程
+            # 卡在 wait 里。实测 8MB/-n 4、一片 404 + 一片连接假死：404 在
+            # 0.05 秒内就被检出、$T/stop 也建了，用户却干等 21 秒才看到报错，
+            # 而那 2MB 照样传完了（桩的记录为证）——3332 行起那段注释说 stop
+            # 机制是为了不"白费带宽和时间"，实际两个都没做到。
+            # 改成后台跑并把 curl 的 PID 落盘，父进程就能直接杀到 curl。
+            # bash 3.2 安全：不用数组、不用 wait -n。
+            curl -sS -L --fail --connect-timeout 10 --speed-limit 20480 \
+                 --speed-time 20 --max-time 300 --range "${st}-${en}" \
+                 $ifpre \
+                 -D "$d/h$idx" \
+                 -o "$d/p$idx" -w '%{http_code}' "$u" > "$d/code_$idx" 2>/dev/null &
+            local _cp=$!
+            printf '%s\n' "$_cp" > "$d/curl_$idx" 2>/dev/null
+            wait "$_cp"
             rc=$?
+            rm -f "$d/curl_$idx" 2>/dev/null
+            http="$(cat "$d/code_$idx" 2>/dev/null)"
+            rm -f "$d/code_$idx" 2>/dev/null
             if [ "$rc" -eq 0 ]; then
                 # 注意：不能写 wc -c < "$d/p$idx" 2>/dev/null。
                 # bash 按从左到右处理重定向，< 先执行——文件打不开时
@@ -3186,14 +3441,22 @@ MSG
                     # 成功了要清掉前几次失败留下的 connfail 标记，否则重试成功
                     # 的分片会被父进程算进"连接失败"里，诊断就虚报了。
                     rm -f "$d/connfail_$idx" 2>/dev/null
-                    # 限流标记也要清：429/503 只说明"那一刻服务端扛不住"，
-                    # 但这个标记原来只写不删，于是一次瞬时 429 就把整次下载
-                    # 的连接数永久钉死在 2 条——实测 A/B（同一 24MB、-n 8、
-                    # 桩每请求固定 400ms）：起始撞一次 429 → 起到 2 条；
-                    # 全程无 429 → 起到 5 条。文件都正确，所以这是纯吞吐损失，
-                    # 而用户看到"-n 8 却只起了 2 条"且没有任何说明。
-                    # connfail 早就是"有成功即清"的设计，这里对齐它。
-                    rm -f "$d/ratelimited" 2>/dev/null
+                    # 限流标记**不能在这里清**。它是父进程扩连循环的**全局闩锁**
+                    # （父进程看 $T/ratelimited 就不再往上加 worker），而这里是
+                    # 任一分片成功都会走到的地方：多 worker 下几乎必然有别的
+                    # worker 在那 1 秒退避窗口里成功，标记平均只活几十毫秒，
+                    # 父进程 0.2 秒一次的轮询基本不可能看见它——闩锁形同虚设。
+                    # A/B 实测（同一慢服务端、-n 8）：原版扩到 5 条、回 9 个 429；
+                    # 不清标记的版本扩到 3 条、同样 9 个 429。连接数白爬 2 条，
+                    # 而屏幕上写着"服务端扛得住才加"。严重时多起的连接招来更多
+                    # 429，某片 3 次重试耗尽，**整个下载失败**。
+                    #
+                    # connfail 早就是"有成功即清"的设计，但两者语义不同：
+                    # connfail 是**每片一份**（$d/connfail_$idx），清了不影响别人；
+                    # ratelimited 是**全局一份**，清它等于替所有 worker 做决定。
+                    # 不再用"空文件 + 有人成功就删"，改成带时间戳、由父进程按
+                    # 时间窗判断（见 _fetch_rl_hot），既让闩锁真的生效，
+                    # 也不会退回"一次瞬时 429 就把整次下载钉死在 2 条"的老问题。
                     return 0
                 fi
                 return 1
@@ -3202,10 +3465,11 @@ MSG
             # proof.ovh.net 和 hetzner 用 429 打过，多连接下载尤其容易触发。
             # 当成致命错误会让整个下载立刻毙掉，而那只是需要退避。
             if [ "$http" = "429" ] || [ "$http" = "503" ]; then
-                # 留下限流标记：父进程的扩连循环看到它就不再往上加 worker。
-                # 限流的含义是"服务端扛不住这么多连接"，此时加连接只会
-                # 招来更多 429，而原来的做法是闷头睡 15 秒（见下面退避）。
-                : > "$d/ratelimited" 2>/dev/null
+                # 留下限流标记（带时间戳）：父进程的扩连循环看到它就不再往上
+                # 加 worker。限流的含义是"服务端扛不住这么多连接"，此时加连接
+                # 只会招来更多 429，而原来的做法是闷头睡 15 秒（见下面退避）。
+                printf '%s\n' "$(date +%s)" > "$d/ratelimited" 2>/dev/null
+                _rl=1
                 return 3
             fi
             if [ -n "$http" ] && [ "$http" != "000" ] && [ "$http" -ge 400 ] 2>/dev/null; then
@@ -3223,6 +3487,7 @@ MSG
         }
 
         for try in 1 2 3; do
+            _rl=0
             _fetch_try
             case $? in
                 0) return 0 ;;
@@ -3243,14 +3508,26 @@ MSG
         # 再**不绑接口**试一次：默认路由一定是通的（单连接下载一直走它）。
         # 注意不能反过来"先换另一条设备"——另一条可能也在抽风，
         # 而默认路由是系统自己选的，最可能通。
-        if [ -n "$dev" ]; then
+        #
+        # ⚠️ 被限流时**不能**记网卡的账。429 说明的是"服务端扛不住这么多
+        # 连接"，和这条线通不通无关。以前不区分，实测两个 worker 都在 en0 上
+        # 撞 429 后打出：
+        #     ⚠️  en0 连续失败，已停止往它派片（剩余分片改走另一条线/默认路由）
+        # 而 en0 刚刚还成功探过（206），线是好的——用户会去查网线。
+        # 同时兜底也不该做：换接口解决不了服务端限流，只会多耗一次完整超时。
+        if [ -n "$dev" ] && [ "$_rl" != "1" ]; then
             _fetch_dev_fail "$dev"
             ifpre=""
+            _rl=0
             _fetch_try
             case $? in
                 0) return 0 ;;
                 2) return 1 ;;
             esac
+        fi
+        # 限流耗尽：留一份专门的标记，让父进程说出正确的处置（降 -n）。
+        if [ "$_rl" = "1" ]; then
+            : > "$d/rlfail_$idx" 2>/dev/null
         fi
         return 1
     }
@@ -3288,6 +3565,19 @@ MSG
                 printf '%s %s %s\n' "$idx" "$want" "${got:-0}" > "$d/fail_$idx"
                 return 1
             fi
+            # 这一片**真的下完了**，单独留一个标记。
+            #
+            # ⚠️ 父进程的扩连阈值必须数这个 done_*，不能数 $T/p*。
+            # curl 一收到 body 的第一个字节就建 p 文件，"刚开始下"就被当成
+            # "下完了"——而 3460-3462 行的注释和阈值算法的全部依据是
+            # "每个 worker 平均至少要完整下完一片才允许再加人"。
+            # 实测 32MB/16 片/-n 8、每片 4 秒的慢链路：第 3 个 worker 在
+            # t=0.45s 就被拉起，而第一片要到 t=3.6s 才下完——零片完成就加人，
+            # 屏幕上还写着"服务端扛得住才加"。慢服务端本该收敛在低连接数
+            # （这正是这套阈值存在的理由），现在会一路爬到 5 条。
+            # mock_fetch_ramp 抓不到：它的 slowsize/<n>/700 是给 body **之前**
+            # 睡 700ms，p 文件出现时机≈完成时机，正好绕开这个差异。
+            : > "$d/done_$idx" 2>/dev/null
         done
         return 0
     }
@@ -3379,8 +3669,11 @@ MSG
         # 原因不是阈值，是整个下载只要 1 秒、ramp 根本来不及——
         # 那种情况下该做的是把已有的少数 worker 分对活（按容量加权，
         # 见 _spread_pick），不是硬加连接数。
-        if [ "$_spawned" -lt "$n" ] && [ ! -f "$T/ratelimited" ]; then
-            _comp=$(ls "$T"/p* 2>/dev/null | wc -l | tr -d ' ')
+        if [ "$_spawned" -lt "$n" ] && ! _fetch_rl_hot; then
+            # 数**已完成**的分片（worker 下完一片才建 done_<片号>），
+            # 不是 $T/p*——后者在 curl 收到第一个 body 字节时就存在了，
+            # 数它等于把"刚开始下"当成"下完了"，见 _fetch_worker 里的说明。
+            _comp=$(ls "$T"/done_* 2>/dev/null | wc -l | tr -d ' ')
             _remain=$(( total_chunks - _comp ))
             if [ "$_comp" -ge "$_next_spawn_at" ] && [ "$_remain" -gt "$_alive" ]; then
                 _fetch_worker "$T/q" "$total_chunks" "$url" "$T" "$chunk" "$size" &
@@ -3429,6 +3722,19 @@ MSG
         for _k in ${pids[@]+"${pids[@]}"}; do
             kill "$_k" 2>/dev/null
         done
+        # 光 kill worker 不够：worker 前台等的是 curl，而 bash 会把发给
+        # "正在等前台子命令的 shell"的 SIGTERM 推迟到该子命令结束才处理
+        # （见 _fetch_try 里那段注释）。所以这里要把 curl 的 PID 也杀掉，
+        # 否则在途分片会整片下完，父进程卡在 wait 里——实测白等 21 秒、
+        # 那 2MB 照样传完。curl 的 PID 由 _fetch_try 落在 $d/curl_<片号>，
+        # 成功或失败都会删掉，所以这里列出来的都是在途的。
+        local _cf _cpid
+        for _cf in "$T"/curl_*; do
+            [ -f "$_cf" ] || continue
+            _cpid="$(cat "$_cf" 2>/dev/null)"
+            case "$_cpid" in ''|*[!0-9]*) continue ;; esac
+            kill "$_cpid" 2>/dev/null
+        done
         wait 2>/dev/null
         rc=1
     fi
@@ -3455,6 +3761,29 @@ MSG
             [ "$_n" -ge 3 ] && break
         done
         [ "$_n" -ge 3 ] && _msg="${_msg}；…等 ${_n} 个分片"
+        # 限流要单独说，而且必须排在"字节数不符"前面。
+        #
+        # 为什么必须排前面：被 429/503 打退的分片走的是同一条 fail_ 路径
+        # （重试耗尽后写 fail_<片号>），所以下面这段"分片大小与请求不符"
+        # 会把它们一起算进去，打出
+        #     原因：这个服务端的 Range 行为不一致…请换一个源，或用单连接下载
+        # 而工具自己刚刚才用 416+Content-Range 证明过这个源支持 Range。
+        # 用户照着换源、或按建议改单连接——两条都是错的，单连接同样会被限流；
+        # 真正该做的（把 -n 降到 2~4）一次都没出现。附带的
+        # "期望 2000000 实得 0 字节"也是纯噪音：429 根本没有字节数可言。
+        local _rln=0
+        for _fi in "$T"/rlfail_*; do
+            [ -f "$_fi" ] || continue
+            _rln=$(( _rln + 1 ))
+        done
+        if [ "$_rln" -gt 0 ]; then
+            echo "分片被服务端限流（HTTP 429/503，${_rln} 个分片重试 ${3:-3} 次仍被拒）"
+            echo "原因：服务端扛不住这么多并发连接，不是网络问题，也不是源坏了。"
+            echo "      多连接下载尤其容易触发——实测被 proof.ovh.net 和 hetzner 打过。"
+            echo "处置：把 -n 降到 2~4 再试（例如 -n 2）。换源通常没用，"
+            echo "      单连接同样会被限流；工具已停止继续加连接。"
+            die "有分片下载失败（已重试 3 次，临时文件已清理）"
+        fi
         if [ -n "$_msg" ]; then
             echo "分片大小与请求不符：${_msg}"
             echo "原因：这个服务端的 Range 行为不一致（对同一文件返回不同内容/大小），"
@@ -3570,12 +3899,16 @@ MSG
             # 反过来，对**正确**的服务端，重下回来的就是该位移的真实字节，
             # 和合并文件必然一致——所以这个校验不会误报，包括全零文件、
             # 稀疏镜像这类内容重复的场景（那时两边都相同，照样通过）。
+            # _vskip 数"没验成的段"，_vtry 数"本来打算验几段"（片数不足 4 时
+            # 会少于 4），末尾据此决定要不要提示。
+            _vskip=0; _vtry=0
             for _vidx in 0 1 2 3; do
                 [ "$_vidx" -ge "${total_chunks:-1}" ] && break
                 _voff=$(( _vidx * chunk + chunk / 2 ))
                 [ "$_voff" -ge "$size" ] && continue
                 _vwant=$(( size - _voff ))
                 [ "$_vwant" -gt 65536 ] && _vwant=65536
+                _vtry=$(( _vtry + 1 ))
                 if curl -sS --fail --connect-timeout 10 --max-time 60 \
                         --range "${_voff}-$(( _voff + _vwant - 1 ))" \
                         -o "$_vtmp" "$url" 2>/dev/null && [ -f "$_vtmp" ]; then
@@ -3592,6 +3925,13 @@ MSG
                        || ! cmp -s "$_vtmp" "$_vtmp.mine"; then
                         _vok=0; break
                     fi
+                else
+                    # 参照下载本身失败（限流/抖动/超时）→ 这一段没验成。
+                    # 以前这里静默跳过，末尾直接报"完成"，用户以为内容被验过了。
+                    # 而那正是下面 die 的注释自己说的"比没有校验更危险"的事：
+                    # 多连接刚压过服务端一轮，之后开始限流是很常见的，
+                    # 实测 4 个抽查点里 2 个的重下请求吃到 429。
+                    _vskip=$(( _vskip + 1 ))
                 fi
                 rm -f "$_vtmp" "$_vtmp.mine" 2>/dev/null
             done
@@ -3599,6 +3939,14 @@ MSG
             if [ "$_vok" != "1" ]; then
                 rm -f "$out" 2>/dev/null
                 die "多连接下载的内容校验失败：单连接重下的字节和多连接拼出的不一致。这个源的 Range 实现有问题（可能被代理/CDN 改写），已删掉不完整的文件。请换一个源，或用 -n 1 单连接下载。"
+            fi
+            # 校验全过、但有几段是"没验成"而不是"验过了"——必须说清楚。
+            # 文件本身是对的（字节数和分片都对），所以不 die；但把一次
+            # 只完成了一半的校验说成"完成"，是让用户依赖一个没发生的保证。
+            # 用语和上面那句 die 保持一致（都叫"内容校验"）——同一件事在
+            # 一次下载里出现两个名字，用户没法把提示和日志对上。
+            if [ "${_vskip:-0}" -gt 0 ]; then
+                echo "⚠️  内容校验跳过 ${_vskip}/${_vtry:-4} 段（单连接重下被限流或网络抖动），本次未完整验证字节内容"
             fi
         fi
     fi
@@ -3930,6 +4278,19 @@ cmd_quality() {   # 每接口 6 个包测延迟/丢包（root 强制走该接口
     local role dev svc gw out loss rtt min avg max rest via
     # 逐个接口加主机路由强制走指定网卡，同样要和守护进程的探测互斥
     acquire_lock_wait 10 || die "另一个 smartroute 操作正在进行（守护进程刚跑过一轮），请稍候再试"
+    # 探测目标跟着 PROBE_TARGETS 走，不写死 223.5.5.5。
+    #
+    # 写死有过两个后果，都是用户可感知的：
+    #  1) README 说 PROBE_TARGETS "可换成公司内网 IP"。用户照做之后，质量页
+    #     仍然去打 223.5.5.5——一个他网络里可能不通的公网地址，于是这一页
+    #     稳定报 100% 丢包，而网络明明是好的。界面显示错比不显示更糟。
+    #  2) cleanup_probe_routes 是按 PROBE_TARGETS 删路由的（INSTALL.md 承诺
+    #     "按你配置的 PROBE_TARGETS 删，不限于默认那几个"）。写死的目标不在
+    #     用户列表里时，加完路由还没删就被杀掉（SIGKILL、或 EXIT trap 前的
+    #     崩溃）会漏删一条主机路由，留在系统路由表里没人再尝试清。
+    # 取第一个：质量页只需要一个稳定目标，多打几个只是把这一页拖慢。
+    local _qt="${PROBE_TARGETS%%[[:space:]]*}"
+    case "$_qt" in ''|*[!0-9.]*) _qt="223.5.5.5" ;; esac
     find_active
     for role in eth wifi; do
         if [ "$role" = "eth" ]; then dev="$ACTIVE_ETH_DEV"; svc="$ACTIVE_ETH_SVC"
@@ -3939,10 +4300,10 @@ cmd_quality() {   # 每接口 6 个包测延迟/丢包（root 强制走该接口
         gw="$(svc_router "$svc")"
         via="default"
         if [ "$(id -u)" -eq 0 ] && [ -n "$gw" ]; then
-            if route_add_host "223.5.5.5" "$dev" "$gw"; then via="hostroute"; fi
+            if route_add_host "$_qt" "$dev" "$gw"; then via="hostroute"; fi
         fi
-        out="$(ping -c 6 -W 800 223.5.5.5 2>/dev/null)"
-        [ "$via" = "hostroute" ] && route delete -host "223.5.5.5" -interface "$dev" 2>/dev/null
+        out="$(ping -c 6 -W 800 "$_qt" 2>/dev/null)"
+        [ "$via" = "hostroute" ] && route delete -host "$_qt" -interface "$dev" 2>/dev/null
         # "6 packets transmitted, 6 received, 0.0% packet loss" → 取带 % 的那一项
         loss="$(printf '%s' "$out" | awk '/packet loss/{for(i=1;i<=NF;i++) if($i ~ /%$/) print $i}')"
         rtt="$(printf '%s' "$out" | awk -F' = ' '/round-trip/{print $2}')"
@@ -4041,6 +4402,24 @@ write_pf_rules() {   # $1=设备A $2=网关A $3=设备B $4=网关B $5=额外排�
     # 用 table 而非列表字面量：macOS 的 pf 不允许对 { a b c } 这样的列表取反
     list="$lan1"
     [ "$same" = "1" ] || list="$list $lan2"
+    # **其余物理接口的网段也要排除**。
+    #
+    # find_active 只挑一块以太网 + 一块 Wi-Fi，机器上其余的网卡（外置 USB
+    # 网卡、iPhone USB 共享网络 en5、iSCSI 存储网段）原本完全不在表里，
+    # 而 `from any to ! <lan_all>` 对它们是命中的——于是本机发往那些局域网的
+    # 流量被 route-to 赶到另一个网关并被 nat 改写源地址，那个局域网整个不可达，
+    # 且没有任何提示。
+    # 对照之下同一个网段如果是 utun3 上的 VPN 路由，other_nets 会正确排除它：
+    # 物理网卡和虚拟网卡待遇不一致。而本项目自己的原则（见 _balance_nets_ok
+    # 的注释）是"宁可保留旧规则，也不能生成一条会打死局域网的规则"。
+    # 排除 LAN 永远是安全方向：多排除一个网段只是让那个网段不走分流，
+    # 而漏排除会让它彻底不通。
+    local _o _os
+    for _o in $(ifconfig -l 2>/dev/null); do
+        case "$_o" in "$d1"|"$d2") continue ;; esac
+        _os="$(dev_subnet "$_o" 2>/dev/null)"
+        [ -n "$_os" ] && list="$list $_os"
+    done
     [ -n "$excl" ] && list="$list $excl"
     list="$list 169.254.0.0/16 224.0.0.0/4 127.0.0.0/8"
     list="$(printf '%s' "$list" | tr -s ' ' | sed 's/^ //;s/ $//')"
@@ -4207,15 +4586,34 @@ balance_validate() {   # $1=设备A $2=IP-A $3=设备B $4=IP-B $5=只走的设�
         # 两个条件同时满足才算这一侧真的在扛：
         #   · 绝对量够大：>= VALIDATE_MIN_BYTES（64KB）。
         #     10 个连通性探测本身就会产生远大于此的出站流量，
-        #     所以真分流时轻松超过；纯背景心跳到不了。
-        #   · 占比别太低：>= 10%。防止一侧扛了 4GB、另一侧 70KB
-        #     这种"看起来分流了、其实全在一条线上"的情况。
+        #     所以真分流时轻松超过；纯背景心跳到不了。**这是硬门槛。**
+        #   · 占比 >= 10%。这一条**只是提示，不再作为硬门槛**，原因见下面。
+        #
+        # ⚠️ 占比原来也是硬门槛，实测把一个常见场景整个堵死：
+        # 用户正在 Wi-Fi 上下载大文件（或云同步/视频会议在跑），想起要开双网
+        # 并发 → 10 个探测让 en0 产生约 100KB 出站，同一窗口里 Wi-Fi 的下载
+        # 推进 3MB → en0 占比 3% → "验证失败：流量没有走预期接口
+        # （en0 +100000 字节/3%，en1 +3000000 字节/96%），已自动还原"。
+        # 回滚本身安全，但重试多少次都是同样结果——**双网并发恰好在"正在下载"
+        # 这个最需要它的场景下开不了**，而报错把他引向"pf 没生效"的错误方向。
+        #
+        # 为什么不改成"减掉背景"：netstat 只有**聚合计数器**，没法把"我们这
+        # 10 个探测连接"和"用户那个 3MB 下载"分开；要减就得知道探测窗口的
+        # 精确时长，而 macOS 的 date 没有 %N，整数秒的误差（背景 1MB/s 时
+        # 1 秒就是 1MB）比探测流量本身（100KB）还大——减完比不减更不可信。
+        #
+        # 而占比作为硬门槛本来也防不住它想防的那个情况：pf 真没生效时，
+        # 全部探测都走默认路由，另一侧只剩背景心跳（几百字节到几 KB），
+        # **远低于 64KB 的绝对门槛**——绝对量这一条就已经抓住了。
+        # 于是占比只在"两侧都远超 64KB、但差得极悬殊"时才起作用，
+        # 而那正是存量下载造成的形状。所以降为提示：既保住真失败的检出，
+        # 又不再把可用场景判死。提示里带具体数字，用户自己能判断。
         local bad_if="" bad_g=0 _tot=$(( g1 + g2 )) _min_pct=10
         local _p1=0 _p2=0
         [ "$_tot" -gt 0 ] && { _p1=$(( g1 * 100 / _tot )); _p2=$(( g2 * 100 / _tot )); }
-        # 某一侧是否"真的在扛"
-        _d1_ok() { [ "$g1" -ge "$VALIDATE_MIN_BYTES" ] && [ "$_p1" -ge "$_min_pct" ]; }
-        _d2_ok() { [ "$g2" -ge "$VALIDATE_MIN_BYTES" ] && [ "$_p2" -ge "$_min_pct" ]; }
+        # 硬门槛只看绝对量；占比另算一份，只用于提示
+        _d1_ok() { [ "$g1" -ge "$VALIDATE_MIN_BYTES" ]; }
+        _d2_ok() { [ "$g2" -ge "$VALIDATE_MIN_BYTES" ]; }
         if [ "$only" = "$d1" ]; then
             _d1_ok || { bad_if="$d1"; bad_g="$g1"; }
         elif [ "$only" = "$d2" ]; then
@@ -4225,10 +4623,27 @@ balance_validate() {   # $1=设备A $2=IP-A $3=设备B $4=IP-B $5=只走的设�
             elif ! _d1_ok; then bad_if="$d1"; bad_g="$g1"
             elif ! _d2_ok; then bad_if="$d2"; bad_g="$g2"; fi
         fi
+        # 占比悬殊不当失败判据，但要留痕：那可能是"其实全在一条线上"，
+        # 也可能是旁边正有大流量在跑——用户手里的上下文比我们多。
+        if [ -z "$bad_if" ] && [ "$_tot" -gt 0 ]; then
+            if   [ "$_p1" -lt "$_min_pct" ]; then _skew="$d1 +$g1 (${_p1}%)"
+            elif [ "$_p2" -lt "$_min_pct" ]; then _skew="$d2 +$g2 (${_p2}%)"
+            fi
+            if [ -n "${_skew:-}" ]; then
+                # ⚠️ 必须写 ${_skew} 不能写 $_skew：后面紧跟的全角逗号会被 bash
+                # 当成变量名的合法组成部分（UTF-8 locale 下），于是展开成空。
+                # 实测 `echo "$_skew，x"` 打出乱码 + 空值，而花括号写法正常。
+                # 这正是 tests/mock_locale_trap.sh 盯着的那类坑，写的时候还是踩了。
+                log "并发分流验证: 流量分布悬殊（${_skew}），可能是存量下载，也可能分流未完全生效"
+                echo "⚠️  流量分布悬殊：${_skew}，另一侧占绝大部分。" >&2
+                echo "    若此时没有大文件在下载，可能是分流未完全生效；" >&2
+                echo "    用 smartroute fetch -n 4 看下载完的逐接口字节报告来确认。" >&2
+            fi
+        fi
         if [ -n "$bad_if" ]; then
             log "并发分流验证失败: 流量未走预期接口 ($bad_if +$bad_g 字节, $d1 +$g1 / $d2 +$g2)"
             echo "验证失败：流量没有走预期接口（$d1 +$g1 字节/${_p1}%，$d2 +$g2 字节/${_p2}%），已自动还原" >&2
-            echo "         （判定标准：单侧至少 ${VALIDATE_MIN_BYTES} 字节且占比 ≥10%；" >&2
+            echo "         （判定标准：单侧至少 ${VALIDATE_MIN_BYTES} 字节；" >&2
             echo "           低于此更可能是背景心跳，不是分流生效）" >&2
             echo "提示：本机 macOS 的 pf 可能未对出站流量生效 route-to。" >&2
             return 1
@@ -4371,12 +4786,17 @@ MSG
     fi
 
     # 必须能确定两个接口的网段，否则生成的排除规则不完整（会误伤局域网），宁可不开
+    #
+    # ⚠️ 这里原来有一句 `unset lan1 lan2`。它不只多余（两者已声明为 local），
+    # 而且**有害**：4792 行的用户提示 "生成分流规则: en0($lan1, gw …)" 还在引用
+    # 它们，unset 之后打出来永远是 `en0(, gw 192.168.1.1)`——本该是网段的位置
+    # 是个空洞，而那句话的作用正是让用户核对我们排除的网段对不对。
+    # 删掉 unset，让提示和实际使用的值一致。
     local lan1 lan2
     lan1="$(dev_subnet "$ACTIVE_ETH_DEV")"; lan2="$(dev_subnet "$ACTIVE_WIFI_DEV")"
     if [ -z "$lan1" ] || [ -z "$lan2" ]; then
         die "无法确定接口网段（$ACTIVE_ETH_DEV=${lan1:-未知} / $ACTIVE_WIFI_DEV=${lan2:-未知}），为安全起见不开启并发分流"
     fi
-    unset lan1 lan2
 
     # 排除 VPN/拨号网段，避免分流把 VPN 流量送到物理接口
     local excl
@@ -4385,11 +4805,11 @@ MSG
         echo "检测到 VPN/拨号网段，将排除: $excl"
     fi
 
-    # 两个接口走同一个网关 = 同一条上网路径，分流不会带来带宽提升（但也不会冲突）
-    if [ "$eth_gw" = "$wifi_gw" ]; then
-        echo "⚠️  注意：两个接口的网关相同（${eth_gw}），属于同一条上网路径，"
-        echo "    并发分流不会提升带宽；只有两个接口通往不同网关/不同外网时才有叠加效果。"
-    fi
+    # 这里原来还有一段"两个接口网关相同 → 不会提升带宽（但也不会冲突）"的提示。
+    # 它是**死代码**：上面 4663 行已经用同一个判据 `[ "$eth_gw" = "$wifi_gw" ]`
+    # die 掉了，永远走不到这里。而且它的注释写"但也不会冲突"，与 4663 行
+    # 拒绝信息里的"会让网页卡壳"直接矛盾——正是本项目特别强调的
+    # "注释与代码相反"。同网关的完整说明已经在拒绝信息里，删掉这块。
 
     # fastest 模式：测量两边延迟，只让更快的那个出口承载新连接
     local only="" eth_lat="" wifi_lat="" winner=""
@@ -4466,9 +4886,15 @@ MSG
     write_pf_rules "$ACTIVE_ETH_DEV" "$eth_gw" "$ACTIVE_WIFI_DEV" "$wifi_gw" "$excl" "$only" "$w1" "$w2" \
         || { trap - INT TERM; die "无法写入 $PF_ANCHOR_FILE"; }
 
-    # 记录系统 pf 原状态，便于撤销时还原
+    # 记录系统 pf 原状态，便于撤销时还原。
+    #
+    # ⚠️ 已经是"我们开的"时**不能**把它覆写成 0。
+    # 以前无条件写：第二次 balance on（用户重试、或换个模式再开）时 pf 已因
+    # 第一次被我们打开，于是记录成"系统原有"。balance off 时
+    # pf_enabled_by_us 为假 → 不执行 pfctl -d → 系统 pf 被留在开启状态。
+    # 那正是"撤销时没恢复原状"，而且 balance status 会一直显示"系统 pf: 开启"。
     if pf_enabled; then
-        echo "pf_enabled_by_us=0" > "$PF_STATE_FILE" 2>/dev/null
+        pf_enabled_by_us || echo "pf_enabled_by_us=0" > "$PF_STATE_FILE" 2>/dev/null
     else
         pfctl -e 2>/dev/null
         echo "pf_enabled_by_us=1" > "$PF_STATE_FILE" 2>/dev/null
@@ -4678,7 +5104,20 @@ balance_status() {
     if pfctl -a "$PF_ANCHOR" -s rules 2>&1 | grep -q "Permission denied"; then
         echo "  分流规则       : 无法读取（需 sudo smartroute balance status）"
     elif pf_anchor_loaded; then
-        echo "  分流规则       : 已加载（${PF_ANCHOR_FILE}）"
+        # 规则在，但**系统 pf 关着** → 分流实际没有生效。
+        #
+        # pfctl -d 只清"运行中"标志，规则集仍留在内核里，所以单看 anchor
+        # 非空会一直以为"规则好好的"。而 route-to/NAT 早就停止作用了。
+        # 以前这里照样打"已加载"，配上下面的 BALANCE=1 和分流策略，
+        # 用户看到的是"显示全都正常，但两条线并没有合在一起用"——
+        # 而且守护进程的自愈分支也判同一条，永远不再 pfctl -e。
+        # 现在明说，并给出该敲的命令。
+        if pf_enabled >/dev/null 2>&1; then
+            echo "  分流规则       : 已加载（${PF_ANCHOR_FILE}）"
+        else
+            echo "  分流规则       : 规则在，但系统 pf 已关闭 → 分流未生效"
+            echo "                    （跑 sudo smartroute balance on 重新启用，或等守护进程自愈）"
+        fi
     elif [ -f "$PF_ANCHOR_FILE" ]; then
         echo "  分流规则       : 文件存在但未加载"
     else
@@ -5016,16 +5455,29 @@ wifi_saved_list() {
 }
 
 # 候选列表 = WIFI_PREFERRED 里指定的（靠前优先）+ 其余已保存的（去重）
+#
+# 输出**一行一个 SSID**，不是空格分隔。
+#
+# 为什么改：空格分隔的表示法让整条候选链对"名字里带空格"的 SSID 全线失效——
+# "My Home"、"Office 5G"、"CMCC-EDU 5G" 这种名字极常见，被 for x in $list
+# 拆成两个候选后，真正的网络永远试不到。实测三重后果：
+#   · wifi tryall → "没找到能上网的网络。试了 5 个：4 个不在范围"，
+#     而 "My Home" 明明能上网
+#   · 守护进程的自动故障转移走同一条管道，同样永远切不过去
+#   · wifi scan 正连着 "My Home"，却把它报成"不在范围"——问的是 "My" 和 "Home"
+# 附带：空格分隔还会被 glob 展开（候选里有 * 时展开成目录清单，已实测）。
+# 换行分隔 + while read 一次解决这两件事。
 wifi_preferred_candidates() {
     local pref saved out="" ssid
-    pref="$(printf '%s' "$WIFI_PREFERRED" | tr ',' ' ')"
-    saved="$(wifi_saved_list | tr '\n' ' ')"
-    for ssid in $pref $saved; do
-        [ -n "$ssid" ] || continue
-        case " $out " in *" $ssid "*) continue ;; esac
-        out="$out $ssid"
-    done
-    printf '%s\n' "${out# }"
+    pref="$(printf '%s' "$WIFI_PREFERRED" | tr ',' '\n')"
+    saved="$(wifi_saved_list)"
+    # 去重用 awk 而不是 case " $out "：后者又回到空格分隔的老路
+    { printf '%s\n' "$pref"; printf '%s\n' "$saved"; } \
+        | awk 'NF && !seen[$0]++' \
+        | while IFS= read -r ssid; do
+              [ -n "$ssid" ] || continue
+              printf '%s\n' "$ssid"
+          done
 }
 
 # ---------- 附近网络扫描（免权限） ----------
@@ -5059,27 +5511,45 @@ wifi_scan_bin() {   # -> stdout: helper 路径；找不到输出空
 # -> stdout: "SSID rssi channel"（只含有信号的，按信号降序）
 # -> 另设 WIFI_SCAN_UNKNOWN=几个没能确认在不在范围
 wifi_scan() {
-    local list="$1" thorough="${2:-0}" bin line ssid rssi ch fresh need="" out="" s
-    local NL=$'\n' 
+    # $1=候选列表，**一行一个 SSID**（不是空格分隔，理由见
+    # wifi_preferred_candidates 上面那段：空格分隔会把 "My Home" 拆成两个）
+    local list="$1" thorough="${2:-0}" bin line ssid rssi ch fresh out="" s
+    local NL=$'\n'
+    # 需要真扫的那些，用数组传给 helper。不能再用 `"$bin" $extra $need` 的
+    # 裸展开：SSID 含空格时会被拆成多个参数，helper 收到的是 "My" 和 "Home"。
+    # 脚本没有 set -u，所以 bash 3.2 下空数组展开是安全的。
+    local -a _need=()
+    local _need_n=0
     bin="$(wifi_scan_bin)" || { WIFI_SCAN_AVAILABLE=0; WIFI_SCAN_UNKNOWN=0; return 1; }
     WIFI_SCAN_AVAILABLE=1
     WIFI_SCAN_UNKNOWN=0
     [ -n "$list" ] || return 1
 
     # 缓存还新鲜的直接拿来用
-    for s in $list; do
+    while IFS= read -r s; do
         [ -n "$s" ] || continue
         if _metric_fresh "wifiscan_$s" "$WIFI_SCAN_TTL"; then
+            # _metric_get 存的是 "rssi ch fresh ts" 四段，但两条路径的输出形状
+            # 必须一致（都是 "SSID rssi ch"），所以这里只取前两段。
+            #
+            # ⚠️ 以前这里是 out="$out$s $line$NL"，把整行都拼进去，靠末尾那个
+            # awk 的 `{print $2" "$1" "$3}` 顺手截断。改成"取末尾两个字段"之后
+            # （理由见函数末尾：SSID 本身可以含空格），缓存路径多出来的
+            # fresh/ts 就被当成了 rssi/ch——实测输出 "A -52 6 1 1792941333"。
+            # 形状必须在**源头**归一，不能依赖下游 awk 的字段数假设。
             line="$(_metric_get "wifiscan_$s")"
             rssi="${line%% *}"
-            [ "$rssi" != "-" ] && out="$out$s $line$NL"
+            ch="${line#* }"; ch="${ch%% *}"
+            [ "$rssi" != "-" ] && out="$out$s $rssi $ch$NL"
         else
-            need="$need $s"
+            _need+=("$s"); _need_n=$(( _need_n + 1 ))
         fi
-    done
+    done <<EOF_LIST
+$list
+EOF_LIST
 
     # 剩下的真扫。helper 输出 TSV：SSID \t rssi \t channel \t fresh
-    if [ -n "${need# }" ]; then
+    if [ "$_need_n" -gt 0 ]; then
         local extra=""
         [ "$thorough" = "1" ] || extra="--quick"
         while IFS="$(printf '\t')" read -r ssid rssi ch fresh; do
@@ -5097,7 +5567,7 @@ wifi_scan() {
                 # 但单独问 B 能拿到 -60。系统约每 5 秒才肯真扫一次。
                 WIFI_SCAN_UNKNOWN=$((WIFI_SCAN_UNKNOWN+1))
             fi
-        done < <("$bin" $extra $need 2>/dev/null)
+        done < <("$bin" $extra "${_need[@]}" 2>/dev/null)
     fi
 
     [ -n "$out" ] || return 1
@@ -5105,9 +5575,17 @@ wifi_scan() {
     #  · -s 稳定排序：相等的键必须保持输入顺序，否则"其余按原顺序垫后"作废
     #  · 先按 SSID 去重取最强：helper 已经这么做了，这里防一手重复行
     #  · out 是"一行一条"，别用 printf '%s\n' ${out}（会把所有条拼成一行）
+    #
+    # ⚠️ 行的形状是 "SSID rssi ch"，而 SSID 本身可以含空格——所以 rssi/ch 取
+    # **末尾两个字段**，行首到那之前全是 SSID。
+    # 以前这里用 $1/$2/$3，于是 "My Home -62 44" 被解析成 SSID="My"、
+    # rssi="Home"(+0=0)、ch="-62"，输出 "My 0 -62"——扫到的网络名字被砍掉
+    # 第一个词，用户看到的是一个不存在的网络。wifi_rank_candidates 里同一处
+    # 毛病（当时用 awk '{print $1}'）已经这么修，这里漏了。
     printf '%s' "$out" | awk 'NF>=3 {
-            r=($2=="-"?-999:$2+0)
-            if (!($1 in best) || r+0 > best[$1]) { best[$1]=r+0; ch[$1]=$3 }
+            r=($(NF-1)=="-"?-999:$(NF-1)+0)
+            ssid=substr($0,1,length($0)-length($(NF-1))-length($NF)-2)
+            if (!(ssid in best) || r+0 > best[ssid]) { best[ssid]=r+0; ch[ssid]=$NF }
         }
         END { for (k in best) printf "%d\t%s\t%s\n", best[k], k, ch[k] }' \
         | sort -s -t"$(printf '\t')" -k1,1nr | awk -F"$(printf '\t')" '{print $2" "$1" "$3}'
@@ -5134,7 +5612,9 @@ wifi_nearby() {
     # WIFI_SCAN_UNKNOWN 在同一个 shell 里累加，读完再打出来。
     local _f _rc
     _f="$(mktemp "${TMPDIR:-/tmp}/sr_nearby.XXXXXX")" || return 1
-    wifi_scan "$(wifi_saved_list | tr '\n' ' ')" "${1:-0}" >"$_f" 2>/dev/null
+    # wifi_saved_list 本来就是一行一个，直接传（以前 tr 成空格分隔，
+    # 那正是 SSID 带空格时整条链被切碎的起点）
+    wifi_scan "$(wifi_saved_list)" "${1:-0}" >"$_f" 2>/dev/null
     _rc=$?
     [ -s "$_f" ] && cat "$_f"
     printf '@unknown %s\n' "${WIFI_SCAN_UNKNOWN:-0}"
@@ -5285,22 +5765,35 @@ wifi_power_cycle() {   # $1=设备
 # 把候选列表按"附近信号强弱"重排：确认有信号的在前（强的更前），
 # 其余保持原顺序垫后。注意"没能确认"和"确认不在范围"都不提前——
 # 前者可能是假阴性，排在前面只是多花几秒，漏掉能用的网络才是真错。
-wifi_rank_candidates() {   # $1=空格分隔候选 -> stdout: 重排后的候选
-    local cands="$1" near="" s out=""
-    local NL=$'\n' 
+#
+# $1=候选列表，**一行一个 SSID**；stdout 同样是换行分隔。
+# （以前是空格分隔，"My Home" 会被拆成两个候选，见 wifi_preferred_candidates）
+wifi_rank_candidates() {
+    local cands="$1" near="" s
+    local NL=$'\n'
     near="$(wifi_scan "$cands" 0)"
     [ -n "$near" ] || { printf '%s\n' "$cands"; return 0; }
 
-    # near 是 "SSID rssi ch" 一行一条；没有信号的候选原样保留在后面
+    # near 是 "SSID rssi ch" 一行一条，而 SSID 本身可以含空格——
+    # 所以 rssi/ch 取**末尾两个字段**，行首到那之前全是 SSID。
+    # 以前用 awk '{print $1}' 取 SSID，"My Home -60 44" 会取成 "My"，
+    # 于是每个带空格的候选都被判成"没有信号"、原样垫后，重排完全失效。
+    # 没有信号的候选原样保留在后面（用整行比对，不用 $1）
     local have=""
-    have="$(printf '%s\n' "$near" | awk '{print $1}' | tr '\n' ' ')"
-    for s in $cands; do
-        case " $have " in *" $s "*) ;; *) near="$near$NL$s - 0" ;; esac
-    done
+    have="$(printf '%s\n' "$near" | awk '{ssid=substr($0,1,length($0)-length($(NF-1))-length($NF)-2); print ssid}')"
+    while IFS= read -r s; do
+        [ -n "$s" ] || continue
+        printf '%s\n' "$have" | grep -qxF "$s" || near="$near$NL$s - 0"
+    done <<EOF_CANDS
+$cands
+EOF_CANDS
 
-    printf '%s\n' "$near" | awk 'NF>=3 {r=($2=="-"?-999:$2+0); print r"\t"$1}' \
-        | sort -s -t"$(printf '\t')" -k1,1nr | awk -F"$(printf '\t')" '{printf "%s ", $2}'
-    echo
+    printf '%s\n' "$near" | awk 'NF>=3 {
+            r=($(NF-1)=="-"?-999:$(NF-1)+0)
+            ssid=substr($0,1,length($0)-length($(NF-1))-length($NF)-2)
+            print r"\t"ssid
+        }' \
+        | sort -s -t"$(printf '\t')" -k1,1nr | awk -F"$(printf '\t')" '{print $2}'
 }
 
 # stdout 契约：**只有**成功的 SSID（没有就空）。tests/mock_wifi.sh 依赖这个。
@@ -5309,10 +5802,12 @@ wifi_rank_candidates() {   # $1=空格分隔候选 -> stdout: 重排后的候选
 # 函数内对 WIFI_TRY_TOTAL 等的赋值父进程收不到，直接设变量会让汇总永远
 # 显示"试了 个"、三个分类全空，[ "" -gt 0 ] 还抛 stderr。
 # 而把统计打到 stdout 又会破坏上面那个契约，所以用文件。
-wifi_try_candidates() {   # $1=候选列表 $2=每个等几秒 -> stdout: 成功的 SSID 或空
+# $1=候选列表，**一行一个 SSID**（空格分隔会把 "My Home" 拆成两个，
+# 见 wifi_preferred_candidates 的说明）；$2=每个等几秒
+wifi_try_candidates() {
     local cands="$1" wait_s="${2:-6}" ssid gw
     WIFI_TRY_TOTAL=0; WIFI_TRY_OUTOFRANGE=0; WIFI_TRY_NOINET=0; WIFI_TRY_JOINFAIL=0
-    [ -n "$cands" ] || cands="$(wifi_saved_list | tr '\n' ' ')"
+    [ -n "$cands" ] || cands="$(wifi_saved_list)"
     [ -n "$cands" ] || return 1
 
     # 【安全】当前网络已经能上网就什么都别做。
@@ -5331,7 +5826,9 @@ wifi_try_candidates() {   # $1=候选列表 $2=每个等几秒 -> stdout: 成功
     local was_assoc=0
     dev_active "$ACTIVE_WIFI_DEV" && was_assoc=1
 
-    for ssid in $cands; do
+    # 一行一个 SSID。以前是 `for ssid in $cands`，带空格的 SSID 被拆成两个
+    # 候选，真正的网络永远试不到（见 wifi_preferred_candidates 的实测）。
+    while IFS= read -r ssid; do
         [ -n "$ssid" ] || continue
         WIFI_TRY_TOTAL=$((WIFI_TRY_TOTAL+1))
         log "wifi 故障转移：试连 '$ssid'"
@@ -5354,7 +5851,9 @@ wifi_try_candidates() {   # $1=候选列表 $2=每个等几秒 -> stdout: 成功
         fi
         log "'$ssid' 能连上但没有外网，试下一个"
         WIFI_TRY_NOINET=$((WIFI_TRY_NOINET+1))
-    done
+    done <<EOF_CANDS
+$cands
+EOF_CANDS
 
     # 全失败。如果动手前是关联着的、现在被我们踢断了，循环电源让 macOS 自动重连回去
     if [ "$was_assoc" = "1" ] && ! dev_active "$ACTIVE_WIFI_DEV"; then
@@ -5668,7 +6167,9 @@ cmd_wifi() {
             # 够不着的排最后。排序错了只是多花几秒，不会漏掉能用的网络——
             # 所以够不着的一样会试，只是最后试。
             local got ordered _sf
-            ordered="$(wifi_rank_candidates "$(wifi_saved_list | tr '\n' ' ')")"
+            # wifi_saved_list 本来就是一行一个，直接传（以前 tr 成空格分隔，
+            # 那正是 SSID 带空格时整条链被切碎的起点）
+            ordered="$(wifi_rank_candidates "$(wifi_saved_list)")"
             _sf="$(mktemp "${TMPDIR:-/tmp}/sr_wts.XXXXXX")" || _sf=""
             WIFI_TRY_STATS_FILE="$_sf"
             got="$(wifi_try_candidates "$ordered" 6)"
